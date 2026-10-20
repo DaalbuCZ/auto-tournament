@@ -3,9 +3,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/coder/websocket"
 	"net"
@@ -18,7 +20,16 @@ import (
 )
 
 func TestNativeCaptureConvertsEngineExport(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
+	testNativeCaptureCamera(t, "100 200 300", false)
+}
+
+func TestNativeCaptureRejectsWrongCamera(t *testing.T) {
+	testNativeCaptureCamera(t, "2000 2000 2000", true)
+}
+
+func testNativeCaptureCamera(t *testing.T, position string, wantFailure bool) {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil && !wantFailure {
 		t.Skip("ffmpeg is not installed")
 	}
 	t.Setenv("AT_KEEP_SCRATCH", "")
@@ -45,16 +56,29 @@ func TestNativeCaptureConvertsEngineExport(t *testing.T) {
 	consoleReader, consoleWriter := net.Pipe()
 	defer consoleReader.Close()
 	defer consoleWriter.Close()
-	// Drain the final host_framerate reset sent to the console.
+	resumed, stopped := make(chan struct{}), make(chan struct{})
+	g := &game{native: b, demoPath: filepath.Join(dir, "test.dem"), width: 16, height: 16,
+		con: &console{conn: consoleWriter, lines: make(chan string, 20)},
+		follow: func(tick int) ([3]float64, bool) {
+			if tick != 96 {
+				t.Errorf("camera checked at tick %d, want paused tick 96", tick)
+			}
+			return [3]float64{100, 200, 300}, true
+		}}
 	go func() {
-		buf := make([]byte, 256)
-		for {
-			if _, err := consoleReader.Read(buf); err != nil {
-				return
+		scanner := bufio.NewScanner(consoleReader)
+		for scanner.Scan() {
+			switch cmd := scanner.Text(); {
+			case cmd == "getpos":
+				g.con.lines <- "setpos " + position + ";setang 0 0 0"
+			case cmd == "demo_resume":
+				close(resumed)
+			case strings.HasPrefix(cmd, "echo AT_NATIVE_STOPPED_"):
+				g.con.lines <- strings.TrimPrefix(cmd, "echo ")
+				close(stopped)
 			}
 		}
 	}()
-	g := &game{native: b, demoPath: filepath.Join(dir, "test.dem"), width: 16, height: 16, con: &console{conn: consoleWriter, lines: make(chan string, 20)}}
 	r := &recorder{gameDir: dir, jobContext: ctx}
 	pluginError := make(chan error, 1)
 	go func() {
@@ -93,6 +117,28 @@ func TestNativeCaptureConvertsEngineExport(t *testing.T) {
 		}
 		if prefix == "" {
 			pluginError <- fmt.Errorf("no startmovie action")
+			return
+		}
+		checkpoint := false
+		for i, action := range sequences[0].Actions {
+			if action.Cmd == "pause_playback" && i+2 < len(sequences[0].Actions) {
+				checkpoint = sequences[0].Actions[i+1].Cmd == "demo_pause" &&
+					sequences[0].Actions[i+2].Cmd == "echo AT_NATIVE_READY_"+prefix
+			}
+		}
+		if !checkpoint {
+			pluginError <- fmt.Errorf("no paused camera checkpoint")
+			return
+		}
+		g.con.lines <- "CSDM: [96] Executing: echo AT_NATIVE_READY_" + prefix
+		g.con.lines <- "AT_NATIVE_READY_" + prefix
+		select {
+		case <-resumed:
+		case <-stopped:
+			pluginError <- nil
+			return
+		case <-ctx.Done():
+			pluginError <- ctx.Err()
 			return
 		}
 		// from=100, to=162+2 guard ticks: one second at 60 frames/sec.
@@ -134,6 +180,15 @@ func TestNativeCaptureConvertsEngineExport(t *testing.T) {
 	}()
 	raw, wav := filepath.Join(dir, "out.yuv"), filepath.Join(dir, "out.wav")
 	ticks, first, err := r.captureNative(g, "player", 100, 162, 60, raw, wav)
+	if wantFailure {
+		if !errors.Is(err, errNotFollowing) {
+			t.Fatalf("wrong camera accepted: %v", err)
+		}
+		if err := <-pluginError; err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

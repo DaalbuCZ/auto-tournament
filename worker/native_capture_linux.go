@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -56,6 +57,13 @@ func (r *recorder) captureNative(g *game, name string, from, to, fps int, raw, w
 	}
 	actionsPath := g.demoPath + ".json"
 	sequences := nativeActions(from, to, fps, prefix, name, r.look())
+	for i, action := range sequences[0].Actions {
+		if action.Cmd == "pause_playback" {
+			sequences[0].Actions = slices.Insert(sequences[0].Actions, i+1,
+				nativeAction{action.Tick, "demo_pause"}, nativeAction{action.Tick, "echo AT_NATIVE_READY_" + prefix})
+			break
+		}
+	}
 	// Preserve the moment's TrueView override, set by recordMoment.
 	if g.nativePredict != "" {
 		// Last setting at tick 1 wins, before seeking away from that tick.
@@ -90,7 +98,10 @@ func (r *recorder) captureNative(g *game, name string, from, to, fps int, raw, w
 		return nil, 0, err
 	}
 	startMovieLine := regexp.MustCompile(`\[([0-9]+)\] Executing: startmovie ` + regexp.QuoteMeta(prefix))
-	firstTick := -1
+	firstTick, cameraTick := -1, -1
+	cameraChecked := false
+	cameraMarker := "AT_NATIVE_READY_" + prefix
+	cameraLine := regexp.MustCompile(`\[([0-9]+)\] Executing: echo ` + regexp.QuoteMeta(cameraMarker))
 	exportDoneMarker := "AT_NATIVE_DONE_" + prefix
 	progress := time.NewTicker(15 * time.Second)
 	defer progress.Stop()
@@ -119,7 +130,25 @@ recording:
 			if !ok {
 				return nil, 0, errors.New("CS2 console closed during native capture")
 			}
+			if m := cameraLine.FindStringSubmatch(line); m != nil {
+				cameraTick, _ = strconv.Atoi(m[1])
+			}
+			if strings.TrimSpace(line) == cameraMarker {
+				if cameraTick < 0 || cameraTick >= from {
+					return nil, 0, errors.New("native seek missed its camera checkpoint")
+				}
+				if err := g.checkFollow(name, cameraTick); err != nil {
+					return nil, 0, err
+				}
+				if err := g.con.send("demo_resume"); err != nil {
+					return nil, 0, err
+				}
+				cameraChecked = true
+			}
 			if m := startMovieLine.FindStringSubmatch(line); m != nil {
+				if !cameraChecked {
+					return nil, 0, errors.New("native export started before its camera check")
+				}
 				firstTick, _ = strconv.Atoi(m[1])
 			}
 			if strings.TrimSpace(line) != exportDoneMarker {
