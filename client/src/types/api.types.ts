@@ -5,6 +5,7 @@
  */
 
 import type { Team, Match, Tournament, TeamStats, TeamStanding } from './index';
+import type { Untrusted } from '../utils/untrusted';
 
 // Base response types
 export interface ApiResponse {
@@ -33,7 +34,7 @@ export interface Server {
   pluginVersion?: string | null; // MatchZy Enhanced version (e.g., "1.3.6")
   hostname?: string | null; // CS2 server hostname (from hostname convar)
   lastSeen?: number | null; // Unix timestamp of last event received (heartbeat)
-  /** Unix timestamp when we last sent persistent config via RCON. Set before MatchZy sends events. */
+  /** Unix timestamp when we last sent persistent config via RCON. Set before MatchZy Enhanced sends events. */
   persistentConfigSent?: number | null;
   /** If set, the server has reported a CS2 update is required (Steam required_version). */
   cs2RequiredVersion?: number | null;
@@ -43,30 +44,22 @@ export interface Server {
   cs2UpdateRequiredAt?: number | null;
   /** Best-effort: CS2 server build ID parsed from `version` output. */
   cs2BuildId?: number | null;
+  /** Unix timestamp when MAT last ran the Steam UpToDateCheck for this server. */
+  cs2UpdateCheckedAt?: number | null;
   /** Best-effort: `version` output (display-only; may include multiple lines). */
   cs2VersionString?: string | null;
   /** Unix timestamp when version/build was last fetched via RCON. */
   cs2VersionFetchedAt?: number | null;
-  /** Best-effort: MatchZy plugin DB reachable. */
-  matchzyDbOk?: boolean | null;
-  /** Best-effort: 'sqlite' | 'mysql'. */
-  matchzyDbType?: string | null;
-  /** Best-effort: last DB error message (if any). */
-  matchzyDbError?: string | null;
-  /** Unix timestamp when DB was last reported OK. */
-  matchzyDbLastOkAt?: number | null;
-  /** Unix timestamp when DB health was last reported. */
-  matchzyDbLastSeenAt?: number | null;
   /** Unix timestamp when server last successfully sent any event to /api/events. */
   serverCanReachApiAt?: number | null;
-  // Optional real-time status values reported by the MatchZy plugin and
+  // Optional real-time status values reported by MatchZy Enhanced and
   // allocator. These are populated by /api/servers/:id/status and are used
   // purely for UI display on the Servers page.
   pluginStatus?: string | null;
   allocationState?: string | null;
   allocationMatchSlug?: string | null;
   ipBanned?: boolean; // True if server has banned our IP address
-  matchzyConfig?: {
+  atConfig?: {
     chatPrefix?: string | null;
     adminChatPrefix?: string | null;
     knifeEnabledDefault?: boolean | null;
@@ -82,6 +75,7 @@ export interface Server {
     /** MatchZy Enhanced: 0=idle, 1=match, 2=practice */
     autostartMode?: 0 | 1 | 2 | null;
     demoPath?: string | null;
+    hostnameFormat?: string | null;
     demoNameFormat?: string | null;
     demoUploadUrl?: string | null;
   } | null;
@@ -93,53 +87,6 @@ export interface ServersResponse extends ApiResponse {
 
 export interface ServerResponse extends ApiResponse {
   server: Server;
-}
-
-export interface ServerStatusResponse extends ApiResponse {
-  serverId: string;
-  status: string;
-  isAvailable: boolean;
-  currentMatch: string | null;
-  queuedMatch?: string | null;
-  playerCount?: number;
-  reachableFromApi?: boolean;
-  serverCanReachApi?: boolean;
-  pluginStatus?: string | null;
-  allocationState?: string | null;
-  allocationMatchSlug?: string | null;
-  ipBanned?: boolean; // True if server has banned our IP address
-  cs2BuildId?: number | null;
-  cs2VersionString?: string | null;
-  cs2VersionFetchedAt?: number | null;
-  /** If set, Steam reports this server is out of date (required_version). */
-  cs2RequiredVersion?: number | null;
-  /** Best-effort: phase of the update signal ('available'|'shutdown'). */
-  cs2UpdatePhase?: string | null;
-  /** Unix timestamp when MAT last checked UpToDateCheck for this server. */
-  cs2UpdateCheckedAt?: number | null;
-}
-
-export interface ServerAllocationInfo {
-  id: string;
-  name: string;
-  online: boolean;
-  status: string | null;
-  matchSlug: string | null;
-  matchNumber: number | null;
-  matchRound: number | null;
-  updatedAt: number | null;
-  inGraceWindow: boolean;
-  secondsUntilReady: number | null;
-  allocatable: boolean;
-}
-
-export interface ServerAvailabilityResponse extends ApiResponse {
-  availableServerCount: number;
-  gracePeriodSeconds: number;
-  nextAllocationInSeconds: number | null;
-  requiredServerCount: number;
-  servers: ServerAllocationInfo[];
-  simulationEnabled: boolean;
 }
 
 // Team types
@@ -191,12 +138,28 @@ export interface PlayerDetail {
   id: string; // Steam ID
   name: string;
   avatar?: string;
+  /** The rating in `ratingGame`, the game the player has played most (ratings are per game). */
   currentElo: number;
+  ratingGame?: string | null;
+  /** Every game the player is rated in, most-played first (single-player reads). */
+  ratings?: Array<{ game: string; elo: number; matchCount: number }>;
   startingElo: number;
   matchCount: number;
   createdAt: number;
   updatedAt: number;
   isAdmin?: boolean;
+  /** Banned: no sign-in; public pages show only the name. */
+  banned?: boolean;
+  /** Deleted: a tombstone named "Deleted player". */
+  deleted?: boolean;
+  /** Why they were banned. Only returned by admin endpoints. */
+  banReason?: string | null;
+  /** Public player reads of a banned or deleted player: only id, name and avatar came back. */
+  restricted?: boolean;
+  /** Discord user ID (17–20 digits). Only returned by admin endpoints. */
+  discordId?: string | null;
+  /** Epoch seconds of the last sign-in; null when never recorded. Only returned by admin endpoints. */
+  lastSignInAt?: number | null;
 }
 
 export interface PlayersResponse extends ApiResponse {
@@ -229,7 +192,7 @@ export interface LogEntry {
   timestamp: string;
   level: string;
   message: string;
-  meta?: Record<string, unknown>;
+  meta?: Record<string, Untrusted>;
 }
 
 export interface LogsResponse extends ApiResponse {
@@ -244,7 +207,7 @@ export interface ServerEvent {
   event: {
     event: string;
     matchid: string;
-    [key: string]: unknown;
+    [key: string]: Untrusted;
   };
 }
 
@@ -311,47 +274,36 @@ export interface PlayerConnectionResponse extends ApiResponse {
 // Settings types
 export interface SettingsResponse extends ApiResponse {
   settings: {
-    webhookUrl: string | null;
     steamApiKey: string | null;
     steamApiKeySet: boolean;
-    webhookConfigured: boolean;
     defaultPlayerElo: number;
     simulateMatches: boolean;
     simulationTimescale?: number;
-    matchzyChatPrefix?: string | null;
-    matchzyAdminChatPrefix?: string | null;
-    matchzyKnifeEnabledDefault?: boolean;
-    matchzyDebugChatEnabled?: boolean;
     ratingsEnabled?: boolean;
     allowSelfRegister?: boolean;
-    // MatchZy core defaults
-    matchzyAutostartMode?: 0 | 1 | 2;
-    matchzyMinimumReadyRequired?: number;
-    matchzyAllowForceReady?: boolean;
-    matchzyKickWhenNoMatchLoaded?: boolean;
-    matchzyWhitelistEnabledDefault?: boolean;
-    matchzyPauseAfterRestore?: boolean;
-    matchzyStopCommandAvailable?: boolean;
-    matchzyStopCommandNoDamage?: boolean;
-    matchzyUsePauseCommandForTacticalPause?: boolean;
-    matchzyDemoPath?: string;
-    matchzyDemoNameFormat?: string;
-    matchzySeriesEndKickDelayNoDemo?: number;
-    matchzySeriesEndKickDelayDemoNoUpload?: number;
-    matchzySeriesEndKickDelayDemoUpload?: number;
+    playersChooseName?: boolean;
+    // Ready Up's ready / restore defaults
+    atMinimumReadyRequired?: number;
+    atAllowForceReady?: boolean;
+    atTeamReady?: boolean;
+    atPauseAfterRestore?: boolean;
+    atJoinPassword?: boolean;
+    atAutostartAfterMinutes?: number;
+    atSeriesEndKickDelayNoDemo?: number;
     // MatchZy Enhanced v1.3.0 settings (null = use tournament defaults)
-    matchzyAutoreadyEnabled?: 0 | 1 | null;
-    matchzyBothTeamsUnpauseRequired?: 0 | 1 | null;
-    matchzyMaxPausesPerTeam?: number | null;
-    matchzyPauseDuration?: number | null;
-    matchzySideSelectionEnabled?: 0 | 1 | null;
-    matchzySideSelectionTime?: number | null;
-    matchzyGgEnabled?: 0 | 1 | null;
-    matchzyGgThreshold?: number | null;
-    matchzyGgMinScoreDiff?: number | null;
-    matchzyFfwEnabled?: 0 | 1 | null;
-    matchzyFfwTime?: number | null;
-    matchzyDemoRecordingEnabled?: 0 | 1 | null;
+    atAutoreadyEnabled?: 0 | 1 | null;
+    atBothTeamsUnpauseRequired?: 0 | 1 | null;
+    atPauseOnDisconnect?: 0 | 1 | null;
+    atMaxPausesPerTeam?: number | null;
+    atPauseDuration?: number | null;
+    atSideSelectionEnabled?: 0 | 1 | null;
+    atSideSelectionTime?: number | null;
+    atGgEnabled?: 0 | 1 | null;
+    atGgThreshold?: number | null;
+    atGgMinScoreDiff?: number | null;
+    atFfwEnabled?: 0 | 1 | null;
+    atFfwTime?: number | null;
+    atDemoRecordingEnabled?: 0 | 1 | null;
   };
 }
 
@@ -367,10 +319,6 @@ export interface Map {
 export interface MapsResponse extends ApiResponse {
   maps: Map[];
   count: number;
-}
-
-export interface MapResponse extends ApiResponse {
-  map: Map;
 }
 
 // Map pool types

@@ -2,10 +2,8 @@
   "matchesPage": {
     "errors": {
       "loadMatches": "Impossibile caricare i match",
-      "loadTitle": "Errore nel caricamento dei match"
-    },
-    "allocation": {
-      "nextServers": "Prossima allocazione server tra {{seconds}}s"
+      "loadTitle": "Errore nel caricamento dei match",
+      "bulkDelete": "Impossibile eliminare una o più partite"
     },
     "header": {
       "createMatch": "Crea match"
@@ -25,7 +23,8 @@
     "sections": {
       "live": "Match live ({{count}})",
       "upcoming": "Match in arrivo ({{count}})",
-      "history": "Storico match ({{count}})"
+      "history": "Storico match ({{count}})",
+      "inQueue": "{{count}} in coda"
     },
     "manualMatchLabel": "Match manuale",
     "create": {
@@ -33,44 +32,99 @@
     },
     "bulkDelete": {
       "title": "Elimina match manuali",
-      "message": "Vuoi davvero eliminare {{count}} match manuale{{suffix}}? Questa azione non può essere annullata."
-    }
-  },
-  "manualMatchModal": {
-    "title": "Crea match manuale",
-    "steps": {
-      "matchSetup": "Configurazione match",
-      "rules": "Regole",
-      "maps": "Mappe",
-      "teams": "Squadre",
-      "review": "Riepilogo"
+      "deleted_one": "{{count}} partita eliminata",
+      "deleted_other": "{{count}} partite eliminate",
+      "message_one": "Vuoi davvero eliminare {{count}} match manuale? Questa azione non può essere annullata.",
+      "message_other": "Vuoi davvero eliminare {{count}} match manuali? Questa azione non può essere annullata."
     },
-    "description": "Crea un match indipendente dal tabellone del torneo. L’API alloca automaticamente un server disponibile per te.",
-    "buttons": {
-      "next": "Avanti",
-      "back": "Indietro",
-      "create": "Crea match",
-      "creating": "Creazione…"
+    "card": {
+      "matchNumber": "Partita #{{number}}",
+      "server": "Server: {{name}}",
+      "queuePosition": "Posizione in coda: #{{position}}",
+      "shuffle": "Shuffle",
+      "shuffleManual": "Shuffle manuale",
+      "manual": "Manuale",
+      "simulation": "Simulazione",
+      "winner": "VINCITORE",
+      "mapN": "Mappa {{n}}"
     },
-    "saveTemplate": {
-      "title": "Salva modello match",
-      "nameLabel": "Nome modello",
-      "nameHelper": "Ad esempio: BO1 Inferno knife, pool mappe BO3, ecc.",
-      "description": "Le mappe attuali, il formato serie, la regola lato CT, il toggle veto, la modalità knife e i giocatori per squadra verranno salvati in questo modello.",
-      "save": "Salva"
+    "statusLabel": {
+      "walkover": "A TAVOLINO",
+      "waitingForTournament": "IN ATTESA DELL'INIZIO DEL TORNEO",
+      "waitingForServer": "IN ATTESA DEL SERVER",
+      "vetoPending": "VETO IN ATTESA",
+      "mapVeto": "VETO MAPPE",
+      "serverAllocated": "SERVER ASSEGNATO",
+      "warmup": "RISCALDAMENTO",
+      "overtime": "SUPPLEMENTARI #{{n}}",
+      "live": "IN DIRETTA",
+      "completed": "COMPLETATA",
+      "cancelled": "ANNULLATA",
+      "needsDecision": "NEEDS ADMIN DECISION",
+      "waitingForPairing": "WAITING FOR PAIRING"
     },
-    "chooseMode": {
-      "heading": "Come vuoi creare questo match?",
-      "template": {
-        "title": "Scegli modello",
-        "description": "Carica un preset per mappe, formato e regole, poi scegli le squadre.",
-        "label": "Modello match",
-        "none": "Nessuno",
-        "empty": "Nessun modello salvato. Configura un match e salvalo come modello."
+    "statusGuide": {
+      "title": "Guida agli stati della partita",
+      "pending": "La partita è programmata ma non ancora assegnata a un server. Verrà assegnata quando un server sarà disponibile.",
+      "loaded": "La partita è caricata sul server ed è in riscaldamento. I giocatori devono connettersi e dichiararsi pronti per iniziare.",
+      "live": "La partita è in corso sul suo server.",
+      "completed": "La partita è terminata. Il vincitore è stato determinato e il tabellone è stato aggiornato.",
+      "proTipTitle": "Suggerimento:",
+      "proTip": "Quando una partita mostra \"In attesa dei giocatori (X/Y)\", il server è pronto e i giocatori devono connettersi. Quando tutti i giocatori previsti sono connessi e pronti, la partita inizia automaticamente."
+    },
+    "latestEvent": "Ultimo: {{event}}",
+    "matchLabel": {
+      "upper": "UB R{{round}} M{{match}}",
+      "lower": "LB R{{round}} M{{match}}",
+      "grandFinal": "Grand Final",
+      "grandFinalReset": "Grand Final Reset",
+      "group": "Group {{group}} · Round {{round}}",
+      "playoffs": "Playoffs · Round {{round}}"
+    },
+    "table": {
+      "filterLabel": "Show",
+      "search": "Find a team or player",
+      "tbd": "TBD",
+      "manage": "Manage match",
+      "empty": "No matches here.",
+      "filter": {
+        "attention_one": "Needs attention · {{count}}",
+        "attention_other": "Needs attention · {{count}}",
+        "live_one": "Live · {{count}}",
+        "live_other": "Live · {{count}}",
+        "veto_one": "Veto · {{count}}",
+        "veto_other": "Veto · {{count}}",
+        "waiting_one": "Waiting · {{count}}",
+        "waiting_other": "Waiting · {{count}}",
+        "finished_one": "Finished · {{count}}",
+        "finished_other": "Finished · {{count}}",
+        "all_one": "All · {{count}}",
+        "all_other": "All · {{count}}"
       },
-      "custom": {
-        "title": "Crea nuovo match",
-        "description": "Configura mappe, regole, lati e squadre da zero."
+      "columns": {
+        "match": "Match",
+        "teams": "Teams",
+        "phase": "Phase",
+        "server": "Server",
+        "attention": "Needs attention",
+        "open": "Open"
+      },
+      "attention": {
+        "calls_one": "Admin call",
+        "calls_other": "{{count}} admin calls",
+        "decide": "Decide the result"
+      },
+      "phase": {
+        "live": "Live · map {{map}}",
+        "finished": "Finished",
+        "finishedScore": "Finished · {{score}}",
+        "veto": "Map veto",
+        "waitingTeams": "Waiting for its teams",
+        "queued": "Waiting for a server · #{{position}} in queue",
+        "waiting": "Waiting"
+      },
+      "server": {
+        "freed": "Freed"
       }
     }
   },
@@ -79,8 +133,68 @@
       "dialogTitle": "Elimina match",
       "confirmTitle": "Eliminare questo match?",
       "confirmBody": "Vuoi davvero eliminare il match \"{{slug}}\"? Questa azione non può essere annullata.",
-      "button": "Elimina match"
-    }
+      "button": "Elimina match",
+      "success": "Match deleted successfully",
+      "failed": "Failed to delete match"
+    },
+    "roster": {
+      "title": "Rosa giocatori",
+      "yourTeam": "La tua squadra",
+      "openPlayerPage": "Apri la pagina del giocatore",
+      "ready": "PRONTO",
+      "connected": "CONNESSO",
+      "offline": "OFFLINE",
+      "bot": "BOT"
+    },
+    "decision": {
+      "body": "Every map has been played but the series is level on maps, rounds and damage. Choose the winner to advance the bracket.",
+      "setWinner": "{{team}} wins",
+      "confirmTitle": "Set series winner",
+      "confirmBody": "Finish this series with {{team}} as the winner? The bracket advances and this cannot be undone here.",
+      "confirm": "Set winner",
+      "success": "Winner set",
+      "failed": "Failed to set the winner"
+    },
+    "tiebreakHint": "Scores are level: {{team}} won the map, decided by tiebreak.",
+    "config": {
+      "loadFailed": "Failed to load match config",
+      "view": "View Match Config JSON",
+      "title": "Match Config JSON",
+      "loading": "Loading match config...",
+      "empty": "No config available for this match."
+    },
+    "tiebreak": {
+      "regulationOnly": "Overtime is disabled for this match (regulation only), so tied scores are resolved by total team damage.",
+      "segmentsExhausted": "Overtime is configured with a maximum number of segments. If the score is still tied, the winner is decided by total team damage.",
+      "overtimeDisabled": "Overtime is disabled for this match, so tied scores are resolved by total team damage.",
+      "tiedByDamage": "The final score was tied, so according to the match settings the winner was chosen by total team damage."
+    },
+    "team1": "Team 1",
+    "team2": "Team 2",
+    "matchTime": "Match Time:",
+    "server": "Server:",
+    "queuePosition": "Queue Position:",
+    "totalDamage": "Total Damage: {{team1}} - {{team2}}",
+    "mapOfTotal": "Map {{index}} of {{total}}: {{map}}",
+    "mapIndex": "Map {{index}}: {{map}}",
+    "round": "Round {{round}}",
+    "shuffle": {
+      "averageElo": "Team ELO (avg): {{team1}} vs {{team2}}",
+      "balancerHint": "Shuffle teams are generated by an OpenSkill-based balancer that spreads high and low-rated players across both sides to keep these averages close."
+    },
+    "playerLeaderboards": "Player Leaderboards",
+    "noPlayerData": "No player data available",
+    "currentMap": "Current Map",
+    "maps": "Maps",
+    "mapsNotPicked": "The maps are not picked yet.",
+    "mapsViaVeto": "To be determined via veto",
+    "matchInformation": "Match Information",
+    "created": "Created:",
+    "started": "Started:",
+    "completed": "Completed:",
+    "adminControls": "Admin Controls",
+    "slug": "Match slug:",
+    "openChat": "Match chat"
   },
   "bulkShuffleMatchesModal": {
     "title": "Crea match shuffle in blocco",
@@ -145,7 +259,7 @@
     "playersHeader": "Giocatori ({{count}})",
     "selectPlayers": "Seleziona giocatori",
     "noPlayersInfo": "Nessun giocatore aggiunto. Aggiungi almeno un giocatore.",
-    "addPlayersHelper": "Aggiungi giocatori incollando un URL Steam o selezionando da giocatori esistenti",
+    "addPlayersHelper_steam": "Aggiungi giocatori incollando un URL Steam o selezionando da giocatori esistenti",
     "steamInputLabel": "Steam ID / vanity URL",
     "steamInputPlaceholder": "gaben or steamcommunity.com/id/gaben",
     "resolveSteam": "Risolvi Steam ID",
@@ -164,7 +278,12 @@
       "teamNameRequired": "Il nome squadra è obbligatorio",
       "playersRequired": "È richiesto almeno un giocatore",
       "saveFailed": "Impossibile salvare la squadra",
-      "deleteFailed": "Impossibile eliminare la squadra"
+      "deleteFailed": "Impossibile eliminare la squadra",
+      "discordIdInvalid": "L'ID Discord deve essere di 17–20 cifre (l'ID utente numerico, non un nome utente)",
+      "discordIdInvalidPlayers": "ID Discord non valido per: {{names}}. Deve essere di 17–20 cifre oppure vuoto.",
+      "discordIdSaveFailed": "La squadra è stata salvata, ma non è stato possibile salvare l'ID Discord per: {{names}}. {{message}}",
+      "nameRequired": "Enter the player's name",
+      "addPlayerFailed": "Could not add the player"
     },
     "success": {
       "playerAdded": "Giocatore aggiunto alla squadra",
@@ -185,7 +304,10 @@
       "message": "Vuoi davvero eliminare \"{{name}}\"? Questa azione non può essere annullata."
     },
     "replacePlayerAria": "Sostituisci giocatore {{name}}",
-    "replacePlayerTooltip": "Sostituisci questo giocatore"
+    "replacePlayerTooltip": "Sostituisci questo giocatore",
+    "addPlayersHelper": "Add a new player below, or select from existing players",
+    "accountLabel": "{{account}} account (optional)",
+    "accountHelper": "For {{games}}. When they sign in with {{account}}, they become this player."
   },
   "playerModal": {
     "titleCreate": "Crea giocatore",
@@ -231,13 +353,17 @@
     "confirmEloUpdate": {
       "title": "Aggiorna ELO giocatore",
       "message": "Vuoi davvero aggiornare l’ELO di questo giocatore da {{from}} a {{to}}? Questo reimposterà statistiche e cronologia rating. Questa azione non può essere annullata."
-    }
+    },
+    "discordIdHelper": "Facoltativo. 17–20 cifre. Permette agli organizzatori di contattare questo giocatore su Discord. Non viene mai mostrato pubblicamente.",
+    "accountLabel": "{{account}} account (optional)",
+    "accountHelper": "For {{games}}. The account id; when they sign in with {{account}}, they become this player.",
+    "accountVerified": "Linked: they signed in with {{account}}. They change it themselves."
   },
   "teamImportModal": {
     "title": "Importa squadre da JSON",
     "info": {
       "title": "Incolla qui sotto il JSON con i dati delle squadre.",
-      "format": "Formato atteso: array di squadre con name, tag (opzionale) e players (name + steamId).",
+      "format": "Formato previsto: array di squadre con name, tag (facoltativo) e players (name + steamId, più un discordId facoltativo come stringa tra virgolette).",
       "link": "Vedi documentazione con esempi"
     },
     "jsonLabel": "Dati JSON",
@@ -250,14 +376,25 @@
       "noJson": "Inserisci i dati JSON"
     },
     "preview": {
-      "summary": "✓ JSON valido! Trovate {{teamCount}} squadra{{teamCount, plural, one {} other {s}}} con {{playerCount}} giocatore{{playerCount, plural, one {} other {i}}} totali.",
+      "summary": "✓ JSON valido! Trovati: {{teams}}, {{players}} in totale.",
       "title": "Anteprima:",
-      "playersChip": "{{count}} giocatore{{count, plural, one {} other {i}}}"
+      "missingDiscordTotal": "Giocatori senza ID Discord: {{count}}",
+      "missingDiscordChip": "Senza Discord: {{count}}",
+      "playersChip_one": "{{count}} giocatore",
+      "playersChip_other": "{{count}} giocatori",
+      "teamsCount_one": "{{count}} squadra",
+      "teamsCount_other": "{{count}} squadre"
     },
     "actions": {
       "preview": "Anteprima",
       "importing": "Importazione...",
-      "import": "Importa {{count}} squadr{{count, plural, one {a} other {e}}}"
+      "import_one": "Importa {{count}} squadra",
+      "import_other": "Importa {{count}} squadre"
+    },
+    "warnings": {
+      "title": "Alcuni ID Discord sono stati ignorati. Questi giocatori verranno importati senza:",
+      "discordIdNumber": "Squadra \"{{team}}\", giocatore \"{{player}}\": discordId deve essere una stringa tra virgolette. I numeri grandi perdono precisione in JSON, quindi l'ID è stato rimosso.",
+      "discordIdInvalid": "Squadra \"{{team}}\", giocatore \"{{player}}\": \"{{value}}\" non è un ID utente Discord (previste 17–20 cifre), quindi è stato rimosso."
     }
   },
   "playerImportModal": {
@@ -272,15 +409,17 @@
     "actions": {
       "parseValidate": "Analizza e valida",
       "importing": "Importazione...",
-      "import": "Importa {{count}} giocator{{count, plural, one {e} other {i}}}"
+      "import_one": "Importa {{count}} giocatore",
+      "import_other": "Importa {{count}} giocatori"
     },
     "preview": {
-      "readyChip": "{{count}} giocator{{count, plural, one {e} other {i}}} pronto{{count, plural, one {} other {i}}} per l’importazione",
       "title": "Giocatori da importare ({{count}}):",
       "steamId": "Steam ID64: {{steamId}}",
       "name": "Nome: {{name}}",
       "initialElo": "ELO iniziale: {{elo}}",
-      "avatar": "URL avatar: {{url}}"
+      "avatar": "URL avatar: {{url}}",
+      "readyChip_one": "{{count}} giocatore pronto per l’importazione",
+      "readyChip_other": "{{count}} giocatori pronti per l’importazione"
     },
     "errors": {
       "noData": "Inserisci dati JSON o CSV",
@@ -294,7 +433,7 @@
   "playerSelectionModal": {
     "title": "Seleziona giocatori",
     "selectedCount": "{{count}} selezionati",
-    "searchPlaceholder": "Cerca giocatori per nome o Steam ID...",
+    "searchPlaceholder_steam": "Cerca giocatori per nome o Steam ID...",
     "selectAll": {
       "select": "Seleziona tutto",
       "deselect": "Deseleziona tutto"
@@ -306,11 +445,13 @@
     "playerCard": {
       "alreadyInTeam": "Già nella squadra"
     },
-    "addPlayersButton": "Aggiungi {{count}} giocator{{count, plural, one {e} other {i}}}",
     "errors": {
       "loadFailed": "Impossibile caricare i giocatori",
       "noSelectable": "Nessun giocatore selezionabile disponibile"
-    }
+    },
+    "addPlayersButton_one": "Aggiungi {{count}} giocatore",
+    "addPlayersButton_other": "Aggiungi {{count}} giocatori",
+    "searchPlaceholder": "Search players by name..."
   },
   "soundSettingsModal": {
     "title": "Impostazioni audio",
@@ -322,5 +463,28 @@
     },
     "testButton": "Test suono",
     "footer": "Le notifiche sonore verranno riprodotte quando il tuo match è pronto o quando si verificano eventi importanti."
+  },
+  "addBackupPlayer": {
+    "title": "Add Player",
+    "loadFailed": "Failed to load player list",
+    "added": "{{name}} added to {{target}}",
+    "addFailed": "Failed to add player",
+    "addToMatchFailed": "Failed to add player to match",
+    "searchLabel": "Search for player",
+    "searchPlaceholder": "Type player name...",
+    "available": "{{count}} available players (not already in match)",
+    "noneAvailable": "No players available",
+    "displayNameLabel": "Display name (optional)",
+    "displayNamePlaceholder": "Defaults to the player's current name",
+    "side": "Side",
+    "spectator": "Spectator",
+    "selected": "Selected:",
+    "fromTeam": "From team: {{team}}",
+    "steamId": "Steam ID: {{id}}",
+    "adding": "Adding Player...",
+    "add": "Add Player to Match",
+    "underlyingCommand": "Underlying command:",
+    "important": "Important:",
+    "reconnectHint": "Il giocatore deve riconnettersi al server dopo essere stato aggiunto. Se è già connesso, potrebbe dover rientrare."
   }
 }

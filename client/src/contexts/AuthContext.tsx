@@ -35,6 +35,15 @@ interface AuthContextType {
    */
   playerSteamId: string | null;
   /**
+   * The same player's game-neutral account id (`players.uid`), from
+   * /api/auth/me. Null when nobody is signed in or the Steam identity has no
+   * players row yet. Follows impersonation like `playerSteamId` does.
+   *
+   * This, not the Steam ID, is how game modules identify a player
+   * (DESIGN-module-client-api.md, decision 5).
+   */
+  playerUid: string | null;
+  /**
    * Helper for starting the Steam login flow. This simply redirects the user
    * to /api/auth/steam and lets the backend/Passport process take over.
    */
@@ -52,7 +61,7 @@ interface AuthContextType {
   isAuthenticated: boolean;
   /**
    * Whether the current admin session still needs to be linked with a Steam ID
-   * (e.g. logged in via Keycloak/Discord/GitHub without a Steam account).
+   * (e.g. signed in with Discord, GitHub or OpenID Connect without a Steam account).
    * Admins who logged in directly with Steam will never see this as true.
    */
   needsSteamLink: boolean;
@@ -68,9 +77,18 @@ interface AuthContextType {
   isLoading: boolean;
   /**
    * The auth provider backing the current admin session (e.g. 'steam',
-   * 'discord', 'github', 'keycloak'), if any.
+   * 'discord', 'github', 'oidc'), if any.
    */
   adminProvider: string | null;
+  /**
+   * Why admin access was refused, in words, when it was.
+   *
+   * `/api/auth/admin/me` used to answer a bare `authenticated: false`, and the
+   * router then bounced the user to their player page without saying anything.
+   * Reports of "it sends me to my player profile even though I am an admin"
+   * were undiagnosable because nothing was ever shown or collected.
+   */
+  adminDenialMessage: string | null;
   /**
    * Lightweight profile preview for the current admin provider – used for
    * UI hints like the /connect-steam page.
@@ -83,6 +101,29 @@ interface AuthContextType {
    * but were never added by an admin (or self‑registration is off).
    */
   hasPlayerRecord: boolean;
+  /**
+   * Set when an admin is currently viewing the site as another player.
+   * `playerSteamId` reflects the impersonated player while this is active, so
+   * player-facing UI matches what the API will authorize.
+   */
+  impersonation: ImpersonationState | null;
+  /**
+   * Start viewing the site as `steamId` (admin only). Reloads identity on success.
+   */
+  startImpersonation: (steamId: string) => Promise<void>;
+  /**
+   * Return to the admin's own identity.
+   */
+  stopImpersonation: () => Promise<void>;
+}
+
+export interface ImpersonationState {
+  /** Steam ID being impersonated. */
+  steamId: string;
+  /** Display name of the impersonated player, when known. */
+  name: string | null;
+  /** The admin's own Steam ID. */
+  realSteamId: string | null;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -90,12 +131,15 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isAdmin, setIsAdmin] = useState(false);
   const [playerSteamId, setPlayerSteamId] = useState<string | null>(null);
+  const [playerUid, setPlayerUid] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [adminHasSteamLinked, setAdminHasSteamLinked] = useState(false);
   const [adminProvider, setAdminProvider] = useState<string | null>(null);
+  const [adminDenialMessage, setAdminDenialMessage] = useState<string | null>(null);
   const [adminProfileName, setAdminProfileName] = useState<string | null>(null);
   const [adminProfileAvatarUrl, setAdminProfileAvatarUrl] = useState<string | null>(null);
   const [hasPlayerRecord, setHasPlayerRecord] = useState(false);
+  const [impersonation, setImpersonation] = useState<ImpersonationState | null>(null);
 
   useEffect(() => {
     let isMounted = true;
@@ -118,6 +162,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
           if (!response.ok) {
             setPlayerSteamId(null);
+            setPlayerUid(null);
             setHasPlayerRecord(false);
             return;
           }
@@ -125,9 +170,40 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           const data: {
             authenticated?: boolean;
             steamId?: string;
+            uid?: string | null;
             hasPlayerRecord?: boolean;
             avatarUrl?: string;
+            impersonation?: {
+              active?: boolean;
+              steamId?: string;
+              name?: string | null;
+              realSteamId?: string | null;
+            };
           } = await response.json();
+
+          // The effective identity's account id. /api/auth/me resolves the
+          // identity the same way /api/auth/admin/me does (session first,
+          // then cookie), so it matches whichever branch sets the Steam ID.
+          setPlayerUid(
+            data.authenticated && typeof data.uid === 'string' && data.uid !== '' ? data.uid : null
+          );
+
+          // /api/auth/me reports the *effective* identity, so an active
+          // impersonation is authoritative even when an admin session exists.
+          if (data.impersonation?.active && data.impersonation.steamId) {
+            setImpersonation({
+              steamId: data.impersonation.steamId,
+              name: data.impersonation.name ?? null,
+              realSteamId: data.impersonation.realSteamId ?? null,
+            });
+            setPlayerSteamId(data.impersonation.steamId);
+            setHasPlayerRecord(true);
+            cookieSteamId = data.impersonation.steamId;
+            cookieHasPlayerRecord = true;
+            return;
+          }
+
+          setImpersonation(null);
           if (adminSteamId) {
             // Admin already set playerSteamId; don't overwrite with /api/auth/me
             return;
@@ -161,6 +237,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           cookieSteamId = null;
           cookieHasPlayerRecord = false;
           setPlayerSteamId(null);
+          setPlayerUid(null);
           setHasPlayerRecord(false);
         }
       };
@@ -187,9 +264,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             steamId?: string | null;
             provider?: string;
             providerProfile?: { name?: string | null; avatarUrl?: string | null };
+            reason?: string;
+            message?: string;
           } = await response.json();
 
           setIsAdmin(Boolean(data.authenticated));
+          // Keep the explanation only while it is true; a later successful
+          // check must not leave a stale "you are not an admin" behind.
+          setAdminDenialMessage(data.authenticated ? null : data.message ?? null);
           setAdminProvider(data.provider ?? null);
           if (data.authenticated) setHasPlayerRecord(true);
 
@@ -273,10 +355,50 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     window.location.href = '/api/auth/steam';
   };
 
+  /**
+   * Start/stop impersonation.
+   *
+   * Both do a hard reload afterwards: nearly every page caches identity-derived
+   * data (team membership, veto turn, match CTAs) in component state, and a full
+   * reload is the only way to guarantee none of the previous identity's data
+   * leaks into the new view.
+   */
+  const startImpersonation = async (steamId: string) => {
+    const response = await fetch('/api/auth/impersonate', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ steamId }),
+    });
+
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error || 'Failed to start impersonation');
+    }
+
+    window.location.reload();
+  };
+
+  const stopImpersonation = async () => {
+    const response = await fetch('/api/auth/impersonate/stop', {
+      method: 'POST',
+      credentials: 'include',
+    });
+
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error || 'Failed to stop impersonation');
+    }
+
+    window.location.reload();
+  };
+
   const logout = async () => {
     const steamIdToClear = playerSteamId;
     setIsAdmin(false);
     setPlayerSteamId(null);
+    setPlayerUid(null);
+    setImpersonation(null);
     setHasPlayerRecord(false);
     setAdminProvider(null);
     setAdminProfileName(null);
@@ -284,6 +406,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     if (steamIdToClear) {
       clearCachedPlayerAvatarUrl(steamIdToClear);
+    }
+
+    try {
+      // Drop any impersonation before tearing down the admin session, otherwise
+      // the (admin-guarded) stop endpoint would no longer accept the request.
+      await fetch('/api/auth/impersonate/stop', {
+        method: 'POST',
+        credentials: 'include',
+      });
+    } catch (error) {
+      console.warn('Failed to call /api/auth/impersonate/stop', error);
     }
 
     try {
@@ -316,13 +449,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         logout,
         isAuthenticated: isAdmin,
         playerSteamId,
+        playerUid,
         isPlayerAuthenticated: !!playerSteamId,
         needsSteamLink: isAdmin && !adminHasSteamLinked,
         isLoading,
         adminProvider,
+        adminDenialMessage,
         adminProfileName,
         adminProfileAvatarUrl,
         hasPlayerRecord,
+        impersonation,
+        startImpersonation,
+        stopImpersonation,
       }}
     >
       {children}

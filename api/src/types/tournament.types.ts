@@ -7,7 +7,9 @@ export type TournamentType =
   | 'double_elimination'
   | 'round_robin'
   | 'swiss'
-  | 'shuffle';
+  | 'shuffle'
+  /** Groups play a round robin each, then the best play elimination (services/groupsTournament.ts). */
+  | 'groups';
 
 export type TournamentStatus = 'setup' | 'ready' | 'in_progress' | 'completed' | 'cancelled';
 
@@ -19,7 +21,17 @@ export interface VetoStep {
   action: 'ban' | 'pick' | 'side_pick';
 }
 
-export interface TournamentSettings {
+/**
+ * Game modules' own objects inside a tournament's settings, under each
+ * module's key (CS2: `cs2`, manual reporting: `manualReport`). Empty here: a
+ * module adds its key with declaration merging, next to its own types, so
+ * its code reads `settings.cs2` typed. The core stores them and never reads
+ * a field (`GameIntegration.tournamentSettings`).
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type -- filled in by modules
+export interface ModuleTournamentObjects {}
+
+export interface TournamentSettings extends ModuleTournamentObjects {
   matchFormat: MatchFormat;
   thirdPlaceMatch: boolean;
   autoAdvance: boolean;
@@ -45,6 +57,77 @@ export interface TournamentSettings {
   maxRounds?: number;
   overtimeMode?: 'enabled' | 'disabled';
   overtimeSegments?: number;
+
+  /**
+   * Organizer-written event page content (the public "Overview" tab).
+   * All optional; the page hides a section when its data is empty. Lengths
+   * are enforced server-side in routes/tournament.ts
+   * (`validateEventPageSettings`).
+   */
+  /** Plain text, max 4000 chars. */
+  description?: string;
+  /** Free-text location line, e.g. "On site, Trondheim". Max 120 chars. */
+  location?: string;
+  /** Who runs it, shown in the page header, e.g. "Edition 35 LAN". Max 80 chars. */
+  organizer?: string;
+  /** Numbered rules, in display order. Max 20 items, 500 chars each. */
+  rules?: string[];
+  /** Link to a fuller rulebook. Must be an https URL, or empty/omitted. */
+  rulebookUrl?: string;
+  /** Up to 5 placements, in display order (e.g. 1st/2nd/3rd). */
+  prizes?: EventPagePrize[];
+  /** Up to 20 schedule rows, in display order. */
+  schedule?: EventPageScheduleItem[];
+  /** A map's picture instead of an uploaded banner (a map id). */
+  bannerMap?: string;
+
+  /** Sign-up and check-in (tournament sign-up). Times are ISO date-times. */
+  registrationOpen?: boolean;
+  maxTeams?: number | null;
+  registrationClosesAt?: string | null;
+  checkInOpensAt?: string | null;
+  checkInClosesAt?: string | null;
+
+  /** Groups, then playoffs (services/groupsTournament.ts): 1–4 each. */
+  groupCount?: number;
+  advancePerGroup?: number;
+
+  /** The start (services/tournamentSchedule.ts): ISO date-time, reminders (minutes before) and auto start. */
+  startsAt?: string | null;
+  startReminders?: number[] | null;
+  autoStart?: boolean;
+  /** Round start times (services/matchTimes.ts). */
+  matchTimes?: StoredMatchTimes;
+  /** Shuffle: breaks between rounds (services/shuffleTournamentService.ts). */
+  roundBreaks?: RoundBreaks;
+}
+
+/** `settings.matchTimes` as stored: round number → ISO start time. */
+export interface StoredMatchTimes {
+  mode: 'times' | 'asap';
+  rounds?: Record<string, string>;
+  vetoLeadMinutes?: number;
+  reminderMinutes?: number;
+}
+
+/**
+ * `settings.roundBreaks`: `minutes` after every round, and `after` a longer
+ * (or shorter) one after given rounds, e.g. { minutes: 0, after: { "3": 30 } }.
+ */
+export interface RoundBreaks {
+  minutes?: number;
+  after?: Record<string, number>;
+}
+
+export interface EventPagePrize {
+  place: string;
+  prize: string;
+}
+
+export interface EventPageScheduleItem {
+  /** ISO 8601 datetime string. */
+  at: string;
+  label: string;
 }
 
 export interface Tournament {
@@ -53,20 +136,30 @@ export interface Tournament {
   type: TournamentType;
   format: MatchFormat;
   status: TournamentStatus;
-  maps: string[]; // JSON array
+  /** Game integration that owns the tournament (`tournament.game`, default 'cs2'). */
+  game: string;
+  /**
+   * The game module's 2.x fields, filled from its object in `settings`
+   * (CS2: `settings.cs2`; utils/tournamentRow `moduleTournamentFields`). The
+   * core keeps them in responses for 2.x clients and never stores them.
+   */
+  maps: string[];
   team_ids: string[]; // JSON array
   settings: TournamentSettings; // JSON object
-  // Shuffle tournament specific fields (parsed / normalized)
-  mapSequence?: string[]; // Maps in order (number of rounds)
+  mapSequence?: string[]; // Shuffle: maps in order (number of rounds). Module field, see `maps`.
   teamSize?: number; // Number of players per team (default: 5)
-  maxRounds?: number;
-  overtimeMode?: 'enabled' | 'disabled';
-  overtimeSegments?: number;
+  maxRounds?: number; // Module field, see `maps`.
+  overtimeMode?: 'enabled' | 'disabled'; // Module field, see `maps`.
+  overtimeSegments?: number; // Module field, see `maps`.
+  /** The map pool the maps came from, when the module stored one. Module field, see `maps`. */
+  mapPoolId?: number;
   eloTemplateId?: string | null;
   created_at: number;
   updated_at: number;
   started_at?: number;
   completed_at?: number;
+  /** Archived (unix seconds): a finished tournament a new one replaced. Its pages are read-only. */
+  archived_at?: number | null;
 }
 
 export interface TournamentRow {
@@ -75,28 +168,38 @@ export interface TournamentRow {
   type: TournamentType;
   format: MatchFormat;
   status: TournamentStatus;
-  maps: string; // JSON string
+  game?: string | null;
   team_ids: string; // JSON string
-  settings: string; // JSON string
-  // Shuffle tournament specific fields (raw DB columns)
-  map_sequence?: string | null;
+  settings: string; // JSON string; the game module's object is under its key (CS2: `cs2`)
   team_size?: number | null;
-  max_rounds?: number | null;
-  overtime_mode?: string | null;
-  overtime_segments?: number | null;
   elo_template_id?: string | null;
   created_at: number;
   updated_at: number;
   started_at?: number;
   completed_at?: number;
+  /** When the banner was last set; null without one (`tournament_banner` holds it). */
+  banner_updated_at?: number | null;
+  /** When it was archived to make way for a new tournament; null for the current one. */
+  archived_at?: number | null;
 }
 
 export interface CreateTournamentInput {
   name: string;
+  /**
+   * The game to run: a catalogue slug ('rocket-league') or an installed
+   * module's id ('cs2'). Omitted, the row takes the `game` column default
+   * (CS2), which is what every tournament created before 3.0 phase D was.
+   */
+  game?: string;
   type: TournamentType;
   format: MatchFormat;
   maps: string[];
   teamIds: string[];
+  /**
+   * Players per team for a team tournament (1-10): how many starters a team
+   * that signs itself up picks. Shuffle tournaments set it on their own route.
+   */
+  teamSize?: number;
   settings?: Partial<TournamentSettings>;
   // Optional global round-limit settings (applies to all tournament types).
   // For shuffle, maxRounds/overtime settings are provided via the dedicated shuffle endpoint.
@@ -106,7 +209,7 @@ export interface CreateTournamentInput {
    * Optional global overtime policy hint (applies to all tournament types).
    *
    * Semantics are shared with shuffle tournaments and manual matches:
-   * - undefined / omitted → MatchZy default behaviour (usually unlimited OT, draws allowed)
+   * - undefined / omitted → MatchZy Enhanced default behaviour (usually unlimited OT, draws allowed)
    * - 0 with overtimeMode === 'disabled' → "no OT, no draws" (force winner by damage tiebreak)
    * - >0 with overtimeMode === 'enabled' → standard OT, then damage tiebreak after N segments
    */
@@ -119,16 +222,31 @@ export interface UpdateTournamentInput {
   format?: MatchFormat;
   maps?: string[];
   teamIds?: string[];
+  /**
+   * Players per team for a team tournament (1-10): how many starters a team
+   * that signs itself up picks. Shuffle tournaments set it on their own route.
+   */
+  teamSize?: number;
   settings?: Partial<TournamentSettings>;
   maxRounds?: number;
   overtimeMode?: 'enabled' | 'disabled';
-  overtimeSegments?: number;
+  /**
+   * null clears the setting back to the MatchZy Enhanced default (unlimited overtime,
+   * or draws allowed when overtime is disabled). 0 with overtimeMode
+   * 'disabled' means "no overtime, no draws" (damage tiebreak).
+   */
+  overtimeSegments?: number | null;
 }
 
 export interface BracketMatch {
   id: number;
   slug: string;
   round: number;
+  /** Its start time and when its veto opens (unix s; services/matchTimes.ts), when it has one. */
+  startsAt?: number | null;
+  vetoOpensAt?: number | null;
+  /** This match's own time (Manage › Schedule), apart from its round's. */
+  ownStartsAt?: number | null;
   matchNumber: number;
   team1?: {
     id: string;
@@ -148,11 +266,33 @@ export interface BracketMatch {
   serverId?: string | null;
   status: 'pending' | 'ready' | 'loaded' | 'live' | 'completed';
   nextMatchId?: number | null;
+  /** 'WB', 'LB', 'GF' in a double elimination; absent otherwise. */
+  bracket?: string | null;
+  /** The map being played and its 0-based number in the series, once on a server. */
+  currentMap?: string | null;
+  mapNumber?: number | null;
+  /** Both teams are in and it waits on its map veto. */
+  vetoing?: boolean;
   createdAt?: number;
   loadedAt?: number;
   completedAt?: number;
+  /** Headline score: maps won when completed, current map rounds while in progress. */
   team1Score?: number;
   team2Score?: number;
+  /** Maps won in the series. */
+  team1SeriesScore?: number;
+  team2SeriesScore?: number;
+  /** Rounds on the map being played (0-0 during warmup; last map once completed; null before any map). */
+  team1MapScore?: number | null;
+  team2MapScore?: number | null;
+  mapResults?: Array<{
+    mapNumber: number;
+    mapName?: string | null;
+    team1Score: number;
+    team2Score: number;
+    winnerTeam: 'team1' | 'team2' | 'none' | null;
+    completedAt: number;
+  }>;
   team1Players?: Array<{
     name: string;
     steamId: string;
@@ -188,19 +328,56 @@ export interface TournamentResponse extends Omit<Tournament, 'settings' | 'maps'
     name: string;
     tag?: string;
   }>;
-  // Shuffle tournament specific fields
+  // The game module's 2.x fields (see `Tournament.maps`)
   mapSequence?: string[];
   teamSize?: number; // Number of players per team (default: 5)
   maxRounds?: number;
   overtimeMode?: 'enabled' | 'disabled';
   overtimeSegments?: number;
+  mapPoolId?: number;
   eloTemplateId?: string; // ELO calculation template ID (optional, defaults to "Pure Win/Loss")
+  /**
+   * Champion once the tournament is completed (null otherwise, for shuffle
+   * tournaments, and for round robin when the top spot is shared).
+   */
+  winner?: { id: string; name: string; tag?: string } | null;
+  /** The page banner's URL (`GET /api/tournament/{id}/banner?v=…`), or null without one. */
+  bannerUrl?: string | null;
+}
+
+/** One row of the Swiss standings, in the order the pairing uses. */
+export interface SwissStandingEntry {
+  rank: number;
+  teamId: string;
+  wins: number;
+  losses: number;
+  /** Sum of the wins of every opponent played. */
+  buchholz: number;
+  /** Rounds won minus rounds lost over all maps. */
+  roundDiff: number;
+  byes: number;
+}
+
+/** Round robin standings row: wins, head-to-head, round difference, rounds won, seed. */
+export interface RoundRobinStandingEntry {
+  rank: number;
+  teamId: string;
+  wins: number;
+  losses: number;
+  /** Rounds won minus rounds lost over all maps. */
+  roundDiff: number;
+  roundsWon: number;
 }
 
 export interface BracketResponse {
   tournament: TournamentResponse;
   matches: BracketMatch[];
   totalRounds: number;
+  /** Swiss tournaments only: server standings, best first. */
+  swissStandings?: SwissStandingEntry[];
+  roundRobinStandings?: RoundRobinStandingEntry[];
+  /** Groups, then playoffs: each group's table (services/groupsTournament.ts). */
+  groupStandings?: Array<{ group: string; done: boolean; standings: RoundRobinStandingEntry[] }>;
 }
 
 export interface TournamentTemplate {
@@ -209,10 +386,13 @@ export interface TournamentTemplate {
   description?: string;
   type: TournamentType;
   format: MatchFormat;
+  /** Module fields (CS2: from `settings.cs2`), kept for 2.x clients. */
   mapPoolId?: number | null;
   maps: string[];
   teamIds?: string[];
   settings: TournamentSettings;
+  /** The game module whose object `settings` carries ('cs2' by default). */
+  game: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -223,10 +403,9 @@ export interface TournamentTemplateRow {
   description?: string | null;
   type: TournamentType;
   format: MatchFormat;
-  map_pool_id?: number | null;
-  maps?: string | null;
   team_ids?: string | null;
-  settings: string; // JSON string
+  settings: string; // JSON string; the game module's object is under its key (CS2: `cs2`)
+  game?: string | null;
   created_at: number;
   updated_at: number;
 }

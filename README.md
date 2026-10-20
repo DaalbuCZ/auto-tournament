@@ -1,143 +1,96 @@
 <div align="center">
-  <img src="client/public/icon.svg" alt="MatchZy Auto Tournament" width="140" height="140">
-  
-  # MatchZy Auto Tournament
-  
-  ⚡ **Automated CS2 tournament management — one click from bracket creation to final scores**
-  
-  <p>Complete tournament automation for Counter-Strike 2 using the enhanced MatchZy plugin. Zero manual server configuration.</p>
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
-[![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-
-**📚 <a href="https://docs.sivert.io/docs/mat" target="_blank">Documentation</a>** • <a href="https://discord.gg/n7gHYau7aW" target="_blank">💬 Discord</a>
-
+  <img src="docs/assets/logo/at-banner.png" alt="Auto Tournament" width="100%" />
+  <p><strong>Self-hosted tournament platform that runs the matches for you</strong></p>
+  <p>
+    <a href="https://github.com/Auto-Tournament/auto-tournament/releases/latest"><img src="https://img.shields.io/github/v/release/Auto-Tournament/auto-tournament?cacheSeconds=3600" alt="GitHub Release" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue.svg" alt="License: PolyForm Noncommercial" /></a>
+    <a href="https://docs.autotournament.gg"><img src="https://img.shields.io/badge/docs-docs.autotournament.gg-blue" alt="Docs" /></a>
+    <a href="https://discord.gg/n7gHYau7aW"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+  </p>
 </div>
 
----
+<br />
 
-## 🎯 Who is this for?
+> [!CAUTION]
+> **3.0 is in beta.** The 3.0 betas change often. The stable line is 2.4.
 
-- **Tournament Organizers** — Run professional CS2 tournaments with automated brackets, veto, ratings, and live stats
-- **Casual Players** — Quick setup to play competitive matches with friends (5v5, 2v2, or custom)
-- **Developers** — Open source platform for building CS2 tournament features
+You create the tournament. Auto Tournament starts the servers, loads each match, runs the map veto in the browser, follows the score live and moves the bracket on when a match ends. Games come in as modules: the CS2 module is included and drives servers running [Ready Up](https://github.com/Auto-Tournament/ready-up). Formerly MatchZy Auto Tournament.
 
----
+## Features
 
-## ⚡ Quick Start (5 minutes)
+- Single and double elimination, Swiss, round robin and shuffle tournaments
+- Map veto for Bo1, Bo3 and Bo5 in the browser
+- Servers started, stopped and created on your machines through [CS2 Server Manager](https://github.com/Auto-Tournament/cs2-server-manager)
+- Live scores and server status
+- Player ratings (OpenSkill) and leaderboards
+- Demo recording and download
+- Sign-in with Steam, Discord, Google, GitHub or Twitch, set up in the admin panel
+- Public team pages with connect info, no login needed
+- HTTP API with API tokens, webhooks and an OpenAPI spec, plus an example Discord bot
+- Game packs: games without a server integration, with results reported by the captains
+- Simulation mode for testing a tournament without players
+- Matchmaking (in progress, 3.1)
 
-### 1. Install Platform
+## Install
 
-```bash
-# Clone and start
-git clone https://github.com/sivert-io/matchzy-auto-tournament.git
-cd matchzy-auto-tournament
-cp example.env .env
-docker compose up -d
+You need Docker with Docker Compose.
 
-# Open http://localhost:3069
-```
+1. Get the compose file and the example config:
 
-### 2. Add CS2 Servers
+   ```bash
+   git clone https://github.com/Auto-Tournament/auto-tournament.git
+   cd auto-tournament
+   cp example.env .env
+   ```
 
-**Option A: Automated (Recommended)**
-- Use [CS2 Server Manager (CSM)](https://docs.sivert.io/docs/csm) to spin up servers with one command
+2. Set `SESSION_SECRET`, `SERVER_TOKEN` and `FRONTEND_BASE_URL` in `.env`.
+3. Start it:
 
-**Option B: Manual**
-- Install [CounterStrikeSharp](https://docs.cssharp.dev/) on your CS2 server
-- Install [MatchZy Enhanced v1.3.0+](https://github.com/sivert-io/matchzy-Enhanced/releases)
-- Add server in the platform: Settings → Servers
+   ```bash
+   docker compose --env-file .env -f docker/docker-compose.yml up -d
+   ```
 
-### 3. Create Tournament
+4. Read the one-time setup code from the log (`docker logs auto-tournament`), open `/setup`, enter it and create the admin account.
 
-Dashboard → New Tournament → Select format → Add teams → Start!
+Then set up sign-in under Settings → Sign-in, and link a machine running CS2 Server Manager under Servers. Full steps: [Getting started](https://docs.autotournament.gg/getting-started/first-login).
 
-**That's it!** Matches auto-load on servers, veto happens in the browser, and brackets update live.
+## Updating
 
----
-
-## ✨ What You Get
-
-🏆 **Tournament Formats** — Single/Double Elimination, Swiss, Round Robin, Shuffle  
-🗺️ **Map Veto** — FaceIT-style ban/pick for BO1/BO3/BO5  
-📈 **Player Ratings** — OpenSkill-backed ELO system with leaderboards  
-⚡ **Real-Time** — WebSocket updates for scores, connections, status  
-🎮 **Auto-Everything** — Server allocation, match loading, bracket progression  
-🎬 **Demo Recording** — Automatic upload and download  
-👥 **Public Pages** — No-login team pages with server connect info
-
-See screenshots in the docs: https://docs.sivert.io/docs/mat/user/screenshots
-
----
-
-## 📖 Documentation (docs.sivert.io)
-
-**For Tournament Admins (Operators):**
-- [Admin Dashboard](https://docs.sivert.io/docs/mat/user/admin-dashboard)
-- [Server Setup](https://docs.sivert.io/docs/mat/user/server-setup)
-- [Creating Tournaments](https://docs.sivert.io/docs/mat/user/tournaments)
-
-**For Developers:**
-- [Contributing Guide](.github/CONTRIBUTING.md)
-- [Architecture](https://docs.sivert.io/docs/mat/developer/architecture)
-- [Testing](https://docs.sivert.io/docs/mat/developer/testing)
-
----
-
-## 🔧 Requirements
-
-- Docker & Docker Compose
-- CS2 servers with [MatchZy Enhanced v1.3.0+](https://github.com/sivert-io/matchzy-Enhanced/releases)
-- RCON access to servers
-
----
-
-## 🔄 Updating (Docker)
-
-If you run MAT via Docker Compose, the basic update flow is:
+Back up the database, then pull and restart. Migrations run on startup.
 
 ```bash
-# (recommended) backup your database first
-mkdir -p backups
-docker compose exec -T postgres pg_dump -U "${DB_USER:-postgres}" "${DB_NAME:-matchzy_tournament}" > "backups/mat-$(date +%F-%H%M%S).sql"
-
-# pull latest image + recreate containers
-docker compose pull
-docker compose up -d
-
-# watch logs for startup/migrations
-docker compose logs -f matchzy-tournament
+docker compose --env-file .env -f docker/docker-compose.yml exec -T postgres pg_dump -U postgres auto_tournament > "backup-$(date +%F).sql"
+docker compose --env-file .env -f docker/docker-compose.yml pull
+docker compose --env-file .env -f docker/docker-compose.yml up -d
 ```
 
-More details: https://docs.sivert.io/docs/mat/user/updating
+More in [Updating](https://docs.autotournament.gg/guides/updating).
 
-For local dev builds (build from source): `yarn docker:local:restart`.
+## Documentation
 
----
+Full docs at **[docs.autotournament.gg](https://docs.autotournament.gg)**.
 
-## 🤝 Contributing
+- [API reference](docs/API-REFERENCE.md) and [OpenAPI spec](docs/openapi.json), generated from the code
+- [Webhooks](docs/WEBHOOKS.md)
+- [Example Discord bot](examples/discord-bot/README.md)
+- [Translating](TRANSLATING.md)
 
-Contributions welcome! Bug fixes, features, docs improvements, translations, or ideas.
+## Contributing
 
-**Ways to contribute:**
-- 🐛 [Report bugs or request features](.github/ISSUE_TEMPLATE/)
-- 💻 [Submit code improvements](.github/CONTRIBUTING.md)
-- 🌍 [Translate to your language](TRANSLATING.md)
-- 📚 [Improve documentation](https://docs.sivert.io/docs/mat)
+See the [contributing guide](.github/CONTRIBUTING.md). Bug reports, fixes, translations and docs changes are all welcome.
 
-**[Read Full Contributing Guide](.github/CONTRIBUTING.md)**
+## Sponsors
 
----
+Auto Tournament is built by one person. If your organisation runs events with it, a sponsorship pays for development, test servers and hosting: [GitHub Sponsors](https://github.com/sponsors/sivert-io) or [Ko-fi](https://ko-fi.com/sivert).
 
-## 📜 License
+<!-- sponsors:start -->
+<!-- sponsors:end -->
 
-MIT License - see [LICENSE](LICENSE)
+## Acknowledgments
 
-**Credits:** [cs2-server-manager](https://github.com/sivert-io/cs2-server-manager) • [brackets-manager.js](https://github.com/Drarig29/brackets-manager.js) • [brackets-viewer.js](https://github.com/Drarig29/brackets-viewer.js)
+- [brackets-manager.js](https://github.com/Drarig29/brackets-manager.js) and [brackets-viewer.js](https://github.com/Drarig29/brackets-viewer.js): the bracket engine and its views
+- [MatchZy](https://github.com/shobhit-pathak/MatchZy) by shobhit-pathak: the plugin MatchZy Enhanced was forked from
 
----
+## License
 
-<div align="center">
-  <strong>Made with ❤️ for the CS2 community</strong>
-</div>
+Auto Tournament is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Copyright (c) 2025-2026 Sivert Gullberg Hansen. Free for non-commercial use; commercial use needs a license, see [pricing](https://autotournament.gg/pricing) and [LICENSING.md](LICENSING.md).

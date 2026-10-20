@@ -1,4 +1,4 @@
-import React from 'react';
+import type { ReactNode } from 'react';
 import {
   Card,
   CardContent,
@@ -8,9 +8,9 @@ import {
   Chip,
   Stack,
 } from '@mui/material';
-import MapIcon from '@mui/icons-material/Map';
-import CheckCircleIcon from '@mui/icons-material/CheckCircle';
-import ScheduleIcon from '@mui/icons-material/Schedule';
+import { CheckCircleIcon, ClockIcon, MapTrifoldIcon } from '@phosphor-icons/react';
+import { useTranslation } from 'react-i18next';
+import { radii } from '../../theme/tokens';
 
 interface RoundStatus {
   roundNumber: number;
@@ -30,15 +30,21 @@ interface RoundStatusCardProps {
   roundStatus: RoundStatus;
   totalRounds: number;
   isActive?: boolean;
-  allocationCountdownSeconds?: number | null;
+  /**
+   * The game's own chip beside the round's counts (CS2: when the next servers
+   * are allocated). A game whose matches wait for nothing hands over nothing,
+   * and the card shows only what it counts itself.
+   */
+  queueChip?: ReactNode;
 }
 
 export function RoundStatusCard({
   roundStatus,
   totalRounds,
   isActive = false,
-  allocationCountdownSeconds,
+  queueChip,
 }: RoundStatusCardProps) {
+  const { t } = useTranslation();
   const completionPercentage =
     roundStatus.totalMatches > 0
       ? (roundStatus.completedMatches / roundStatus.totalMatches) * 100
@@ -56,18 +62,18 @@ export function RoundStatusCard({
         <Box display="flex" alignItems="center" justifyContent="space-between" mb={2}>
           <Box display="flex" alignItems="center" gap={1}>
             {roundStatus.isComplete ? (
-              <CheckCircleIcon color="success" />
+              <Box component={CheckCircleIcon} sx={{ color: 'success.main' }} />
             ) : (
-              <ScheduleIcon color={isActive ? 'primary' : 'action'} />
+              <Box component={ClockIcon} sx={{ color: isActive ? 'primary.main' : 'action.active' }} />
             )}
             <Typography variant="h6" fontWeight={600}>
-              Round {roundStatus.roundNumber} of {totalRounds}
+              {t('roundStatusCard.roundOf', { current: roundStatus.roundNumber, total: totalRounds })}
             </Typography>
             {roundStatus.isComplete && (
-              <Chip label="Complete" size="small" color="success" />
+              <Chip label={t('roundStatusCard.complete')} size="small" color="success" />
             )}
             {isActive && !roundStatus.isComplete && (
-              <Chip label="In Progress" size="small" color="primary" />
+              <Chip label={t('roundStatusCard.inProgress')} size="small" color="primary" />
             )}
           </Box>
         </Box>
@@ -75,7 +81,7 @@ export function RoundStatusCard({
         <Stack spacing={2}>
           {/* Map Info */}
           <Box display="flex" alignItems="center" gap={1}>
-            <MapIcon fontSize="small" color="action" />
+            <Box component={MapTrifoldIcon} size={20} sx={{ color: 'action.active' }} />
             <Typography variant="body2" color="text.secondary">
               {roundStatus.map}
             </Typography>
@@ -85,10 +91,13 @@ export function RoundStatusCard({
           <Box>
             <Box display="flex" justifyContent="space-between" alignItems="center" mb={1}>
               <Typography variant="body2" color="text.secondary">
-                Match Progress
+                {t('roundStatusCard.matchProgress')}
               </Typography>
               <Typography variant="body2" fontWeight={600}>
-                {roundStatus.completedMatches} / {roundStatus.totalMatches} completed
+                {t('roundStatusCard.completedOf', {
+                  completed: roundStatus.completedMatches,
+                  total: roundStatus.totalMatches,
+                })}
               </Typography>
             </Box>
             <LinearProgress
@@ -96,7 +105,7 @@ export function RoundStatusCard({
               value={completionPercentage}
               sx={{
                 height: 8,
-                borderRadius: 1,
+                borderRadius: radii.sm,
                 bgcolor: 'action.disabledBackground',
               }}
               color={roundStatus.isComplete ? 'success' : 'primary'}
@@ -106,14 +115,14 @@ export function RoundStatusCard({
           {/* Match Status Summary */}
           <Box display="flex" gap={2} flexWrap="wrap">
             <Chip
-              label={`${roundStatus.completedMatches} completed`}
+              label={t('roundStatusCard.completedCount', { count: roundStatus.completedMatches })}
               size="small"
               color="success"
               variant="outlined"
             />
             {playingCount > 0 && (
               <Chip
-                label={`${playingCount} playing`}
+                label={t('roundStatusCard.playingCount', { count: playingCount })}
                 size="small"
                 color="primary"
                 variant="outlined"
@@ -121,20 +130,13 @@ export function RoundStatusCard({
             )}
             {waitingCount > 0 && (
               <Chip
-                label={`${waitingCount} pending`}
+                label={t('roundStatusCard.pendingCount', { count: waitingCount })}
                 size="small"
                 color="warning"
                 variant="outlined"
               />
             )}
-            {allocationCountdownSeconds !== null && allocationCountdownSeconds > 0 && (
-              <Chip
-                label={`Next servers in ${Math.max(0, allocationCountdownSeconds)}s`}
-                size="small"
-                color="info"
-                variant="outlined"
-              />
-            )}
+            {queueChip}
           </Box>
 
           {/* Previously displayed a generic "next round will begin automatically" message here.

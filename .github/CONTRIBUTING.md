@@ -1,99 +1,62 @@
-# Contributing to MatchZy Auto Tournament
+# Contributing to Auto Tournament
 
-Thank you for your interest in contributing! 🎉
+The full guide is in the docs:
+[Development → Contributing](https://docs.autotournament.gg/developer/contributing).
 
-## 📚 Full Documentation
+Contributions are accepted under the project's [PolyForm Noncommercial License](../LICENSE).
 
-For detailed contribution guidelines, please see:
+## Contributor License Agreement
 
-**[Development → Contributing](https://docs.sivert.io/docs/mat/developer/contributing)**
+Before your first pull request can be merged, you sign the [CLA](../CLA.md) by
+commenting on the pull request as the CLA bot asks. You keep your copyright;
+the CLA lets the maintainer offer the project under both the non-commercial
+licence and commercial licences.
 
-## 🚀 Quick Start
+## Running it locally
 
-1. **Fork & Clone**
+```bash
+git clone https://github.com/YOUR_USERNAME/auto-tournament.git
+cd auto-tournament
+yarn install
 
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/matchzy-auto-tournament.git
-   cd matchzy-auto-tournament
-   ```
+yarn db               # starts PostgreSQL in Docker
+cp example.env .env   # the API reads .env on startup; the DB_* defaults match `yarn db`
 
-2. **Install Dependencies**
+yarn dev              # API and client together
+```
 
-   ```bash
-   yarn install
-   ```
+## Pull requests
 
-3. **Setup Environment**
+- Keep each PR to one fix or feature.
+- Test what you changed.
+- Follow the existing code style.
+- Update the docs if behaviour changes.
+- Write commit messages that say what changed and why.
 
-   ```bash
-   # Start PostgreSQL
-   yarn db
+## Releases
 
-   # Set environment variables
-   export API_TOKEN=admin123
-   export SERVER_TOKEN=server123
-   export DB_HOST=localhost
-   export DB_PORT=5432
-   export DB_USER=postgres
-   export DB_PASSWORD=postgres
-   export DB_NAME=matchzy_tournament
-   ```
+Releases are cut with the **Release** workflow or `scripts/release.sh`. Release notes go in the GitHub release; the [docs changelog](https://docs.autotournament.gg/reference/changelog/platform) is generated from them, and [CHANGELOG.md](../CHANGELOG.md) only links there.
 
-4. **Start Development**
-   ```bash
-   yarn dev
-   ```
+## Translations
 
-## 📝 Guidelines
+[TRANSLATING.md](../TRANSLATING.md) has the steps. The longer version is
+[i18n and translation](https://docs.autotournament.gg/developer/translating).
 
-- ✅ Write clear commit messages
-- ✅ Test your changes
-- ✅ Update documentation if needed
-- ✅ Follow existing code style
-- ✅ Keep PRs focused on one feature/fix
+## Reporting bugs
 
-## 🌍 Translating the Project
+[Open an issue](https://github.com/Auto-Tournament/auto-tournament/issues/new/choose)
+with what happened, how to reproduce it, what you expected, and your setup (OS,
+Docker version, MAT version).
 
-Want to help translate MatchZy Auto Tournament into your language? We'd love your help!
+If you need several players to test something, or want feedback on a change,
+use the **Community Request** issue template. People who help with those get
+credited.
 
-**Quick Start:** See [TRANSLATING.md](../TRANSLATING.md) for a 5-step guide.
+## Questions
 
-**Full Guide:** [i18n Documentation](https://docs.sivert.io/docs/mat/developer/i18n-and-translation)
+Ask in [GitHub Discussions](https://github.com/Auto-Tournament/auto-tournament/discussions)
+or on [Discord](https://discord.gg/n7gHYau7aW).
 
-**Currently supported:**
-- 🇬🇧 English
-- 🇨🇳 Simplified Chinese
+## Code of conduct
 
-Translation contributions are highly valued and help make the platform accessible worldwide! 🌍
-
-## 🐛 Reporting Issues
-
-Found a bug? Please [open an issue](https://github.com/sivert-io/matchzy-auto-tournament/issues/new) with:
-
-- Clear description
-- Steps to reproduce
-- Expected vs actual behavior
-- Environment details (OS, Docker version, etc.)
-
-## 🙏 Community Requests
-
-Need help testing something or getting feedback? Use the **Community Request** issue template! This is perfect for:
-- Features that require multiple players to test
-- Cross-platform compatibility testing
-- Getting user experience feedback
-- Performance testing with real-world scenarios
-
-**Contributors who help with Community Requests will be recognized and credited!** 🏆
-
-## 💬 Questions?
-
-- [GitHub Discussions](https://github.com/sivert-io/matchzy-auto-tournament/discussions) - Ask questions
-- [Documentation](https://docs.sivert.io/docs/mat) - Read the docs
-
-## 📖 Code of Conduct
-
-Be respectful and constructive. We're all here to build something awesome for the CS2 community! 🎮
-
----
-
-**Full Contribution Guide:** https://docs.sivert.io/docs/mat/developer/contributing
+Be respectful. The details are in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

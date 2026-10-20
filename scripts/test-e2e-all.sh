@@ -8,20 +8,20 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}MatchZy Auto Tournament - Full E2E Test Suite${NC}"
+echo -e "${BLUE}Auto Tournament - Full E2E Test Suite${NC}"
 echo "========================================="
 echo ""
 
 # Configuration
 COMPOSE_FILE="docker/docker-compose.local.yml"
-COMPOSE_PROJECT="matchzy-test"
+COMPOSE_PROJECT="auto-tournament-test"
 TEST_TIMEOUT=300 # 5 minutes timeout for tests
 
 # Cleanup function
 cleanup() {
   echo ""
   echo -e "${YELLOW}Cleaning up Docker Compose services...${NC}"
-  docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" down -v 2>/dev/null || true
+  docker compose --env-file .env -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" down -v 2>/dev/null || true
   echo -e "${GREEN}✅ Cleanup complete${NC}"
 }
 
@@ -44,8 +44,19 @@ fi
 export SERVER_TOKEN="${SERVER_TOKEN:-server123}"
 export DB_USER="${DB_USER:-postgres}"
 export DB_PASSWORD="${DB_PASSWORD:-postgres}"
-export DB_NAME="${DB_NAME:-matchzy_tournament}"
+export DB_NAME="${DB_NAME:-auto_tournament}"
 export ENABLE_TEST_ENDPOINTS="${ENABLE_TEST_ENDPOINTS:-true}"
+export MAT_TEST_INTEGRATION="${MAT_TEST_INTEGRATION:-1}"
+# The admin UI waits for the license terms; the suite accepts them up front.
+export AT_ACCEPT_LICENSE="${AT_ACCEPT_LICENSE:-noncommercial}"
+export AT_VETO_TURN_SECONDS_DEFAULT="${AT_VETO_TURN_SECONDS_DEFAULT:-0}"
+export AT_UPDATE_CHECK="${AT_UPDATE_CHECK:-off}"
+export CS2_IMAGE_PREFETCH="${CS2_IMAGE_PREFETCH:-off}"
+# Test license keys never check in with autotournament.gg.
+export LICENSE_CHECKIN_URL="${LICENSE_CHECKIN_URL:-off}"
+export API_TOKENS="${API_TOKENS:-ci-admin:ci-admin-token-0123456789abcdef}"
+export API_TOKENS_READONLY="${API_TOKENS_READONLY:-ci-readonly:ci-readonly-token-0123456789abcdef}"
+export COMPAT_INGEST_TOKEN="${COMPAT_INGEST_TOKEN:-ci-compat-token-0123456789abcdef}"
 export PLAYWRIGHT_BASE_URL="http://localhost:3069"
 
 echo -e "${BLUE}Configuration:${NC}"
@@ -54,18 +65,26 @@ echo "  Database: ${DB_USER}@localhost:5432/${DB_NAME}"
 echo "  Base URL: ${PLAYWRIGHT_BASE_URL}"
 echo ""
 
+# CS2 is a catalog module: the image carries it only in its offline snapshot,
+# signed. Local runs sign it with a throwaway key and trust that key, as CI does.
+echo -e "${YELLOW}Building the offline module snapshot (CS2)...${NC}"
+MODULE_TRUSTED_KEYS="$(bash scripts/build-module-snapshot.sh --ephemeral | sed -n 's/^MODULE_TRUSTED_KEYS=//p')"
+export MODULE_TRUSTED_KEYS
+export PREINSTALL_PACKS="${PREINSTALL_PACKS:-all}"
+export CATALOG_OFFLINE="${CATALOG_OFFLINE:-true}"
+
 # Step 1: Start Docker Compose services
 echo -e "${YELLOW}Step 1/4: Starting Docker Compose services...${NC}"
-docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" up -d --build
+docker compose --env-file .env -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" up -d --build
 
 # Wait for PostgreSQL to be ready
 echo -e "${YELLOW}Waiting for PostgreSQL to be ready...${NC}"
 timeout=60
 elapsed=0
-while ! docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" exec -T postgres pg_isready -U "${DB_USER}" > /dev/null 2>&1; do
+while ! docker compose --env-file .env -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" exec -T postgres pg_isready -U "${DB_USER}" > /dev/null 2>&1; do
   if [ $elapsed -ge $timeout ]; then
     echo -e "${RED}❌ PostgreSQL failed to start within ${timeout} seconds${NC}"
-    docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" logs postgres --tail=20
+    docker compose --env-file .env -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" logs postgres --tail=20
     exit 1
   fi
   sleep 2
@@ -83,7 +102,7 @@ while ! curl -f -s http://localhost:3069/health > /dev/null 2>&1; do
   if [ $elapsed -ge $timeout ]; then
     echo -e "${RED}❌ Application failed to start within ${timeout} seconds${NC}"
     echo -e "${YELLOW}Container logs:${NC}"
-    docker compose -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" logs matchzy-tournament --tail=50
+    docker compose --env-file .env -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" logs auto-tournament --tail=50
     exit 1
   fi
   sleep 2
@@ -92,6 +111,12 @@ while ! curl -f -s http://localhost:3069/health > /dev/null 2>&1; do
 done
 echo ""
 echo -e "${GREEN}✅ Application is ready${NC}"
+
+# Install CS2 the way an admin does, from the catalog (as CI does).
+curl -sf -X POST http://localhost:3069/api/catalog/modules/cs2/install \
+  -H "Authorization: Bearer ${API_TOKENS#*:}" -H 'Content-Type: application/json' -d '{}' > /dev/null \
+  && echo -e "${GREEN}✅ CS2 installed from the catalog${NC}" \
+  || echo -e "${YELLOW}⚠️  CS2 was not installed from the catalog (already installed?)${NC}"
 
 # Step 2: Run Playwright tests
 echo ""

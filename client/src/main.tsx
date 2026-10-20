@@ -2,16 +2,27 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { I18nextProvider } from 'react-i18next';
 import { ThemeProvider, CssBaseline } from '@mui/material';
-import { zhCN, enUS, frFR, deDE, esES, itIT, ptPT, plPL, nlNL } from '@mui/material/locale';
+import { zhCN, enUS, frFR, deDE, esES, itIT, ptPT, plPL, nlNL, nbNO } from '@mui/material/locale';
 import App from './App';
 import './index.css';
 import i18n from './i18n';
-import { theme as baseTheme } from './theme';
+import { theme as baseTheme, activeThemeId, tokens } from './theme';
 import { createTheme } from '@mui/material/styles';
+import { applyFaviconTheme } from './theme/favicon';
+import { IconDefaults } from './theme/icons';
+import { bootCodeModules } from './module-loader/boot';
 
 // Log application version on startup (injected by Vite from package.json)
 
-console.info('[MatchZy] App version:', __APP_VERSION__);
+console.info('[Auto Tournament] App version:', __APP_VERSION__);
+
+// Ember's favicon is baked into index.html; swap it for the active theme's
+// recoloured ram logo otherwise.
+applyFaviconTheme(activeThemeId, {
+  accent: tokens.color.accent,
+  accent2: tokens.color.accent2,
+  logoInk: tokens.color.logoInk,
+});
 
 const getMuiLocale = (lang: string) => {
   if (lang.startsWith('zh')) return zhCN;
@@ -22,6 +33,8 @@ const getMuiLocale = (lang: string) => {
   if (lang.startsWith('pt')) return ptPT;
   if (lang.startsWith('pl')) return plPL;
   if (lang.startsWith('nl')) return nlNL;
+  // Built-in MUI strings (Autocomplete "Clear"/"Open", pagination, …)
+  if (lang.startsWith('nb') || lang.startsWith('no')) return nbNO;
   return enUS;
 };
 
@@ -46,11 +59,19 @@ const Root: React.FC = () => {
       <I18nextProvider i18n={i18n}>
         <ThemeProvider theme={muiTheme}>
           <CssBaseline />
-          <App />
+          {/* Phosphor's size, weight and colour for every icon (theme/icons). */}
+          <IconDefaults>
+            <App />
+          </IconDefaults>
         </ThemeProvider>
       </I18nextProvider>
     </React.StrictMode>
   );
 };
+
+// Code modules: ask for the public manifest now, alongside the first render,
+// never before it. Nothing waits on this; a module's slots and routes show a
+// pending state until it arrives (`useIntegration` in integrations/registry).
+void bootCodeModules();
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<Root />);

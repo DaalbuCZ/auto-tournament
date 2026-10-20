@@ -1,4 +1,5 @@
-import React, { useEffect } from 'react';
+import { pageTitle } from '../utils/pageTitle';
+import { useEffect } from 'react';
 import { Box, Button, Container, Typography, Card, CardContent, Stack } from '@mui/material';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
@@ -6,7 +7,16 @@ import { useAuth } from '../contexts/AuthContext';
 import { SteamIcon } from '../components/icons/SteamIcon';
 import { PlayerAvatar } from '../components/player/PlayerAvatar';
 import { generateAvatarDataUrl } from '../generation/avatar';
+import { tokens } from '../theme/tokens';
 
+/**
+ * `/connect-steam`: an admin who signed in with another provider links a Steam
+ * account before the dashboard opens.
+ *
+ * Steam is the platform's own sign-in provider, used by admins of every game,
+ * so this page is core's, not a game module's (DESIGN-module-client-api.md,
+ * decision 8).
+ */
 export default function ConnectSteam() {
   const {
     isAuthenticated,
@@ -22,7 +32,7 @@ export default function ConnectSteam() {
   const { t } = useTranslation();
 
   useEffect(() => {
-    document.title = t('connectSteam.title');
+    document.title = pageTitle(t('connectSteam.title'));
   }, [t]);
 
   useEffect(() => {
@@ -58,7 +68,7 @@ export default function ConnectSteam() {
     generateAvatarDataUrl(`${providerLabel}:${displayName}`);
 
   return (
-    <Box minHeight="100vh" bgcolor="background.default" display="flex" alignItems="center">
+    <Box minHeight="100vh" bgcolor="transparent" display="flex" alignItems="center">
       <Container maxWidth="sm">
         <Card>
           <CardContent sx={{ p: 4 }}>
@@ -67,13 +77,13 @@ export default function ConnectSteam() {
                 <PlayerAvatar id={null} name={displayName} avatarUrl={avatarUrl} size={56} />
                 <Box>
                   <Typography variant="overline" color="text.secondary" display="block">
-                    Signed in as
+                    {t('connectSteam.signedInAs')}
                   </Typography>
                   <Typography variant="subtitle1" fontWeight={600}>
                     {displayName}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    via {providerLabel}
+                    {t('connectSteam.viaProvider', { provider: providerLabel })}
                   </Typography>
                 </Box>
               </Stack>
@@ -98,10 +108,10 @@ export default function ConnectSteam() {
                   fullWidth
                   startIcon={<SteamIcon />}
                   sx={{
-                    bgcolor: '#171a21',
-                    color: '#ffffff',
+                    bgcolor: tokens.brand.steam,
+                    color: tokens.brand.onBrand,
                     '&:hover': {
-                      bgcolor: '#1b2838',
+                      bgcolor: tokens.brand.steamHover,
                     },
                   }}
                 >

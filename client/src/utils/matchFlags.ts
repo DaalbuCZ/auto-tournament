@@ -1,5 +1,6 @@
 // Match-like shape shared across different views (Matches page, Team page, modals).
 // We only care about round, team IDs and an optional config with vetoDisabled.
+import type { Untrusted } from './untrusted';
 export type MatchLike = {
   round?: number | null;
   team1?: { id?: string | null } | null;
@@ -9,10 +10,10 @@ export type MatchLike = {
     team1?: { id?: string | null } | null;
     team2?: { id?: string | null } | null;
     // Allow additional fields without typing them explicitly
-    [key: string]: unknown;
+    [key: string]: Untrusted;
   } | null;
   // Allow additional top-level fields without typing them explicitly
-  [key: string]: unknown;
+  [key: string]: Untrusted;
 };
 
 /**
@@ -49,9 +50,8 @@ export const isShuffleMatch = (match: MatchLike): boolean => {
 };
 
 /**
- * Frontend-level veto disable flag used by cards, team view and match modal.
- * This is separate from MatchZy's skip_veto flag, which is handled entirely
- * on the server/plugin side.
+ * Veto disable flag used by cards, team view and match modal (the veto is the
+ * platform's, in the browser).
  *
  * For manual matches: veto is disabled by default, but can be enabled via
  * config.vetoDisabled === false. Shuffle matches always have veto disabled.
@@ -59,15 +59,13 @@ export const isShuffleMatch = (match: MatchLike): boolean => {
 export const isVetoDisabledForMatch = (match: MatchLike): boolean => {
   // Shuffle matches never use veto
   if (isShuffleMatch(match)) return true;
-  
+
   // Manual matches: check config.vetoDisabled flag
   // If vetoDisabled is explicitly false, veto is enabled
   if (isManualMatch(match)) {
     return match.config?.vetoDisabled !== false;
   }
-  
+
   // For bracket matches, check the explicit flag
   return match.config?.vetoDisabled === true;
 };
-
-

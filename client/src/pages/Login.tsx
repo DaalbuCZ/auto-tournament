@@ -1,12 +1,43 @@
+import { pageTitle } from '../utils/pageTitle';
 import React, { useEffect, useState } from 'react';
-import { Box, Card, Button, Alert, Container, Link, Stack, Typography } from '@mui/material';
-import { OpenInNew as OpenInNewIcon } from '@mui/icons-material';
-import { SiDiscord, SiGithub, SiKeycloak } from 'react-icons/si';
-import { useLocation } from 'react-router-dom';
+import {
+  Box,
+  Card,
+  Button,
+  Alert,
+  CircularProgress,
+  Container,
+  Link,
+  Skeleton,
+  Stack,
+  Typography,
+} from '@mui/material';
+import { Link as RouterLink } from 'react-router-dom';
+import { paths } from '../paths';
+import { BookOpenIcon, GithubLogoIcon, GlobeIcon, ScalesIcon } from '@phosphor-icons/react';
 import { useAuth } from '../contexts/AuthContext';
 import { useTranslation } from 'react-i18next';
-import { SteamIcon } from '../components/icons/SteamIcon';
+import { ProviderLogo, hasProviderLogo } from '../components/auth/ProviderLogo';
 import { TopNavBar } from '../components/layout/TopNavBar';
+import { AtIcon } from '../components/common/AtIcon';
+import { ExternalLink } from '../components/common/ExternalLink';
+
+/** Stands for "no sign-in method is available"; rendered as `login.unavailable`. */
+const SIGN_IN_UNAVAILABLE = 'sign-in-unavailable';
+/** The site answered, with no sign-in turned on: a fresh install, not an outage. */
+const SIGN_IN_NOT_SET_UP = 'sign-in-not-set-up';
+/** The provider list could not be loaded; rendered as `login.loadFailed`. */
+const LOAD_FAILED = 'load-failed';
+
+/** Black or white text, whichever reads better on `hex` (#rrggbb). */
+function readableOn(hex: string): string {
+  const n = parseInt(hex.slice(1), 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.4 ? '#111111' : '#ffffff';
+}
 
 export default function Login() {
   const { t } = useTranslation();
@@ -17,16 +48,25 @@ export default function Login() {
       label: string;
       loginUrl: string;
       enabled: boolean;
-      buttonLabel?: string;
-      buttonBgColor?: string;
-      buttonTextColor?: string;
-      buttonHoverBgColor?: string;
+      /** OpenID Connect: the admin's logo and button colour. */
+      logoUrl?: string | null;
+      buttonColor?: string | null;
     }>
   >([]);
   const [loadingProviders, setLoadingProviders] = useState(false);
   const [providersError, setProvidersError] = useState<string | null>(null);
-  const location = useLocation();
   const hasLoadedProvidersRef = React.useRef(false);
+  // Local admin login (small link) and first-admin setup (/api/auth/local/status).
+  const [localLogin, setLocalLogin] = useState<{ enabled: boolean; setup: boolean } | null>(null);
+
+  useEffect(() => {
+    void fetch('/api/auth/local/status', { credentials: 'same-origin' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { enabled?: boolean; setup?: boolean } | null) => {
+        if (data) setLocalLogin({ enabled: data.enabled === true, setup: data.setup === true });
+      })
+      .catch(() => undefined);
+  }, []);
   // __APP_VERSION__ is injected by Vite at build time (see client/vite.config.ts)
   const appVersion = __APP_VERSION__;
 
@@ -37,7 +77,7 @@ export default function Login() {
     }
     hasLoadedProvidersRef.current = true;
 
-    document.title = t('login.title');
+    document.title = pageTitle(t('login.title'));
   }, [t]);
 
   useEffect(() => {
@@ -58,10 +98,8 @@ export default function Login() {
             label: string;
             loginUrl: string;
             enabled: boolean;
-            buttonLabel?: string;
-            buttonBgColor?: string;
-            buttonTextColor?: string;
-            buttonHoverBgColor?: string;
+            logoUrl?: string | null;
+            buttonColor?: string | null;
           }>;
           error?: string;
         } = await response.json();
@@ -74,24 +112,23 @@ export default function Login() {
         const enabledProviders = providersList.filter((p) => p.enabled);
         setProviders(enabledProviders);
 
-        if (!data.success || enabledProviders.length === 0) {
-          throw new Error(
-            data.error ||
-              'No sign-in providers are configured. Please configure Steam or another SSO provider on the server.'
-          );
+        if (data.success && enabledProviders.length === 0) {
+          throw new Error(SIGN_IN_NOT_SET_UP);
         }
-
-        // If only Steam is configured, keep backwards-compatible behaviour.
-        if (enabledProviders.length === 1 && enabledProviders[0].id === 'steam') {
-          // no-op here; the primary button below will handle it.
+        if (!data.success) {
+          // The API's reason is English only; the alert says it in the
+          // viewer's language instead (see SIGN_IN_UNAVAILABLE below).
+          throw new Error(SIGN_IN_UNAVAILABLE);
         }
       } catch (error) {
         console.error(error);
-        const message =
-          error instanceof Error
+        // The alert says it in the viewer's language; details are in the console.
+        setProvidersError(
+          error instanceof Error &&
+            (error.message === SIGN_IN_UNAVAILABLE || error.message === SIGN_IN_NOT_SET_UP)
             ? error.message
-            : 'Failed to load sign-in options. Please try again or check server logs.';
-        setProvidersError(message);
+            : LOAD_FAILED
+        );
       } finally {
         setLoadingProviders(false);
       }
@@ -100,7 +137,21 @@ export default function Login() {
     void loadProviders();
   }, []);
 
+  // The provider whose sign-in is under way: its button shows a spinner and
+  // the others wait, so a second click can't start another redirect.
+  const [pendingProvider, setPendingProvider] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Coming back with the browser's Back button restores the page from cache.
+    const reset = (event: globalThis.PageTransitionEvent) => {
+      if (event.persisted) setPendingProvider(null);
+    };
+    window.addEventListener('pageshow', reset);
+    return () => window.removeEventListener('pageshow', reset);
+  }, []);
+
   const handleProviderClick = (providerId: string, loginUrl: string) => {
+    setPendingProvider(providerId);
     if (providerId === 'steam') {
       // Use the existing helper so that future changes to the Steam flow are centralized.
       loginWithSteam();
@@ -110,222 +161,266 @@ export default function Login() {
     window.location.href = loginUrl;
   };
 
+  const footerLinks = [
+    {
+      href: 'https://autotournament.gg',
+      label: t('login.website'),
+      Icon: GlobeIcon,
+      testId: 'login-website-link',
+    },
+    {
+      href: 'https://docs.autotournament.gg',
+      label: t('login.documentation'),
+      Icon: BookOpenIcon,
+      testId: 'login-docs-link',
+    },
+    {
+      href: 'https://github.com/Auto-Tournament/auto-tournament',
+      label: t('login.github'),
+      Icon: GithubLogoIcon,
+      testId: 'login-github-link',
+    },
+  ];
+
+  // Footer links: small text, but a 44px-tall hit area for touch.
+  const quietLinkSx = {
+    fontSize: '0.8rem',
+    whiteSpace: 'nowrap',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 0.5,
+    minHeight: 44,
+    '@media (hover: hover)': { '&:hover': { color: 'text.primary' } },
+  } as const;
+
   return (
     <Box
       sx={{
         minHeight: '100vh',
         display: 'flex',
         flexDirection: 'column',
-        background: 'linear-gradient(135deg, #1C1B1F 0%, #2B2930 100%)',
+        // Transparent: the body carries the paper colour.
+        background: 'transparent',
       }}
     >
       <TopNavBar />
-      <Box
-        sx={{
-          flex: 1,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-        }}
-      >
+      <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', py: 4 }}>
         <Container maxWidth="xs">
-        <Card
-          elevation={0}
-          sx={{
-            p: { xs: 4, md: 5 },
-            backgroundColor: 'background.paper',
-            borderRadius: 3,
-            boxShadow: (theme) => theme.shadows[location.pathname === '/login' ? 8 : 2],
-          }}
-        >
-          <Stack spacing={4} alignItems="center">
-            <Stack spacing={2} alignItems="center" sx={{ width: '100%' }}>
-              <Box
-                sx={{
-                  display: 'flex',
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                  width: '100%',
-                }}
-              >
-                <img
-                  src="/icon.svg"
-                  alt="MatchZy Auto Tournament Logo"
-                  style={{ width: '108px', height: '108px' }}
-                />
-              </Box>
-
-              <Stack spacing={0.5} alignItems="center" sx={{ textAlign: 'center', px: 2 }}>
-                <Typography variant="h5" fontWeight={600}>
-                  {t('login.welcome')}
-                </Typography>
-                <Typography variant="body2" color="text.secondary" maxWidth={320}>
-                  {t('login.subtitle')}
-                </Typography>
+          <Card elevation={0} sx={{ backgroundColor: 'background.paper', overflow: 'hidden' }}>
+            <Stack spacing={3.5} sx={{ p: { xs: 3, sm: 4 } }}>
+              <Stack direction="row" spacing={2} alignItems="center">
+                <Box
+                  sx={{
+                    width: 56,
+                    height: 56,
+                    borderRadius: '14px',
+                    overflow: 'hidden',
+                    display: 'flex',
+                    flexShrink: 0,
+                  }}
+                >
+                  <AtIcon size={56} title="Auto Tournament Logo" />
+                </Box>
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography component="h1" variant="h5" fontWeight={700} sx={{ lineHeight: 1.2 }}>
+                    {t('login.welcome')}
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    {t('login.subtitle')}
+                  </Typography>
+                </Box>
               </Stack>
-            </Stack>
 
-            {/* Provider-based sign in (Steam, Keycloak, Discord, etc.) */}
-            <Stack spacing={2.5} sx={{ width: '100%' }}>
-              {providersError && (
-                <Alert severity="error" sx={{ borderRadius: 2 }}>
+              {localLogin?.setup && (
+                <Alert severity="info" data-testid="login-setup-notice">
                   <Stack spacing={0.5}>
-                    <Typography variant="body2">{providersError}</Typography>
+                    <Typography variant="body2">{t('login.setupNotice')}</Typography>
                     <Link
-                      href="https://docs.sivert.io/docs/mat/developer/auth-providers"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      sx={{ fontSize: '0.8rem' }}
+                      component={RouterLink}
+                      to={paths.setup}
+                      variant="body2"
+                      data-testid="login-setup-link"
                     >
-                      {t('login.documentation')}
+                      {t('login.setupLink')}
                     </Link>
                   </Stack>
                 </Alert>
               )}
 
-              <Stack spacing={1.5}>
-                {providers.map((provider) => {
-                  const isSteam = provider.id === 'steam';
-                  const isDiscord = provider.id === 'discord';
-                  const isGitHub = provider.id === 'github';
-                  const isKeycloak = provider.id === 'keycloak';
+              {providersError && !localLogin?.setup && (
+                <Alert severity="error" data-testid="login-providers-error">
+                  <Stack spacing={0.5}>
+                    <Typography variant="body2">
+                      {providersError === SIGN_IN_NOT_SET_UP
+                        ? t('login.notSetUp')
+                        : providersError === SIGN_IN_UNAVAILABLE
+                          ? t('login.unavailable')
+                          : t('login.loadFailed')}
+                    </Typography>
+                    <ExternalLink
+                      href="https://docs.autotournament.gg/guides/sign-in"
+                      sx={{ fontSize: '0.8rem' }}
+                    >
+                      {t('login.signInGuide')}
+                    </ExternalLink>
+                  </Stack>
+                </Alert>
+              )}
 
-                  // Brand-aligned button styles per provider
-                  const { variant, color, sx, icon } = (() => {
-                    if (isSteam) {
-                      return {
-                        variant: 'contained' as const,
-                        color: 'primary' as const,
-                        sx: {
-                          bgcolor: '#171a21',
-                          color: '#ffffff',
-                          '&:hover': {
-                            bgcolor: '#1b2838',
-                          },
-                        },
-                        icon: <SteamIcon />,
-                      };
-                    }
-                    if (isDiscord) {
-                      return {
-                        variant: 'contained' as const,
-                        color: 'inherit' as const,
-                        sx: {
-                          bgcolor: '#5865F2',
-                          color: '#ffffff',
-                          '&:hover': {
-                            bgcolor: '#4752c4',
-                          },
-                        },
-                        icon: <SiDiscord />,
-                      };
-                    }
-                    if (isGitHub) {
-                      return {
-                        variant: 'contained' as const,
-                        color: 'inherit' as const,
-                        sx: {
-                          bgcolor: '#24292e',
-                          color: '#ffffff',
-                          '&:hover': {
-                            bgcolor: '#1b1f23',
-                          },
-                        },
-                        icon: <SiGithub />,
-                      };
-                    }
-                    if (isKeycloak) {
-                      const bg = provider.buttonBgColor || '#3262a8';
-                      const text = provider.buttonTextColor || '#ffffff';
-                      const hoverBg = provider.buttonHoverBgColor || '#274c82';
-                      return {
-                        variant: 'contained' as const,
-                        color: 'inherit' as const,
-                        sx: {
-                          bgcolor: bg,
-                          color: text,
-                          '&:hover': {
-                            bgcolor: hoverBg,
-                          },
-                        },
-                        icon: <SiKeycloak />,
-                      };
-                    }
-                    return {
-                      variant: 'outlined' as const,
-                      color: 'inherit' as const,
-                      sx: undefined,
-                      icon: undefined,
-                    };
-                  })();
+              {/* One button per provider the API offers, in its order. */}
+              <Stack spacing={1.25} aria-busy={loadingProviders || undefined}>
+                {providers.map((provider, index) => {
+                  // The first provider gets the theme's accent; the rest are outlined.
+                  const isPreferred = index === 0;
+                  const isPending = pendingProvider === provider.id;
 
                   return (
                     <Button
                       key={provider.id}
                       fullWidth
                       size="large"
-                      variant={variant}
-                      color={color}
-                      sx={sx}
+                      variant={isPreferred ? 'contained' : 'outlined'}
+                      color={isPreferred ? 'primary' : 'inherit'}
                       onClick={() => handleProviderClick(provider.id, provider.loginUrl)}
-                      startIcon={icon}
-                      disabled={loadingProviders}
-                      data-testid={
-                        isSteam
-                          ? 'login-steam-sign-in-button'
-                          : `login-${provider.id}-sign-in-button`
-                      }
+                      disabled={loadingProviders || (pendingProvider !== null && !isPending)}
+                      aria-busy={isPending || undefined}
+                      data-testid={`login-${provider.id}-sign-in-button`}
+                      sx={{
+                        minHeight: 48,
+                        justifyContent: 'flex-start',
+                        gap: 1.5,
+                        px: 2,
+                        // The pending button keeps its look; it just stops taking clicks.
+                        ...(isPending && { pointerEvents: 'none' }),
+                        ...(!isPreferred && { borderColor: 'divider' }),
+                        // The colour the admin gave an OpenID Connect provider.
+                        ...(provider.buttonColor && {
+                          bgcolor: provider.buttonColor,
+                          borderColor: provider.buttonColor,
+                          color: readableOn(provider.buttonColor),
+                          '&:hover': { bgcolor: provider.buttonColor, filter: 'brightness(0.92)' },
+                        }),
+                      }}
                     >
-                      {provider.buttonLabel || `Sign in with ${provider.label}`}
+                      {/* Fixed logo slot, so every label sits in the same place. */}
+                      <Box
+                        component="span"
+                        sx={{
+                          width: 20,
+                          height: 20,
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          flexShrink: 0,
+                        }}
+                      >
+                        {isPending ? (
+                          <CircularProgress size={18} color="inherit" aria-hidden />
+                        ) : (
+                          (provider.logoUrl || hasProviderLogo(provider.id)) && (
+                            <ProviderLogo id={provider.id} src={provider.logoUrl} />
+                          )
+                        )}
+                      </Box>
+                      <Box
+                        component="span"
+                        sx={{ flex: 1, textAlign: 'center', pr: '20px', whiteSpace: 'nowrap' }}
+                      >
+                        {t('login.signInWith', { provider: provider.label })}
+                      </Box>
                     </Button>
                   );
                 })}
 
-                {loadingProviders && providers.length === 0 && (
-                  <Button fullWidth size="large" variant="contained" disabled>
-                    {t('login.signingIn')}
+                {/* The buttons' shape while the list loads. */}
+                {loadingProviders &&
+                  providers.length === 0 &&
+                  [0, 1].map((i) => (
+                    <Skeleton
+                      key={i}
+                      variant="rounded"
+                      height={48}
+                      sx={{ borderRadius: 999 }}
+                      data-testid="login-provider-skeleton"
+                    />
+                  ))}
+
+                {/* The username + password admin login, while it is on (Settings → Sign-in). */}
+                {localLogin?.enabled && !localLogin.setup && (
+                  <Button
+                    component={RouterLink}
+                    to={paths.adminLogin}
+                    variant="text"
+                    color="inherit"
+                    size="small"
+                    data-testid="login-admin-link"
+                    sx={{ alignSelf: 'center', color: 'text.secondary', mt: 0.5 }}
+                  >
+                    {t('login.adminLink')}
                   </Button>
                 )}
               </Stack>
             </Stack>
 
-            <Stack spacing={1.5} alignItems="center" sx={{ width: '100%' }}>
-              <Stack direction="row" spacing={2}>
-                <Link
-                  href="https://github.com/sivert-io/matchzy-auto-tournament"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  sx={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 0.5,
-                  }}
+            <Stack
+              component="nav"
+              aria-label={t('login.linksLabel')}
+              direction="row"
+              alignItems="center"
+              justifyContent="center"
+              columnGap={{ xs: 2, sm: 3 }}
+              flexWrap="wrap"
+              sx={{ px: 2, py: 0.5, borderTop: 1, borderColor: 'divider' }}
+            >
+              {footerLinks.map((link) => (
+                <ExternalLink
+                  key={link.href}
+                  href={link.href}
+                  hideIcon
+                  underline="hover"
+                  color="text.secondary"
+                  data-testid={link.testId}
+                  sx={quietLinkSx}
                 >
-                  {t('login.github')}
-                  <OpenInNewIcon sx={{ fontSize: '1rem' }} />
-                </Link>
-                <Link
-                  href="https://docs.sivert.io/docs/mat"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  sx={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 0.5,
-                  }}
-                >
-                  {t('login.documentation')}
-                  <OpenInNewIcon sx={{ fontSize: '1rem' }} />
-                </Link>
-              </Stack>
-
-              <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>
-                {t('login.version')} {appVersion || 'Unknown'}
-              </Typography>
+                  <link.Icon size={14} aria-hidden />
+                  {link.label}
+                </ExternalLink>
+              ))}
             </Stack>
+          </Card>
+
+          <Stack
+            direction="row"
+            alignItems="center"
+            justifyContent="center"
+            columnGap={1.5}
+            sx={{ mt: 0.5 }}
+          >
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              title={t('login.version')}
+              sx={{ fontVariantNumeric: 'tabular-nums' }}
+              data-testid="login-version"
+            >
+              {appVersion ? `v${appVersion}` : '—'}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" aria-hidden>
+              ·
+            </Typography>
+            <ExternalLink
+              href="https://docs.autotournament.gg/reference/licensing"
+              hideIcon
+              underline="hover"
+              color="text.secondary"
+              data-testid="login-license-link"
+              sx={{ ...quietLinkSx, fontSize: '0.75rem' }}
+            >
+              <ScalesIcon size={13} aria-hidden />
+              {t('login.license')}
+            </ExternalLink>
           </Stack>
-        </Card>
-      </Container>
+        </Container>
       </Box>
     </Box>
   );

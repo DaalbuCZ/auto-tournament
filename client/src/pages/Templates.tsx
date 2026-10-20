@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { usePageHeader } from '../contexts/PageHeaderContext';
+import { pageTitle } from '../utils/pageTitle';
+import { useState, useEffect, useCallback } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { PageHead } from '../components/common/ui';
 import {
   Box,
   Typography,
@@ -26,11 +27,12 @@ import {
   Divider,
 } from '@mui/material';
 import {
-  Delete as DeleteIcon,
-  Edit as EditIcon,
-  Add as AddIcon,
-  ContentCopy as CopyIcon,
-} from '@mui/icons-material';
+  CopyIcon,
+  FileTextIcon,
+  PencilSimpleIcon,
+  PlusIcon,
+  TrashIcon,
+} from '@phosphor-icons/react';
 import { api } from '../utils/api';
 import type { TournamentTemplate } from '../types/tournament.types';
 import type { TournamentResponse } from '../types';
@@ -38,7 +40,10 @@ import { TOURNAMENT_TYPES, MATCH_FORMATS } from '../constants/tournament';
 import type { Map, MapPool } from '../types/api.types';
 import { useSnackbar } from '../contexts/SnackbarContext';
 import ConfirmDialog from '../components/modals/ConfirmDialog';
+import { EmptyState } from '../components/shared/EmptyState';
 import { useTranslation } from 'react-i18next';
+import { PageTabs } from '../components/manage/PageTabs';
+import { paths, manageTournamentPath } from '../paths';
 
 const TOURNAMENT_TYPE_LABELS: Record<string, string> = {
   single_elimination: 'Single Elimination',
@@ -54,8 +59,13 @@ const FORMAT_LABELS: Record<string, string> = {
 };
 
 export default function Templates() {
-  const { setHeaderActions } = usePageHeader();
   const navigate = useNavigate();
+  // `?tab=ratings` (old links, the IA plan's address): Ratings is its own page.
+  const [searchParams] = useSearchParams();
+  const ratingsTab = searchParams.get('tab') === 'ratings';
+  useEffect(() => {
+    if (ratingsTab) navigate(paths.eloTemplates, { replace: true });
+  }, [ratingsTab, navigate]);
   const [templates, setTemplates] = useState<TournamentTemplate[]>([]);
   const [loading, setLoading] = useState(true);
   const { showSuccess, showError } = useSnackbar();
@@ -74,23 +84,6 @@ export default function Templates() {
   const [selectedMapPool, setSelectedMapPool] = useState<string>('');
   const [loadingMaps, setLoadingMaps] = useState(false);
   const { t } = useTranslation();
-
-  useEffect(() => {
-    setHeaderActions(
-      <Button
-        variant="contained"
-        size="small"
-        startIcon={<AddIcon />}
-        onClick={() => navigate('/tournament')}
-      >
-        Create Template from Tournament
-      </Button>
-    );
-
-    return () => {
-      setHeaderActions(null);
-    };
-  }, [setHeaderActions, navigate]);
 
   const loadTournamentStatus = useCallback(async () => {
     try {
@@ -137,10 +130,10 @@ export default function Templates() {
   };
 
   const getMapType = (mapId: string): string => {
-    if (mapId.startsWith('de_')) return 'Defusal';
-    if (mapId.startsWith('cs_')) return 'Hostage';
-    if (mapId.startsWith('ar_')) return 'Arms Race';
-    return 'Unknown';
+    if (mapId.startsWith('de_')) return t('tournament.mapPool.types.defusal');
+    if (mapId.startsWith('cs_')) return t('tournament.mapPool.types.hostage');
+    if (mapId.startsWith('ar_')) return t('tournament.mapPool.types.armsRace');
+    return t('tournament.mapPool.types.unknown');
   };
 
   const getMapTypeColor = (mapId: string): 'default' | 'primary' | 'secondary' | 'success' => {
@@ -185,7 +178,7 @@ export default function Templates() {
   }, [showError, t]);
 
   useEffect(() => {
-    document.title = t('layout.pageTitle.templates');
+    document.title = pageTitle(t('layout.pageTitle.templates'));
     loadTemplates();
     loadTournamentStatus();
     loadMaps();
@@ -295,24 +288,37 @@ export default function Templates() {
     const params = new URLSearchParams({
       template: template.id.toString(),
     });
-    navigate(`/tournament?${params.toString()}`);
+    navigate(`/manage/tournament?${params.toString()}`);
   };
 
-  useEffect(() => {
-    setHeaderActions(
-      <Button variant="contained" startIcon={<AddIcon />} onClick={() => navigate('/tournament')}>
-        {t('templatesPage.header.createFromTournament')}
-      </Button>
-    );
-
-    return () => {
-      setHeaderActions(null);
-    };
-  }, [setHeaderActions, navigate, t]);
+  const pageHead = (
+    <>
+      <PageHead
+        title={t('layout.pageTitle.templates')}
+        actions={
+          <Button
+            variant="contained"
+            startIcon={<PlusIcon />}
+            onClick={() => navigate(manageTournamentPath('new', 'setup'))}
+          >
+            {t('templatesPage.header.createFromTournament')}
+          </Button>
+        }
+      />
+      <PageTabs
+        label={t('managePage.rail.templatesAndRatings')}
+        tabs={[
+          { key: 'templates', label: t('managePage.rail.templates'), to: paths.templates },
+          { key: 'ratings', label: t('managePage.rail.ratings'), to: paths.eloTemplates },
+        ]}
+      />
+    </>
+  );
 
   if (loading) {
     return (
       <Box sx={{ width: '100%', height: '100%' }}>
+        {pageHead}
         <Box display="flex" justifyContent="center" alignItems="center" minHeight="400px">
           <CircularProgress />
         </Box>
@@ -322,14 +328,18 @@ export default function Templates() {
 
   return (
     <Box sx={{ width: '100%', height: '100%' }}>
+      {pageHead}
       {templates.length === 0 ? (
-        <Card>
-          <CardContent>
-            <Typography variant="body1" color="text.secondary" align="center" py={4}>
-              {t('templatesPage.empty')}
-            </Typography>
-          </CardContent>
-        </Card>
+        // The same empty state as Teams, Players, Maps and Ratings: icon,
+        // title, what to do, and the button that does it.
+        <EmptyState
+          icon={FileTextIcon}
+          title={t('templatesPage.emptyTitle')}
+          description={t('templatesPage.emptyDescription')}
+          actionLabel={t('templatesPage.header.createFromTournament')}
+          actionIcon={PlusIcon}
+          onAction={() => navigate(manageTournamentPath('new', 'setup'))}
+        />
       ) : (
         <Grid container spacing={2}>
           {templates.map((template) => (
@@ -353,7 +363,7 @@ export default function Templates() {
                         onClick={() => handleEdit(template)}
                         sx={{ mr: 0.5 }}
                       >
-                        <EditIcon fontSize="small" />
+                        <PencilSimpleIcon size={20} />
                       </IconButton>
                       <IconButton
                         size="small"
@@ -363,14 +373,16 @@ export default function Templates() {
                           setDeleteDialogOpen(true);
                         }}
                       >
-                        <DeleteIcon fontSize="small" />
+                        <TrashIcon size={20} />
                       </IconButton>
                     </Box>
                   </Box>
 
                   <Stack direction="row" spacing={1} mb={2} flexWrap="wrap" gap={1}>
                     <Chip
-                      label={TOURNAMENT_TYPE_LABELS[template.type] || template.type}
+                      label={t(`tournament.typeSelector.types.${template.type}.label`, {
+                        defaultValue: TOURNAMENT_TYPE_LABELS[template.type] || template.type,
+                      })}
                       size="small"
                       color="primary"
                       variant="outlined"
@@ -405,13 +417,13 @@ export default function Templates() {
                     }
                     title={
                       tournamentStatus === 'in_progress' || tournamentStatus === 'completed'
-                        ? 'Cannot create tournament while one is in progress or completed'
+                        ? t('templatesPage.createFromTemplate.errors.inProgressOrCompleted')
                         : tournamentStatus === 'setup' || tournamentStatus === 'ready'
-                        ? 'A tournament already exists. Delete or reset it first.'
-                        : ''
+                          ? t('templatesPage.createFromTemplate.errors.alreadyExists')
+                          : ''
                     }
                   >
-                    Create Tournament from Template
+                    {t('templatesPage.createFromTemplate.button')}
                   </Button>
                 </CardContent>
               </Card>
@@ -561,7 +573,12 @@ export default function Templates() {
                   fullWidth
                   loading={loadingMaps}
                   getOptionLabel={(option) => getMapDisplayName(option)}
-                  renderInput={(params) => <TextField {...params} placeholder="Choose maps..." />}
+                  renderInput={(params) => (
+                    <TextField
+                      {...params}
+                      placeholder={t('templatesPage.edit.mapPool.chooseMaps')}
+                    />
+                  )}
                   renderOption={(props, option) => (
                     <Box component="li" {...props} key={option}>
                       <Box display="flex" alignItems="center" gap={1} width="100%">
@@ -593,7 +610,7 @@ export default function Templates() {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={handleCloseEdit}>Cancel</Button>
+          <Button onClick={handleCloseEdit}>{t('common.cancel')}</Button>
           <Button
             onClick={handleSaveEdit}
             variant="contained"

@@ -6,16 +6,20 @@ import {
   Typography,
   IconButton,
   ToggleButton,
-  ToggleButtonGroup,
   Alert,
   CircularProgress,
   Chip,
 } from '@mui/material';
-import RefreshIcon from '@mui/icons-material/Refresh';
+import { ArrowClockwiseIcon } from '@phosphor-icons/react';
+import { useTranslation } from 'react-i18next';
 import { api } from '../../utils/api';
 import type { LogEntry, LogsResponse } from '../../types';
+import { radii } from '../../theme/tokens';
+import { useTopic } from '../../hooks/useTopic';
+import { SegmentedControl } from '../common/SegmentedControl';
 
 export const LogViewer: React.FC = () => {
+  const { t } = useTranslation();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -37,25 +41,18 @@ export const LogViewer: React.FC = () => {
       }
     } catch (err) {
       const error = err as Error;
-      setError(error.message || 'Failed to load logs');
+      setError(error.message || t('adminToolsPage.logs.loadFailed'));
     } finally {
       setLoading(false);
     }
-  }, [levelFilter]);
+  }, [levelFilter, t]);
 
   useEffect(() => {
     loadLogs();
   }, [loadLogs]);
 
-  useEffect(() => {
-    if (!autoRefresh) return;
-
-    const interval = setInterval(() => {
-      loadLogs();
-    }, 2000); // Refresh every 2 seconds
-
-    return () => clearInterval(interval);
-  }, [autoRefresh, loadLogs]);
+  // New lines as they are written (the `logs` topic), while auto-refresh is on.
+  useTopic('logs', loadLogs, { admin: true, enabled: autoRefresh });
 
   const getLevelColor = (level: string) => {
     switch (level) {
@@ -84,30 +81,36 @@ export const LogViewer: React.FC = () => {
     <Card>
       <CardContent>
         <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-          <Typography variant="h6">Application Logs</Typography>
+          <Typography variant="h6">{t('adminToolsPage.monitoring.appLogs')}</Typography>
           <Box display="flex" gap={1} alignItems="center">
-            <ToggleButtonGroup
+            <SegmentedControl
               size="small"
-              value={levelFilter}
-              exclusive
-              onChange={(_, value) => setLevelFilter(value || '')}
-            >
-              <ToggleButton value="">All</ToggleButton>
-              <ToggleButton value="debug">Debug</ToggleButton>
-              <ToggleButton value="info">Info</ToggleButton>
-              <ToggleButton value="warn">Warn</ToggleButton>
-              <ToggleButton value="error">Error</ToggleButton>
-            </ToggleButtonGroup>
+              label={t('adminToolsPage.logs.levelAll')}
+              value={levelFilter || 'all'}
+              onChange={(value) => setLevelFilter(value === 'all' ? '' : value)}
+              options={[
+                { value: 'all', label: t('adminToolsPage.logs.levelAll') },
+                { value: 'debug', label: 'Debug' },
+                { value: 'info', label: 'Info' },
+                { value: 'warn', label: 'Warn' },
+                { value: 'error', label: 'Error' },
+              ]}
+            />
             <ToggleButton
               value="autoRefresh"
               selected={autoRefresh}
               onChange={() => setAutoRefresh(!autoRefresh)}
               size="small"
             >
-              Auto
+              {t('adminToolsPage.logs.auto')}
             </ToggleButton>
-            <IconButton onClick={loadLogs} disabled={loading} size="small">
-              <RefreshIcon />
+            <IconButton
+              onClick={loadLogs}
+              disabled={loading}
+              size="small"
+              aria-label={t('adminToolsPage.logs.refresh')}
+            >
+              <ArrowClockwiseIcon />
             </IconButton>
           </Box>
         </Box>
@@ -131,7 +134,7 @@ export const LogViewer: React.FC = () => {
               fontSize: '13px',
               bgcolor: 'background.default',
               p: 2,
-              borderRadius: 1,
+              borderRadius: radii.sm,
               '& .log-entry': {
                 py: 0.5,
                 borderBottom: '1px solid',
@@ -144,7 +147,7 @@ export const LogViewer: React.FC = () => {
           >
             {logs.length === 0 ? (
               <Typography color="text.secondary" textAlign="center">
-                No logs to display
+                {t('adminToolsPage.logs.empty')}
               </Typography>
             ) : (
               logs.map((log, index) => (
@@ -192,8 +195,9 @@ export const LogViewer: React.FC = () => {
         )}
 
         <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
-          Showing {logs.length} recent logs
-          {autoRefresh && ' (auto-refreshing)'}
+          {autoRefresh
+            ? t('adminToolsPage.logs.footerAutoRefresh', { count: logs.length })
+            : t('adminToolsPage.logs.footer', { count: logs.length })}
         </Typography>
       </CardContent>
     </Card>

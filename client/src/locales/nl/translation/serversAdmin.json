@@ -1,181 +1,8 @@
 {
-  "serversPage": {
-    "title": "Spelservers",
-    "headerActions": {
-      "refreshChecking": "Controleren…",
-      "refresh": "Status vernieuwen",
-      "batchAdd": "Batch toevoegen",
-      "addServer": "Server toevoegen",
-      "retryUninitialized": "Niet geïnitialiseerd opnieuw proberen ({{count}})",
-      "retryUninitializedChecking": "Opnieuw proberen...",
-      "select": "Selecteren",
-      "done": "Klaar met selecteren",
-      "selectAll": "Alles selecteren",
-      "unselectAll": "Alles deselecteren",
-      "deleteSelected": "Selectie verwijderen"
-    },
-    "empty": {
-      "title": "Geen servers geregistreerd",
-      "description": "Voeg je eerste CS2-server toe om met het toernooi te beginnen",
-      "addServer": "Server toevoegen",
-      "batchAdd": "Of meerdere servers in batch toevoegen"
-    },
-    "errors": {
-      "loadServers": "Kon servers niet laden",
-      "noMatchesForServer": "Geen wedstrijden gevonden voor deze server",
-      "loadCurrentMatch": "Huidige wedstrijd voor deze server laden mislukt",
-      "bulkDelete": "Kon één of meer servers niet verwijderen"
-    },
-    "allocation": {
-      "title": "Servertoewijzing",
-      "loading": "Toewijzingsstatus laden...",
-      "empty": "Geen toewijzingsgegevens beschikbaar.",
-      "available": "Beschikbare servers:",
-      "waiting": "Wedstrijden die wachten op servers:",
-      "nextPass": "Volgende allocator-run over ~{{seconds}}s",
-      "cooldownLabel": "Afkoelperiode",
-      "cooldownDescription": "Onlangs is er een wedstrijd afgerond — in afkoelperiode zodat demo’s kunnen uploaden en de server volledig kan resetten (ongeveer 2 minuten).",
-      "cooldownEta": "Klaar over ~{{seconds}}s"
-    },
-    "statusChip": {
-      "checking": "Controleren...",
-      "disabled": "Uitgeschakeld",
-      "offline": "Offline (uit)",
-      "onlineOk": "Online (API ↔ server OK)",
-      "onlineRconOnly": "Online (alleen RCON)",
-      "rconFailed": "RCON mislukt",
-      "onlineTesting": "Online (test)"
-    },
-    "ipBanned": {
-      "title": "Server heeft mogelijk ons IP geband",
-      "message": "De server is bereikbaar maar weigert herhaaldelijk RCON-authenticatie. Dit kan duiden op een IP-ban. Als het RCON-wachtwoord klopt, controleer dan de banlijst van de server en unban ons IP-adres."
-    },
-    "connectivity": {
-      "apiToServer": "MAT API → CS2-server",
-      "serverToApi": "Server → API (/api/events) (gebeurtenissen)",
-      "unreachable": "Onbereikbaar",
-      "reachable": "Bereikbaar",
-      "unknown": "Onbekend",
-      "loading": "Laden…",
-      "pluginLabel": "MatchZy :"
-    },
-    "currentMatch": {
-      "view": "Wedstrijd bekijken",
-      "loading": "Laden...",
-      "queuedPrefix": "In wachtrij: "
-    },
-    "labels": {
-      "host": "Adres:",
-      "port": "Poort:",
-      "id": "ID-nummer:"
-    },
-    "bulkDelete": {
-      "title": "Servers verwijderen",
-      "message": "Weet je zeker dat je {{count}} server{{suffix}} wilt verwijderen? Deze actie kan niet ongedaan worden gemaakt."
-    },
-    "autoConfig": {
-      "configuring": "Nieuwe servers configureren (MatchZy-config via RCON versturen)…",
-      "done": "Nieuwe servers geconfigureerd. Status verversen…"
-    },
-    "checkServerLogs": "Controleer de gameserverconsole/logs om te zien of MatchZy config ontvangt en events verstuurt."
-  },
-  "serverModal": {
-    "titleCreate": "Server toevoegen",
-    "titleEdit": "Server bewerken",
-    "serverNameLabel": "Servernaam",
-    "serverNamePlaceholder": "Matchserver #1",
-    "hostLabel": "Host / IP-adres",
-    "hostPlaceholder": "192.168.1.100",
-    "portLabel": "Poort",
-    "portPlaceholder": "27015",
-    "rconPasswordLabel": "RCON-wachtwoord",
-    "rconPasswordPlaceholder": "your-rcon-password",
-    "rconPasswordHelper": "Wachtwoord voor RCON-toegang tot de server",
-    "enabledLabel": "Server ingeschakeld",
-    "enabledHelper": "Uitgeschakelde servers worden niet gebruikt voor wedstrijden",
-    "overridesTitle": "MatchZy-overschrijvingen (optioneel)",
-    "overridesDescription": "Deze instellingen overschrijven de globale MatchZy-standaarden alleen voor deze server. Laat leeg om de globale waarden uit Instellingen te gebruiken.",
-    "chatPrefixLabel": "Chatprefix-overschrijving",
-    "chatPrefixPlaceholder": "[{Green}MAT{Default}]",
-    "chatPrefixHelper": "Overschrijft matchzy_chat_prefix op deze server (optioneel)",
-    "adminChatPrefixLabel": "Admin-chatprefix-overschrijving",
-    "adminChatPrefixPlaceholder": "[{Red}ADMIN{Default}]",
-    "adminChatPrefixHelper": "Overschrijft matchzy_admin_chat_prefix op deze server (optioneel)",
-    "knifeOverrideLabel": "Knife-round standaard ingeschakeld (overschrijven)",
-    "knifeOverrideHelper": "Wanneer ingesteld, overschrijft dit matchzy_knife_enabled_default voor deze server. Laat in onbepaalde staat om de globale standaard te gebruiken.",
-    "testConnectivity": "Connectiviteit testen",
-    "testingConnectivity": "Connectiviteit testen…",
-    "connectivity": {
-      "apiToServer": "MAT API → CS2-server:",
-      "serverToApi": "Server → API (/api/events) (gebeurtenissen):",
-      "reachable": "Bereikbaar",
-      "unreachable": "Onbereikbaar"
-    },
-    "errors": {
-      "nameRequired": "Servernaam is verplicht",
-      "hostRequired": "Host is verplicht",
-      "portInvalid": "Poort moet een geldig nummer zijn tussen 1 en 65535",
-      "rconRequired": "RCON-wachtwoord is verplicht",
-      "idGenerationFailed": "Kan server-ID niet genereren. Pas de servernaam aan.",
-      "duplicateId": "Servernaam veroorzaakt een dubbel ID '{{id}}'. Kies een andere naam.",
-      "duplicateHostPort": "Er bestaat al een server met host:poort '{{host}}:{{port}}' (ID: {{id}}, Naam: {{name}})",
-      "testConnectionSaveFirst": "Sla de server eerst op voordat je de verbinding test",
-      "testConnectionFailed": "Verbindingstest mislukt",
-      "saveFailed": "Server opslaan mislukt",
-      "deleteFailed": "Server verwijderen mislukt",
-      "rconReachableApiUnreachable": "We kunnen de server bereiken via RCON, maar de server kon het API-endpoint niet bereiken (testevent ontbreekt).",
-      "serverOffline": "Server lijkt offline of onbereikbaar via RCON."
-    },
-    "success": {
-      "connectivityOk": "Connectiviteit in beide richtingen geverifieerd: server is online en kan de API bereiken.",
-      "serverUpdated": "Server succesvol bijgewerkt",
-      "serverCreated": "Server succesvol aangemaakt",
-      "serverDeleted": "Server succesvol verwijderd"
-    },
-    "buttons": {
-      "deleteServer": "Server verwijderen",
-      "cancel": "Annuleren",
-      "saving": "Opslaan...",
-      "saveChanges": "Wijzigingen opslaan",
-      "addServer": "Server toevoegen"
-    },
-    "confirmDelete": {
-      "title": "Server verwijderen",
-      "message": "Weet je zeker dat je \"{{name}}\" wilt verwijderen? Deze actie kan niet ongedaan worden gemaakt."
-    }
-  },
   "adminToolsPage": {
-    "title": "Admin-tools",
-    "description": "Voer veelgebruikte wedstrijd- en serveracties uit op je CS2-servers. Snelle acties worden eerst getoond; meer geavanceerde tools vind je hieronder.",
-    "header": {
-      "refresh": "Servers vernieuwen"
-    },
-    "serverSelect": {
-      "label": "Doelserver(s)",
-      "allServersChip": "Alle servers",
-      "allServersDescription": "Uitvoeren op alle {{count}} server(s)",
-      "sendStatus": "Status sturen"
-    },
-    "command": {
-      "execute": "Uitvoeren"
-    },
-    "customRconWarning": "Waarschuwing: voorzichtig gebruiken!",
-    "results": {
-      "title": "Uitvoerresultaten",
-      "successChip": "✓ Gelukt",
-      "failedChip": "✗ Mislukt",
-      "errorPrefix": "Fout:"
-    },
-    "quickActions": {
-      "title": "Snelle acties"
-    },
-    "advanced": {
-      "title": "Geavanceerde tools"
-    },
-    "noServers": "Geen ingeschakelde servers gevonden. Voeg servers toe en schakel ze in op de pagina Spelservers.",
     "recovery": {
       "title": "Wedstrijdherstel",
-      "description": "Als de API of servers tijdens een toernooi zijn herstart en de wedstrijdstatus niet meer klopt (bijv. wedstrijden hangen in warmup of live scores ontbreken), kun je handmatig een herstelrun starten. Dit vraagt alle servers om hun huidige wedstrijdrapport, synchroniseert scores/fases opnieuw en configureert webhooks en demo-uploads waar mogelijk.",
+      "description": "Als de API of de servers tijdens een toernooi opnieuw zijn gestart en de wedstrijdstatus niet klopt (bijv. wedstrijden die vastzitten voordat ze live gaan of live-scores die ontbreken), kun je handmatig een herstel starten. Alle servers worden dan om hun huidige wedstrijdrapport gevraagd, scores en fases worden opnieuw gesynchroniseerd en webhooks en demo-uploads worden waar mogelijk opnieuw ingesteld.",
       "button": "Wedstrijdherstel nu uitvoeren",
       "success": "Wedstrijdherstel voltooid.",
       "error": "Wedstrijdherstel mislukt.",
@@ -183,8 +10,189 @@
     },
     "monitoring": {
       "title": "Monitoring & logs",
-      "serverEvents": "Server-eventmonitor",
       "appLogs": "Applicatielogs"
+    },
+    "logs": {
+      "loadFailed": "Logs laden mislukt",
+      "levelAll": "Alle",
+      "auto": "Auto",
+      "refresh": "Logs vernieuwen",
+      "empty": "Geen logs om te tonen",
+      "footer": "De {{count}} meest recente logregels worden getoond",
+      "footerAutoRefresh": "De {{count}} meest recente logregels worden getoond (automatisch vernieuwd)"
+    },
+    "description": "Logs and maintenance for this site. Installed game modules add their own tools below."
+  },
+  "servers": {
+    "allocation": {
+      "title": "Wachten op een beschikbare server",
+      "waiting": "Deze wedstrijd start automatisch zodra er servers vrij zijn. Benodigde servers:",
+      "nextPass": "Volgende toewijzingspoging over {{seconds}} s"
     }
+  },
+  "adminMatchControls": {
+    "title": "Admin-bediening",
+    "noServer": "Er is geen server aan deze wedstrijd toegewezen",
+    "unavailable": "Er is geen server aan deze wedstrijd toegewezen, dus de admin-bediening is niet beschikbaar.",
+    "unknownAction": "Onbekende actie",
+    "commandFailed": "Commando uitvoeren mislukt",
+    "confirm": "Bevestigen",
+    "execute": "Uitvoeren",
+    "close": "Sluiten",
+    "tipLabel": "Admin-tip:",
+    "tip": "Gebruik deze bediening voorzichtig tijdens live wedstrijden. Sommige acties, zoals \"{{endMatch}}\" en \"{{restartMatch}}\", kunnen niet ongedaan worden gemaakt.",
+    "sections": {
+      "matchControl": "Wedstrijdbeheer",
+      "advanced": "Geavanceerde acties"
+    },
+    "actions": {
+      "pause": {
+        "button": "Pauzeren",
+        "tooltip": "Adminpauze – spelers kunnen de pauze niet opheffen",
+        "title": "Wedstrijd pauzeren",
+        "description": "Hiermee wordt de wedstrijd geforceerd gepauzeerd. Spelers kunnen de pauze niet opheffen."
+      },
+      "unpause": {
+        "button": "Pauze opheffen",
+        "tooltip": "De wedstrijd hervatten na een pauze",
+        "title": "Pauze opheffen",
+        "description": "Hiermee wordt de pauze van de wedstrijd geforceerd opgeheven."
+      },
+      "swap": {
+        "button": "Teams wisselen",
+        "tooltip": "Teams naar de andere kant laten wisselen (CT ↔ T)",
+        "title": "Teams wisselen",
+        "description": "Hiermee wisselen de teams van kant (CT/T)."
+      },
+      "restartRound": {
+        "button": "Ronde herstarten",
+        "tooltip": "De huidige ronde vanaf het begin herstarten (reset de economie)",
+        "title": "Ronde herstarten",
+        "description": "Hiermee wordt de huidige ronde herstart."
+      },
+      "skipVeto": {
+        "button": "Veto overslaan",
+        "tooltip": "Het mapveto overslaan en direct de eerste map laden",
+        "title": "Veto overslaan",
+        "description": "Hiermee wordt de vetofase overgeslagen en start de wedstrijd."
+      },
+      "endWarmup": {
+        "button": "Warmup beëindigen",
+        "tooltip": "Warmup beëindigen en de wedstrijd starten (knife-round of live)",
+        "title": "Warmup beëindigen",
+        "description": "Hiermee wordt de warmup beëindigd en start de wedstrijd."
+      },
+      "endMatch": {
+        "button": "Wedstrijd beëindigen",
+        "tooltip": "De wedstrijd direct beëindigen en de eindstand vastleggen",
+        "title": "Wedstrijd beëindigen",
+        "description": "Hiermee wordt de wedstrijd geforceerd beëindigd. Wees voorzichtig!"
+      },
+      "restartMatch": {
+        "button": "Wedstrijd herstarten",
+        "tooltip": "De wedstrijd beëindigen en opnieuw laden – alle voortgang gaat verloren",
+        "title": "Wedstrijd herstarten",
+        "description": "Hiermee wordt de wedstrijd beëindigd en vanaf het begin opnieuw geladen. Alle voortgang gaat verloren!"
+      },
+      "reallocateServer": {
+        "button": "Andere server toewijzen",
+        "tooltip": "De wedstrijd naar een andere server verplaatsen (herstel voordat hij live gaat)",
+        "tooltipUnavailable": "Alleen beschikbaar voor wedstrijden die klaar/geladen zijn (niet tijdens live spel)",
+        "title": "Andere server toewijzen",
+        "description": "Hiermee wordt de wedstrijd naar een andere vrije server verplaatst en opnieuw geladen. Gebruik dit als de huidige server verouderd is of spelers niet kunnen verbinden. Niet toegestaan tijdens een live wedstrijd."
+      },
+      "forceCancel": {
+        "button": "Geforceerd annuleren",
+        "tooltip": "De wedstrijd annuleren, ook als de server offline is – geeft de servertoewijzing vrij",
+        "title": "Wedstrijd geforceerd annuleren",
+        "description": "⚠️ Hiermee wordt de wedstrijd geannuleerd, ook als de server offline is. De wedstrijd wordt als voltooid gemarkeerd en de server komt vrij. Deze actie kan niet ongedaan worden gemaakt."
+      }
+    },
+    "inputs": {
+      "restoreBackup": {
+        "button": "Back-up herstellen",
+        "tooltip": "Een opgeslagen rondeback-up laden – herstelt economie en posities",
+        "title": "Back-up herstellen",
+        "label": "Rondenummer om te herstellen"
+      },
+      "addTime": {
+        "button": "Tijd toevoegen",
+        "tooltip": "De rondetimer verlengen (handig bij technische pauzes)",
+        "title": "Rondetijd toevoegen",
+        "label": "Aantal seconden"
+      },
+      "broadcast": {
+        "button": "Uitzenden",
+        "tooltip": "Een bericht sturen naar alle spelers op de server",
+        "title": "Bericht uitzenden",
+        "label": "Bericht om uit te zenden"
+      }
+    },
+    "success": {
+      "pause": "Wedstrijd gepauzeerd",
+      "unpause": "Pauze opgeheven",
+      "swap": "Teams gewisseld",
+      "skipVeto": "Vetofase overgeslagen",
+      "restartRound": "Ronde herstart",
+      "endMatch": "Wedstrijd beëindigd",
+      "endWarmup": "Warmup beëindigd",
+      "startMatch": "Wedstrijd gestart",
+      "restoreBackup": "Back-up hersteld naar ronde {{round}}",
+      "addTime_one": "{{count}} seconde toegevoegd aan de rondetimer",
+      "addTime_other": "{{count}} seconden toegevoegd aan de rondetimer",
+      "broadcast": "Bericht naar de server gestuurd",
+      "restartMatch": "Wedstrijd herstart (beëindigd en opnieuw geladen)",
+      "reallocateServer": "Wedstrijd naar een andere server verplaatst",
+      "forceCancel": "Wedstrijd geannuleerd",
+      "default": "Commando uitgevoerd"
+    },
+    "hold": {
+      "title": "Hold instead of a walkover",
+      "description": "While held, the match is not loaded or started and nobody gets a walkover. When it goes ahead, the teams get the full time again.",
+      "reason": "Reason (shown to admins)",
+      "delay": "Delay {{minutes}} min",
+      "holdUntilReleased": "Hold until released",
+      "release": "Release now",
+      "restartCountdown": "Restart the countdown",
+      "heldUntil": "On hold until {{time}}",
+      "heldIndefinitely": "On hold until released",
+      "tournamentPaused": "The tournament is paused",
+      "heldDone": "Match on hold",
+      "delayedDone": "Match delayed {{minutes}} min",
+      "releasedDone": "Match released",
+      "restartedDone": "Countdown restarted: the teams have the full time again",
+      "failed": "Could not change the hold"
+    }
+  },
+  "adminCalls": {
+    "header": "Adminoproepen ({{count}})",
+    "title": "{{player}} roept een admin",
+    "justNow": "zojuist",
+    "minutesAgo": "{{count}} min geleden",
+    "hoursAgo": "{{count}} u geleden",
+    "spectator": "Toeschouwer",
+    "team1": "Team 1",
+    "team2": "Team 2",
+    "noMessage": "Geen bericht",
+    "unknownPlayer": "Onbekende speler",
+    "unknownServer": "Onbekende server",
+    "matchMap": "{{match}}, map {{map}}",
+    "openMatch": "Wedstrijd openen",
+    "openServers": "Servers",
+    "resolve": "Markeren als opgelost",
+    "resolveAll": "Alles oplossen",
+    "resolveFailed": "De oproep kon niet als opgelost worden gemarkeerd. Probeer het opnieuw.",
+    "matchUnavailable": "Die wedstrijd kon niet worden geopend.",
+    "enableSound": "Geluid inschakelen",
+    "mute": "Dempen",
+    "unmute": "Dempen opheffen",
+    "minimize": "Minimaliseren",
+    "show": "Tonen",
+    "openChat": "Open chat",
+    "claim": "Claim",
+    "release": "Release",
+    "claimedBy": "Claimed by {{name}}",
+    "claimedByYou": "Claimed by you",
+    "anAdmin": "an admin"
   }
 }

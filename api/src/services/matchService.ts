@@ -1,18 +1,33 @@
 import { db } from '../config/database';
-import { Match, MatchConfig, CreateMatchInput, MatchResponse } from '../types/match.types';
+import type { Match, CreateMatchInput, MatchResponse } from '../types/match.types';
 import { log } from '../utils/logger';
-import { settingsService } from './settingsService';
 import { emitMatchUpdate } from './socketService';
-import { matchzyConfigService } from './matchzyConfigService';
-import { matchAllocationService } from './matchAllocationService';
-import { serverAllocationTracker } from './serverAllocationTracker';
-import type { DbTournamentRow } from '../types/database.types';
+import { integrationForMatch } from '../integrations/registry';
+import {
+  buildMatchConfigFor,
+  describeMatch,
+  matchContextFor,
+  parseStoredMatchConfig,
+  serializeMatchConfig,
+} from '../utils/matchIntegration';
+import { tournamentRowToResponse } from '../utils/tournamentRow';
+import type { DbMatchRow, DbTournamentRow } from '../types/database.types';
+import type { SqlValue } from '../config/database';
 
 class MatchService {
   /**
    * Create a new match configuration
    */
-  async createMatch(input: CreateMatchInput, baseUrl: string): Promise<MatchResponse> {
+  /**
+   * @param defaultsTournamentId tournament whose rules (e.g. the round limit)
+   *   fill in what the admin left out of a manual match.
+   */
+  async createMatch(
+    input: CreateMatchInput,
+    baseUrl: string,
+    /** The tournament whose rules fill gaps (round limit); null: none (matchmaking). */
+    defaultsTournamentId: number | null
+  ): Promise<MatchResponse> {
     // Check if slug already exists
     const existing = await db.getOneAsync<Match>('matches', 'slug = ?', [input.slug]);
     if (existing) {
@@ -24,95 +39,35 @@ class MatchService {
     // ignore any serverId passed in the payload to avoid double‑booking or
     // pinning matches to a single server.
 
-    // Normalize config and apply global simulation + round-limit settings so
-    // manual matches behave like tournament-generated matches.
-    const config: MatchConfig = {
-      ...input.config,
-    };
+    // Manual matches borrow the primary tournament's rules (e.g. the round
+    // limit) for anything the admin left out.
+    const tournament =
+      defaultsTournamentId === null
+        ? null
+        : await db
+            .queryOneAsync<DbTournamentRow>('SELECT * FROM tournament WHERE id = ?', [
+              defaultsTournamentId,
+            ])
+            .catch((error: unknown) => {
+              log.warn('Failed to read round-limit defaults for manual match', error as Error);
+              return null;
+            });
 
-    try {
-      // Apply global simulation mode (development only, mirrors matchConfigBuilder behavior)
-      const simulationEnabled = await settingsService.isSimulationModeEnabled();
-      if (simulationEnabled) {
-        const timescale = await settingsService.getSimulationTimescale();
-        config.simulation = true;
-        config.simulation_timescale = timescale;
-      } else {
-        // Explicitly clear simulation flags for manual matches when simulation mode is off.
-        config.simulation = false;
-        config.simulation_timescale = undefined;
-      }
-
-      // Respect a manually provided mp_maxrounds from the match config when present.
-      const hasManualMaxRounds =
-        typeof config.cvars?.mp_maxrounds === 'number' &&
-        Number.isFinite(config.cvars.mp_maxrounds) &&
-        config.cvars.mp_maxrounds > 0;
-
-      // Apply mp_maxrounds based on the primary tournament's maxRounds only when
-      // the manual match config did not already specify a value. This keeps the
-      // manual match modal's "Max rounds" field authoritative while still
-      // providing a sensible default that mirrors tournament-generated matches.
-      if (!hasManualMaxRounds) {
-        const tournament = await db.queryOneAsync<DbTournamentRow>(
-          'SELECT * FROM tournament WHERE id = ?',
-          [1]
-        );
-        if (tournament) {
-          const raw = tournament.max_rounds;
-          const parsed =
-            typeof raw === 'number'
-              ? raw
-              : typeof raw === 'string' && raw.trim() !== ''
-              ? Number(raw)
-              : undefined;
-
-          const maxRounds =
-            typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
-
-          config.cvars = {
-            ...(config.cvars || {}),
-            mp_maxrounds: maxRounds,
-          };
-        }
-      }
-
-      // Apply MatchZy Enhanced v1.3.0 cvars for manual matches.
-      // Use the 'default' profile (safe, permissive settings) unless the config
-      // already includes specific MatchZy Enhanced cvars (allowing customization).
-      const hasMatchzyEnhancedCvars = config.cvars && (
-        'matchzy_autoready_enabled' in config.cvars ||
-        'matchzy_gg_enabled' in config.cvars ||
-        'matchzy_ffw_enabled' in config.cvars
-      );
-
-      if (!hasMatchzyEnhancedCvars) {
-        const matchzyEnhancedCvars = matchzyConfigService.getDefaultMatchzyEnhancedCvars();
-        config.cvars = {
-          ...(config.cvars || {}),
-          ...matchzyEnhancedCvars,
-        };
-        log.debug('Applied default MatchZy Enhanced cvars to manual match', {
-          matchSlug: input.slug,
-        });
-      }
-    } catch (simError) {
-      log.warn(
-        'Failed to apply simulation / round-limit settings to manual match config',
-        simError as Error
-      );
-    }
-
-    // Always attach current admin Steam64 IDs to manual match configs so they
-    // have in‑game admin rights just like tournament-generated matches.
-    try {
-      const adminRows = await db.queryAsync<{ id: string }>(
-        'SELECT id FROM players WHERE is_admin = 1'
-      );
-      config.admins = Array.isArray(adminRows) ? adminRows.map((row) => row.id) : [];
-    } catch (e) {
-      log.warn('Failed to attach admins to manual match config', e as Error);
-    }
+    // The integration builds the stored config from the admin's settings
+    // (for CS2: simulation, round limit, default MatchZy Enhanced cvars and
+    // admins, so manual matches behave like tournament-generated matches).
+    const config = await buildMatchConfigFor(
+      {
+        slug: input.slug,
+        round: 0,
+        team1Id: input.config.team1?.id ?? null,
+        team2Id: input.config.team2?.id ?? null,
+      },
+      null,
+      input.config,
+      { defaultsFrom: tournament ? tournamentRowToResponse(tournament) : null }
+    );
+    const description = describeMatch({ config });
 
     // Insert match
     //
@@ -123,13 +78,13 @@ class MatchService {
     // from bracket matches (which always use round >= 1).
     // Derive team IDs from config so manual matches can participate in veto
     // flow and use the same team lookup logic as bracket matches.
-    const team1Id = config.team1?.id ?? null;
-    const team2Id = config.team2?.id ?? null;
+    const team1Id = description.team1.id ?? null;
+    const team2Id = description.team2.id ?? null;
 
     // Determine initial status based on whether veto is enabled
     // If veto is enabled (vetoDisabled === false), start as 'pending' to allow veto flow
     // Otherwise, start as 'ready' for immediate allocation
-    const vetoEnabled = config.vetoDisabled === false;
+    const vetoEnabled = description.skipPreMatchPhase === false;
     const initialStatus = vetoEnabled ? 'pending' : 'ready';
 
     await db.insertAsync('matches', {
@@ -145,7 +100,7 @@ class MatchService {
       server_id: null,
       team1_id: team1Id,
       team2_id: team2Id,
-      config: JSON.stringify(config),
+      config: serializeMatchConfig(config),
       // If veto is enabled, start as 'pending' to allow teams to complete veto.
       // Otherwise, start as 'ready' for immediate server allocation.
       status: initialStatus,
@@ -209,15 +164,24 @@ class MatchService {
   /**
    * Update match status
    */
-  async updateMatchStatus(slug: string, status: 'pending' | 'loaded' | 'live' | 'completed'): Promise<void> {
+  async updateMatchStatus(
+    slug: string,
+    status: 'pending' | 'loaded' | 'live' | 'completed'
+  ): Promise<void> {
     const match = await db.getOneAsync<Match>('matches', 'slug = ?', [slug]);
     if (!match) {
       throw new Error(`Match '${slug}' not found`);
     }
 
-    const updateData: Record<string, unknown> = { status };
+    const updateData: Record<string, SqlValue> = { status };
     if (status === 'loaded') {
       updateData.loaded_at = Math.floor(Date.now() / 1000);
+    }
+    if (status === 'completed' && match.status !== 'completed') {
+      // An admin completing a match is a deliberate finish. Stamping
+      // completed_at is what marks it finalized (isMatchFinalized), so late
+      // plugin events don't re-open it.
+      updateData.completed_at = Math.floor(Date.now() / 1000);
     }
 
     await db.updateAsync('matches', updateData, 'slug = ?', [slug]);
@@ -228,7 +192,7 @@ class MatchService {
    * Delete match
    */
   async deleteMatch(slug: string): Promise<void> {
-    const match = await db.getOneAsync<Match>('matches', 'slug = ?', [slug]);
+    const match = await db.getOneAsync<DbMatchRow>('matches', 'slug = ?', [slug]);
     if (!match) {
       throw new Error(`Match '${slug}' not found`);
     }
@@ -237,33 +201,20 @@ class MatchService {
     await db.deleteAsync('matches', 'slug = ?', [slug]);
     log.success(`Match deleted: ${slug}`);
 
-    // If the deleted match had a server assigned, mark that server as idle
-    // and trigger immediate allocation for any waiting matches.
+    // If the deleted match had a server assigned, free it through the
+    // integration (CS2: mark it idle and allocate waiting matches right away).
     if (serverId) {
-      serverAllocationTracker.markIdle(serverId);
       log.info(`Server ${serverId} freed by match deletion, triggering immediate allocation`);
-      setImmediate(() => {
-        void matchAllocationService.tryImmediateAllocation();
-      });
+      await integrationForMatch(match).release?.(await matchContextFor(match));
     }
-  }
-
-  /**
-   * Get match config (raw JSON for MatchZy)
-   */
-  async getMatchConfig(slug: string): Promise<MatchConfig | null> {
-    const match = await db.getOneAsync<Match>('matches', 'slug = ?', [slug]);
-    if (!match) {
-      return null;
-    }
-    return JSON.parse(match.config) as MatchConfig;
   }
 
   /**
    * Convert database match to response format
    */
   private toResponse(match: Match, baseUrl: string): MatchResponse {
-    const config = JSON.parse(match.config) as MatchConfig;
+    // Integration-owned blob, forwarded as stored (client slots: PR 12).
+    const config = parseStoredMatchConfig(match.config);
     return {
       id: match.id,
       slug: match.slug,

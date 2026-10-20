@@ -2,10 +2,71 @@ import { BracketsManager } from 'brackets-manager';
 import { InMemoryDatabase } from 'brackets-memory-db';
 import type { Match, StageType, StageSettings } from 'brackets-model';
 import { log } from '../utils/logger';
-import type { TournamentResponse, BracketMatch } from '../types/tournament.types';
+import type { TournamentResponse } from '../types/tournament.types';
 import type { IBracketGenerator, BracketGeneratorResult } from './bracketGenerators/types';
-import { generateMatchConfig } from './matchConfigBuilder';
 import { determineInitialMatchStatus } from '../utils/matchStatusHelpers';
+import { isPowerOfTwo, padWithByes, resolveByes } from './bracketByes';
+
+type DropInOrdering = 'natural' | 'reverse' | 'half_shift' | 'reverse_half_shift' | 'pair_flip';
+
+/**
+ * How the losers of each upper-bracket round are laid over the lower-bracket
+ * round they drop into, per bracket size. Index 0 is WB round 1 (its losers
+ * pair up with each other in LB round 1, so it is always natural); index r-1
+ * is WB round r. These are brackets-manager's `defaultMinorOrdering` values.
+ *
+ * The point is the crossover: a team losing in WB round r has only played
+ * teams from its own part of the upper bracket, so it is sent to the lower
+ * bracket match fed from the other part. With natural order (the old wiring)
+ * the loser of WB r2m1 met the winner of lb-r1m1, i.e. a team it had just
+ * knocked out in WB round 1. Reverse for round 2 fixes that; for 16+ teams
+ * the later rounds also keep the halves apart for as long as that is
+ * possible (reverse_half_shift, then reverse or half_shift).
+ */
+const DROP_IN_ORDERING: Record<number, DropInOrdering[]> = {
+  4: ['natural', 'reverse'],
+  8: ['natural', 'reverse', 'natural'],
+  16: ['natural', 'reverse_half_shift', 'reverse', 'natural'],
+  32: ['natural', 'reverse', 'half_shift', 'natural', 'natural'],
+  64: ['natural', 'reverse', 'half_shift', 'reverse', 'natural', 'natural'],
+  128: ['natural', 'reverse', 'half_shift', 'pair_flip', 'pair_flip', 'pair_flip', 'natural'],
+};
+
+function applyOrdering<T>(method: DropInOrdering, array: T[]): T[] {
+  const half = array.length / 2;
+  switch (method) {
+    case 'reverse':
+      return [...array].reverse();
+    case 'half_shift':
+      return [...array.slice(half), ...array.slice(0, half)];
+    case 'reverse_half_shift':
+      return [...array.slice(0, half).reverse(), ...array.slice(half).reverse()];
+    case 'pair_flip': {
+      const out: T[] = [];
+      for (let i = 0; i < array.length; i += 2) out.push(array[i + 1], array[i]);
+      return out;
+    }
+    default:
+      return [...array];
+  }
+}
+
+/**
+ * The matches of WB round `wbRound` in the order their losers fill the
+ * lower-bracket round they drop into. Sizes past the table get round 2
+ * reversed and round 3 half-shifted, the part every listed size shares.
+ */
+export function dropInOrder<T>(teamCount: number, wbRound: number, wbMatches: T[]): T[] {
+  const table = DROP_IN_ORDERING[teamCount];
+  const method: DropInOrdering = table
+    ? (table[wbRound - 1] ?? 'natural')
+    : wbRound === 2
+      ? 'reverse'
+      : wbRound === 3
+        ? 'half_shift'
+        : 'natural';
+  return applyOrdering(method, wbMatches);
+}
 
 /**
  * Standard Bracket Generator
@@ -24,10 +85,7 @@ export class StandardBracketGenerator implements IBracketGenerator {
   /**
    * Generate bracket using brackets-manager and convert to our schema
    */
-  async generate(
-    tournament: TournamentResponse,
-    _getMatchesCallback: () => Promise<BracketMatch[]>
-  ): Promise<BracketGeneratorResult> {
+  async generate(tournament: TournamentResponse): Promise<BracketGeneratorResult> {
     const { teamIds, type, settings } = tournament;
 
     // For power-of-two single / double elimination tournaments, bypass
@@ -49,6 +107,16 @@ export class StandardBracketGenerator implements IBracketGenerator {
       (settings.grandFinalMode === undefined || settings.grandFinalMode !== 'none')
     ) {
       return this.generatePowerOfTwoDoubleElimination(tournament);
+    }
+
+    // Any other team count (3, 5, 6, …): the bracket for the next power of
+    // two with byes for the top seeds, then the byes taken out (bracketByes.ts).
+    if (
+      (type === 'single_elimination' || type === 'double_elimination') &&
+      teamIds.length > 2 &&
+      !isPowerOfTwo(teamIds.length)
+    ) {
+      return this.generateWithByes(tournament);
     }
 
     // Map our tournament types to brackets-manager types
@@ -213,7 +281,6 @@ export class StandardBracketGenerator implements IBracketGenerator {
       winnerId: string | null;
       status: 'pending' | 'ready' | 'loaded' | 'live' | 'completed';
       nextMatchId: number | null;
-      config: string;
     }>;
   }> {
     const matches = await Promise.all(
@@ -294,14 +361,6 @@ export class StandardBracketGenerator implements IBracketGenerator {
           status = determineInitialMatchStatus(team1Id, team2Id, tournament.format, roundNum);
         }
 
-        // Generate match config
-        const config = await generateMatchConfig(
-          tournament,
-          team1Id as string | undefined,
-          team2Id as string | undefined,
-          slug
-        );
-
         // Infer basic bracket grouping from slug for downstream consumers.
         let bracket: 'WB' | 'LB' | 'GF' | 'GF_RESET' | undefined;
         if (stageType === 'double_elimination') {
@@ -329,7 +388,6 @@ export class StandardBracketGenerator implements IBracketGenerator {
           team1FromOutcome: null,
           team2FromMatchSlug: null,
           team2FromOutcome: null,
-          config: JSON.stringify(config),
         };
       })
     );
@@ -373,12 +431,49 @@ export class StandardBracketGenerator implements IBracketGenerator {
   }
 
   /**
+   * Single or double elimination for a team count that is not a power of
+   * two: generated for the next power of two with empty seats, then every
+   * match that can't be played (a bye, or nothing at all) is taken out and
+   * the wiring points past it. Matches whose two teams are known now start
+   * ready, wherever they are in the bracket.
+   */
+  private async generateWithByes(tournament: TournamentResponse): Promise<BracketGeneratorResult> {
+    const padded = {
+      ...tournament,
+      teamIds: padWithByes(tournament.teamIds) as string[],
+    } as TournamentResponse;
+    const full =
+      tournament.type === 'double_elimination'
+        ? await this.generatePowerOfTwoDoubleElimination(padded)
+        : await this.generatePowerOfTwoSingleElimination(padded);
+    // No grand final ('none'): the winners bracket final decides it; the
+    // losers bracket still plays out, as the library's brackets do.
+    const noFinal =
+      tournament.type === 'double_elimination' && tournament.settings.grandFinalMode === 'none';
+    const kept = resolveByes(noFinal ? full.matches.filter((m) => m.slug !== 'gf') : full.matches);
+    return {
+      matches: kept.map((m) => ({
+        ...m,
+        status:
+          m.team1Id && m.team2Id
+            ? determineInitialMatchStatus(m.team1Id, m.team2Id, tournament.format, m.round)
+            : 'pending',
+      })),
+    };
+  }
+
+  /**
    * Deterministic power-of-two double-elimination generator with explicit
    * winners/losers bracket wiring. This follows a generic pattern for
    * N = 2^k teams:
    *  - Winners bracket: k rounds, N/2, N/4, ..., 1 match
    *  - Losers bracket: 2k-2 rounds, wired via fixed rules
    *  - Grand final: WB champion vs LB champion
+   *
+   * N = 2 (k = 1) is the degenerate case these formulas already describe: the
+   * losers bracket has 2k-2 = 0 rounds, so the team that loses the single
+   * winners match drops into an empty bracket and wins it by walkover. It is
+   * therefore the grand final's second seed, and the same two teams meet twice.
    */
   private async generatePowerOfTwoDoubleElimination(
     tournament: TournamentResponse
@@ -387,9 +482,9 @@ export class StandardBracketGenerator implements IBracketGenerator {
     const N = teamIds.length;
     const k = Math.log2(N);
 
-    if (!Number.isInteger(k) || k < 2) {
+    if (!Number.isInteger(k) || k < 1) {
       throw new Error(
-        `Power-of-two double elimination generator requires N=2^k with k>=2, got ${N}`
+        `Power-of-two double elimination generator requires N=2^k with k>=1, got ${N}`
       );
     }
 
@@ -547,17 +642,20 @@ export class StandardBracketGenerator implements IBracketGenerator {
       }
     }
 
-    // 3.3) LB even rounds: LB odd winners vs WB (i+1) losers
+    // 3.3) LB even rounds: LB odd winners vs WB (i+1) losers. The WB losers
+    // are crossed over (dropInOrder) so they land against the half of the
+    // lower bracket they could not have met in the upper bracket.
     for (let i = 1; i <= k - 1; i++) {
       const L_even = 2 * i;
       const evenIndex = L_even - 1;
       const prevOddIndex = L_even - 2;
       const matchesPerRound = lb[evenIndex].length;
+      const wbLosers = dropInOrder(N, i + 1, wb[i]);
 
       for (let m = 1; m <= matchesPerRound; m++) {
         const lbMatch = lb[evenIndex][m - 1];
         const lbSource = lb[prevOddIndex][m - 1];
-        const wbSource = wb[i][m - 1]; // WB round (i+1), match m
+        const wbSource = wbLosers[m - 1]; // a loser of WB round (i+1)
 
         lbMatch.team1FromMatchSlug = lbSource.slug;
         lbMatch.team1FromOutcome = 'winner';
@@ -566,9 +664,15 @@ export class StandardBracketGenerator implements IBracketGenerator {
       }
     }
 
-    // 4) Grand Final: WB final winner vs LB final winner
+    // 4) Grand Final: WB final winner vs LB final winner.
+    //
+    // With two teams there are no losers-bracket rounds at all, so there is no
+    // LB final to take a winner from: the losers-bracket champion is simply the
+    // team that lost the winners final (it "wins" an empty bracket unopposed).
+    // Wiring the second slot to that loser keeps the grand final a real match
+    // instead of a slot that can never be filled.
     const wbFinal = wb[k - 1][0];
-    const lbFinal = lb[lbTotalRounds - 1][0];
+    const lbFinal = lbTotalRounds > 0 ? lb[lbTotalRounds - 1][0] : null;
 
     const gf: GeneratedMatch = {
       slug: 'gf',
@@ -579,13 +683,13 @@ export class StandardBracketGenerator implements IBracketGenerator {
       team2Id: null,
       team1FromMatchSlug: wbFinal.slug,
       team1FromOutcome: 'winner',
-      team2FromMatchSlug: lbFinal.slug,
-      team2FromOutcome: 'winner',
+      team2FromMatchSlug: lbFinal ? lbFinal.slug : wbFinal.slug,
+      team2FromOutcome: lbFinal ? 'winner' : 'loser',
     };
 
     const allGenerated: GeneratedMatch[] = [...wb.flat(), ...lb.flat(), gf];
 
-    // 5) Convert to BracketGeneratorResult with configs and initial statuses
+    // 5) Convert to BracketGeneratorResult with initial statuses
     const matches = await Promise.all(
       allGenerated.map(async (gm) => {
         // Determine initial status based on seeding
@@ -593,13 +697,6 @@ export class StandardBracketGenerator implements IBracketGenerator {
           gm.bracket === 'WB' && gm.round === 1
             ? determineInitialMatchStatus(gm.team1Id, gm.team2Id, tournament.format, gm.round)
             : 'pending';
-
-        const config = await generateMatchConfig(
-          tournament,
-          gm.team1Id ?? undefined,
-          gm.team2Id ?? undefined,
-          gm.slug
-        );
 
         return {
           slug: gm.slug,
@@ -615,7 +712,6 @@ export class StandardBracketGenerator implements IBracketGenerator {
           team1FromOutcome: gm.team1FromOutcome,
           team2FromMatchSlug: gm.team2FromMatchSlug,
           team2FromOutcome: gm.team2FromOutcome,
-          config: JSON.stringify(config),
         };
       })
     );
@@ -716,20 +812,13 @@ export class StandardBracketGenerator implements IBracketGenerator {
 
     const allGenerated: GeneratedMatch[] = rounds.flat();
 
-    // 3) Convert to BracketGeneratorResult with configs and initial statuses
+    // 3) Convert to BracketGeneratorResult with initial statuses
     const matches = await Promise.all(
       allGenerated.map(async (gm) => {
         const status =
           gm.round === 1
             ? determineInitialMatchStatus(gm.team1Id, gm.team2Id, tournament.format, gm.round)
             : 'pending';
-
-        const config = await generateMatchConfig(
-          tournament,
-          gm.team1Id ?? undefined,
-          gm.team2Id ?? undefined,
-          gm.slug
-        );
 
         return {
           slug: gm.slug,
@@ -745,7 +834,6 @@ export class StandardBracketGenerator implements IBracketGenerator {
           team1FromOutcome: gm.team1FromOutcome,
           team2FromMatchSlug: gm.team2FromMatchSlug,
           team2FromOutcome: gm.team2FromOutcome,
-          config: JSON.stringify(config),
         };
       })
     );

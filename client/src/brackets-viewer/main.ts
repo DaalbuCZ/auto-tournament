@@ -40,11 +40,9 @@ export class BracketsViewer {
         return this.config.customRoundName?.(info, lang.t) || fallbackGetter(info, lang.t);
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    private _onMatchClick: MatchClickCallback = (match: MatchWithMetadata): void => { };
+    private _onMatchClick: MatchClickCallback = (_match: MatchWithMetadata): void => { };
 
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    private _onMatchLabelClick: MatchClickCallback = (match: MatchWithMetadata): void => { };
+    private _onMatchLabelClick: MatchClickCallback = (_match: MatchWithMetadata): void => { };
 
     /**
      * @deprecated Use `onMatchClick` in the `config` parameter of `viewer.render()`.
@@ -79,6 +77,7 @@ export class BracketsViewer {
             highlightParticipantOnHover: config?.highlightParticipantOnHover ?? true,
             showRankingTable: config?.showRankingTable ?? true,
             rankingFormula: config?.rankingFormula,
+            rankingOrder: config?.rankingOrder,
         };
 
         if (config?.onMatchClick)
@@ -488,7 +487,17 @@ export class BracketsViewer {
      */
     private createRanking(matches: Match[]): HTMLElement {
         const table = dom.createTable();
-        const ranking = getRanking(matches, this.config.rankingFormula);
+        let ranking = getRanking(matches, this.config.rankingFormula);
+
+        const order = this.config.rankingOrder;
+        if (order?.length) {
+            const position = (id: Id) => {
+                const index = order.indexOf(id);
+                return index === -1 ? order.length : index;
+            };
+            ranking = [...ranking].sort((a, b) => position(a.id) - position(b.id));
+            ranking.forEach((item, index) => { item.rank = index + 1; });
+        }
 
         table.append(dom.createRankingHeaders(ranking));
 

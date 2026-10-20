@@ -33,7 +33,11 @@ export type {
   Tournament,
   TournamentSettings,
   BracketData,
+  SwissStanding,
+  RoundRobinStanding,
   TournamentTemplate,
+  EventPagePrize,
+  EventPageScheduleItem,
 } from './tournament.types';
 
 // Veto types
@@ -58,9 +62,6 @@ export type {
   Server,
   ServersResponse,
   ServerResponse,
-  ServerStatusResponse,
-  ServerAllocationInfo,
-  ServerAvailabilityResponse,
   TeamsResponse,
   TeamResponse,
   TeamStatsResponse,

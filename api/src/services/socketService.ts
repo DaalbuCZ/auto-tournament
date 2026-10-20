@@ -1,6 +1,16 @@
-import { Server as SocketIOServer } from 'socket.io';
-import type { Server as HTTPServer } from 'http';
-import { log } from '../utils/logger';
+import { Server as SocketIOServer, type Socket } from 'socket.io';
+import type { Server as HTTPServer, IncomingMessage, ServerResponse } from 'http';
+import type { Request } from 'express';
+import { log, onLogEntry } from '../utils/logger';
+import { getRealViewerSteamId } from '../utils/viewerIdentity';
+import { checkAdminAccess } from '../middleware/auth';
+import { matchChanged } from '../core/matchChangeBus';
+import { PresenceTracker, type PresenceChange, type PresenceStatus } from './presenceTracker';
+import type {
+  AdminCall,
+  AdminCallClaimedEvent,
+  AdminCallResolvedEvent,
+} from '../types/adminCall.types';
 import type {
   TournamentUpdateEvent,
   BracketUpdateEvent,
@@ -8,11 +18,83 @@ import type {
   MatchEventData,
   ServerEvent,
   VetoUpdateEvent,
+  CompatUpdateEvent,
 } from '../types/socket.types';
+import type { Untrusted } from '../utils/untrusted';
+import type { MatchChatKey } from './matchChatLines';
+import type { GameChatInput } from './chatService';
 
 let io: SocketIOServer | null = null;
 
-export function initializeSocket(httpServer: HTTPServer): SocketIOServer {
+/** Room of the sockets on the public compatibility page (`compat:subscribe`). */
+export const COMPAT_ROOM = 'compat';
+
+/**
+ * Room of the sockets whose handshake proved admin rights (`admin:subscribe`).
+ * Admin-only events (`admin:call`, `admin:call:resolved`) go only here: a
+ * player's message to the admins is not for every viewer of the bracket.
+ */
+export const ADMIN_ROOM = 'admins';
+
+/** Room of the sockets that show player avatars (`presence:subscribe`): they get `presence:update`. */
+export const PRESENCE_ROOM = 'presence';
+
+/** Who is online, away or offline (in memory: a restart starts everyone offline until they reconnect). */
+const presence = new PresenceTracker();
+
+/** Express-style middleware (session, Passport) run on the Socket.IO handshake. */
+export type HandshakeMiddleware = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  next: (err?: unknown) => void
+) => void;
+
+export interface SocketOptions {
+  /**
+   * Run on each handshake request, in order, so `socket.request` carries the
+   * session and Passport user that `admin:subscribe` checks (index.ts passes
+   * the app's own session and Passport middleware).
+   */
+  handshakeMiddleware?: HandshakeMiddleware[];
+}
+
+/**
+ * The handshake request, shaped enough like an Express request for
+ * `checkAdminAccess`: it reads headers through `req.get`.
+ */
+function handshakeAsRequest(socket: Socket): Request {
+  const req = socket.request as IncomingMessage & Partial<Request>;
+  if (typeof req.get !== 'function') {
+    const get = (name: string): string | undefined => {
+      const value = req.headers[name.toLowerCase()];
+      return Array.isArray(value) ? value[0] : value;
+    };
+    Object.defineProperty(req, 'get', { value: get, configurable: true });
+  }
+  return req as Request;
+}
+
+async function joinAdminRoom(socket: Socket, ack?: Untrusted): Promise<void> {
+  const reply = typeof ack === 'function' ? (ack as (body: object) => void) : () => undefined;
+  try {
+    const access = await checkAdminAccess(handshakeAsRequest(socket));
+    if (!access.ok) {
+      log.debug('Socket refused the admin room', { socketId: socket.id, reason: access.logReason });
+      reply({ ok: false, error: access.error });
+      return;
+    }
+    await socket.join(ADMIN_ROOM);
+    reply({ ok: true });
+  } catch (error) {
+    log.error('Socket admin check failed', error as Error);
+    reply({ ok: false, error: 'Failed to verify admin permissions' });
+  }
+}
+
+export function initializeSocket(
+  httpServer: HTTPServer,
+  options: SocketOptions = {}
+): SocketIOServer {
   io = new SocketIOServer(httpServer, {
     cors: {
       origin: process.env.CORS_ORIGIN || '*',
@@ -20,16 +102,126 @@ export function initializeSocket(httpServer: HTTPServer): SocketIOServer {
     },
   });
 
+  // Session and Passport on the handshake only (not on every polling
+  // request of the same connection), as Socket.IO's docs recommend.
+  for (const middleware of options.handshakeMiddleware ?? []) {
+    io.engine.use(
+      (
+        req: IncomingMessage & { _query?: { sid?: string } },
+        res: ServerResponse,
+        next: (err?: unknown) => void
+      ) => {
+        const isHandshake = req._query?.sid === undefined;
+        if (isHandshake) middleware(req, res, next);
+        else next();
+      }
+    );
+  }
+
   io.on('connection', (socket) => {
     log.debug(`Socket client connected: ${socket.id}`);
+
+    // The public Ready Up compatibility page. Anyone may listen (the data is
+    // public), but only sockets that ask get `compat:update`, so every other
+    // page's connection is not sent it. Rooms do not survive a reconnect: the
+    // client asks again on every `connect`.
+    socket.on('compat:subscribe', () => {
+      void socket.join(COMPAT_ROOM);
+    });
+    socket.on('compat:unsubscribe', () => {
+      void socket.leave(COMPAT_ROOM);
+    });
+
+    // Admin-only events (admin calls). The socket joins only if the
+    // handshake's session, signed cookie or API token is an admin's — the
+    // same check as `requireAuth`. The optional ack says whether it did.
+    // Rooms do not survive a reconnect: the client asks again on `connect`.
+    socket.on('admin:subscribe', (ack?: Untrusted) => {
+      void joinAdminRoom(socket, ack);
+    });
+    socket.on('admin:unsubscribe', () => {
+      void socket.leave(ADMIN_ROOM);
+    });
+
+    // A signed-in player's own events (matchmaking): room `player:<id>`, for
+    // the account the handshake's session or signed cookie names. Nothing for
+    // an anonymous socket. The client asks again on every `connect`.
+    socket.on('player:subscribe', (ack?: Untrusted) => {
+      const reply = typeof ack === 'function' ? (ack as (body: object) => void) : () => undefined;
+      const playerId = getRealViewerSteamId(handshakeAsRequest(socket));
+      if (!playerId) return reply({ ok: false });
+      const change = presence.connect(playerId, socket.id);
+      void Promise.resolve(socket.join(playerRoom(playerId))).then(() => {
+        reply({ ok: true });
+        if (change) presenceChanged(change);
+      });
+    });
+
+    // Presence for the avatars on the page: `presence:update` goes to the
+    // sockets that ask (room `presence`), anonymous viewers included.
+    socket.on('presence:subscribe', () => {
+      void socket.join(PRESENCE_ROOM);
+    });
+
+    // The tab went idle (5 minutes without input) or came back. One socket
+    // per tab reports it; nothing for an anonymous socket.
+    socket.on('presence:idle', (idle?: Untrusted) => {
+      if (typeof idle !== 'boolean') return;
+      const playerId = getRealViewerSteamId(handshakeAsRequest(socket));
+      if (!playerId) return;
+      const change = presence.report(playerId, socket.id, idle);
+      if (change) presenceChanged(change);
+    });
+
+    // The last tab of a player closing: they went offline.
+    socket.on('disconnecting', () => {
+      const change = presence.disconnect(socket.id);
+      if (change) presenceChanged(change);
+    });
 
     socket.on('disconnect', () => {
       log.debug(`Socket client disconnected: ${socket.id}`);
     });
   });
 
+  // The admin log viewer follows the log (the `logs` topic, coalesced).
+  onLogEntry(() => emitTopic('logs', { admin: true }));
+
   log.success('Socket.io initialized');
   return io;
+}
+
+/**
+ * Page data changed: every page showing `topic` re-reads it (client
+ * hooks/useTopic.ts), instead of polling. `admin` topics go to the admins'
+ * room only. Coalesced per topic: a burst of changes is one `topic` event
+ * 250 ms after the first.
+ *
+ * Topics: `fleet` (servers, machines, autoscale, failover, pushes, server
+ * availability; admin), `matchmaking` (the admin queue; admin), `steam-health`
+ * (admin), `highlights-admin` (clean copies and redraws; admin),
+ * `logs` (the log viewer; admin), `demo-analysis` (imports; admin).
+ */
+const TOPIC_COALESCE_MS = 250;
+const pendingTopics = new Map<string, NodeJS.Timeout>();
+
+export function emitTopic(topic: string, options: { admin?: boolean } = {}): void {
+  const key = `${options.admin ? 'admin' : 'all'}:${topic}`;
+  if (pendingTopics.has(key)) return;
+  pendingTopics.set(
+    key,
+    setTimeout(() => {
+      pendingTopics.delete(key);
+      if (!io) return;
+      if (options.admin) io.to(ADMIN_ROOM).emit('topic', { topic });
+      else io.emit('topic', { topic });
+    }, TOPIC_COALESCE_MS)
+  );
+}
+
+/** The socket server, or null before it is up (for emitters that may run early, or in scripts). */
+export function maybeIO(): SocketIOServer | null {
+  return io ?? null;
 }
 
 export function getIO(): SocketIOServer {
@@ -43,10 +235,36 @@ export function getIO(): SocketIOServer {
  * Emit tournament update
  */
 export function emitTournamentUpdate(tournament: TournamentUpdateEvent): void {
+  // A tournament changed status (created, started, finished, ...): which one
+  // is featured may have changed with it.
+  void import('./currentTournament')
+    .then((m) => m.refreshCurrentTournamentId())
+    .catch(() => undefined);
   if (io) {
     io.emit('tournament:update', tournament);
     log.debug('Emitted tournament update', { tournamentId: tournament.id });
   }
+}
+
+/**
+ * Emit an event scoped to one tournament (3.0 phase D).
+ *
+ * Everything else here broadcasts, because 3.0 hosts a single tournament row.
+ * A tournament-scoped emit is the shape 3.1 needs — several tournaments on one
+ * instance, each with its own listeners — so anything written from phase D
+ * onwards goes through this rather than adding another global `io.emit`.
+ *
+ * It sends the event twice: once globally, so today's clients (which join no
+ * room and filter nothing) keep working, and once on a per-tournament channel
+ * a 3.1 client subscribes to. `tournamentId` rides along in the payload so a
+ * listener on the global channel can tell them apart.
+ */
+export function emitTournament(tournamentId: number, event: string, payload: object = {}): void {
+  if (!io) return;
+  const body = { ...payload, tournamentId };
+  io.emit(event, body);
+  io.emit(`${event}:t${tournamentId}`, body);
+  log.debug('Emitted tournament-scoped event', { tournamentId, event });
 }
 
 /**
@@ -63,6 +281,9 @@ export function emitBracketUpdate(bracket: BracketUpdateEvent): void {
  * Emit match update
  */
 export function emitMatchUpdate(match: MatchUpdateEvent): void {
+  // Integrator webhooks re-read the match (core/matchChangeBus), socket or not.
+  const ref = match as { slug?: string; id?: number; deleted?: boolean };
+  matchChanged({ slug: ref.slug ?? null, id: ref.id ?? null, deleted: ref.deleted === true });
   if (io) {
     io.emit('match:update', match);
 
@@ -83,6 +304,18 @@ export function emitMatchEvent(matchSlug: string, event: MatchEventData['event']
     io.emit('match:event', { matchSlug, event });
     io.emit(`match:event:${matchSlug}`, event);
     log.debug('Emitted match event', { matchSlug, eventType: event.event });
+  }
+}
+
+/**
+ * A match's highlights changed (a clip or a reel finished, or one was
+ * dropped): its public page fetches them again. Only the slug goes out;
+ * what changed is read through the usual public routes.
+ */
+export function emitHighlightsChanged(matchSlug: string): void {
+  if (io) {
+    io.emit(`highlights:update:${matchSlug}`, { matchSlug });
+    log.debug('Emitted highlights update', { matchSlug });
   }
 }
 
@@ -116,4 +349,210 @@ export function emitVetoUpdate(matchSlug: string, vetoState: VetoUpdateEvent['ve
     io.emit(`veto:update:${matchSlug}`, vetoState);
     log.debug('Emitted veto update', { matchSlug });
   }
+}
+
+/**
+ * Emit a Ready Up compatibility change to the sockets on the public
+ * compatibility page (room `compat`, joined with `compat:subscribe`).
+ */
+export function emitCompatUpdate(payload: CompatUpdateEvent): void {
+  if (io) {
+    io.to(COMPAT_ROOM).emit('compat:update', payload);
+    log.debug('Emitted compat update', { runId: payload.run.run.id });
+  }
+}
+
+const playerRoom = (playerId: string) => `player:${playerId}`;
+
+/**
+ * Signed-in players with the site open right now (each tab asks for its
+ * `player:<id>` room on connect).
+ */
+export function onlinePlayerCount(): number {
+  return presence.onlineIds().length;
+}
+
+/** The players with the site open right now. */
+export function onlinePlayerIds(): string[] {
+  return presence.onlineIds();
+}
+
+/** Whether the player has the site open in at least one tab (away counts). */
+export function isPlayerOnline(playerId: string): boolean {
+  return presence.status(playerId) !== 'offline';
+}
+
+/** Online, away (every reporting tab idle for 5 minutes) or offline. */
+export function presenceStatus(playerId: string): PresenceStatus {
+  return presence.status(playerId);
+}
+
+type PresenceListener = (playerId: string, online: boolean) => void;
+let presenceListener: PresenceListener | null = null;
+
+/** Hear players come online (first tab) and go offline (last tab closed). One listener (services/socialService). */
+export function onPresence(listener: PresenceListener): void {
+  presenceListener = listener;
+}
+
+/** Tell the pages showing avatars (`presence:update`), and friends when they came or went. */
+function presenceChanged(change: PresenceChange): void {
+  io?.to(PRESENCE_ROOM).emit('presence:update', {
+    playerId: change.playerId,
+    status: change.status,
+  });
+  if (change.previous === 'offline') presenceListener?.(change.playerId, true);
+  else if (change.status === 'offline') presenceListener?.(change.playerId, false);
+}
+
+/** A new notice for the bell (`notify:new`, the notice as payload). Room `player:<id>`. */
+export function emitNotification(playerId: string, notice: object): void {
+  if (io) io.to(playerRoom(playerId)).emit('notify:new', notice);
+}
+
+/**
+ * Tell players their friends, requests or invites changed (`social:changed`,
+ * no payload: the client reads GET /api/social/friends again). Rooms `player:<id>`.
+ */
+export function emitSocialChanged(playerIds: Iterable<string>): void {
+  if (!io) return;
+  const rooms = [...new Set(playerIds)].map(playerRoom);
+  if (rooms.length > 0) io.to(rooms).emit('social:changed');
+}
+
+/**
+ * Tell players their matchmaking state changed (`mm:changed`, no payload: the
+ * client reads GET /api/matchmaking/me again). Rooms `player:<id>`.
+ */
+export function emitMatchmakingChanged(playerIds: Iterable<string>): void {
+  if (!io) return;
+  const rooms = [...new Set(playerIds)].map(playerRoom);
+  if (rooms.length > 0) io.to(rooms).emit('mm:changed');
+}
+
+/**
+ * Tell a player their skins changed (`skins:changed`, no payload: the client
+ * reads GET /api/skins/me again and shows the new-skin reveal). Room `player:<id>`.
+ */
+export function emitSkinsChanged(playerId: string): void {
+  if (io) io.to(playerRoom(playerId)).emit('skins:changed');
+}
+
+/** A new admin call, to the signed-in admins (room `admins`). */
+export function emitAdminCall(call: AdminCall): void {
+  if (io) {
+    io.to(ADMIN_ROOM).emit('admin:call', call);
+    log.debug('Emitted admin call', { id: call.id });
+  }
+}
+
+/**
+ * A csm machine changed (inventory, health, a command's progress or result,
+ * online or offline), to the signed-in admins: the Servers page reloads that
+ * machine instead of waiting for its next poll.
+ */
+export function emitFleetHostChanged(hostId: string): void {
+  if (io) io.to(ADMIN_ROOM).emit('fleet:host', { hostId });
+}
+
+/** A notice for the admins' bell (services/adminNoticeService.ts), to the signed-in admins. */
+export function emitAdminNotice(notice: object, sound: boolean): void {
+  if (io) io.to(ADMIN_ROOM).emit('admin:notice', { notice, sound });
+}
+
+/** Admins' bell notices that are closed now (fixed themselves or dismissed). */
+export function emitAdminNoticesResolved(ids: number[]): void {
+  if (io && ids.length) io.to(ADMIN_ROOM).emit('admin:notice:resolved', { ids });
+}
+
+/** Admin calls resolved, to the signed-in admins (room `admins`). */
+/** A call was claimed or released, to the signed-in admins (the others see who has it). */
+export function emitAdminCallClaimed(payload: AdminCallClaimedEvent): void {
+  if (io) {
+    io.to(ADMIN_ROOM).emit('admin:call:claimed', payload);
+    log.debug('Emitted admin call claimed', { id: payload.id });
+  }
+}
+
+export function emitAdminCallResolved(payload: AdminCallResolvedEvent): void {
+  if (io) {
+    io.to(ADMIN_ROOM).emit('admin:call:resolved', payload);
+    log.debug('Emitted admin call resolved', { ids: payload.ids });
+  }
+}
+
+/** A chat message, to the players in its channel (rooms `player:<id>`) and, for a match, the admins. */
+export function emitChatMessage(
+  playerIds: Iterable<string>,
+  toAdmins: boolean,
+  message: object
+): void {
+  if (!io) return;
+  const rooms = [...new Set(playerIds)].map(playerRoom);
+  if (toAdmins) rooms.push(ADMIN_ROOM);
+  if (rooms.length > 0) io.to(rooms).emit('chat:message', message);
+}
+
+/** Someone is typing in a chat channel, to its other players (not the admins' room). */
+export function emitChatTyping(
+  playerIds: Iterable<string>,
+  typing: { channel: string; playerId: string; name: string }
+): void {
+  if (!io) return;
+  const rooms = [...new Set(playerIds)].map(playerRoom);
+  if (rooms.length > 0) io.to(rooms).emit('chat:typing', typing);
+}
+
+/**
+ * A platform line in a match's chat (veto steps, the server being ready),
+ * for a game module: it reaches core through this bridged module.
+ * See ./matchChatLines.ts.
+ */
+export async function postMatchChatLine(
+  slug: string,
+  key: MatchChatKey,
+  params: Record<string, string | number | boolean | string[]> = {}
+): Promise<void> {
+  const lines = await import('./matchChatLines');
+  await lines.postMatchChatLine(slug, key, params);
+}
+
+/** A message written on the site in a match's chat (not one that came from the game). */
+export interface MatchChatPosted {
+  slug: string;
+  senderKind: 'player' | 'admin';
+  senderName: string;
+  body: string;
+}
+
+const matchChatListeners = new Set<(posted: MatchChatPosted) => void>();
+
+/**
+ * Hear every message written on the site in a match's chat, for a game module that sends
+ * them to the match's server (CS2: fleet/chatBridge.ts). Lines that came from the game
+ * itself (`postGameChatMessage`) are not heard here, so nothing loops.
+ */
+export function onMatchChatPosted(listener: (posted: MatchChatPosted) => void): () => void {
+  matchChatListeners.add(listener);
+  return () => matchChatListeners.delete(listener);
+}
+
+/** Called by the chat service after a site message in a match's chat is stored and sent. */
+export function matchChatPosted(posted: MatchChatPosted): void {
+  for (const listener of matchChatListeners) {
+    try {
+      listener(posted);
+    } catch (error) {
+      log.debug('A match chat listener failed', { error: (error as Error).message });
+    }
+  }
+}
+
+/**
+ * A player's chat line from the match's game server, into the match's chat (for a game
+ * module: it reaches core through this bridged module). See chatService.fromGame.
+ */
+export async function postGameChatMessage(slug: string, input: GameChatInput): Promise<void> {
+  const { chatService } = await import('./chatService');
+  await chatService.fromGame(slug, input);
 }

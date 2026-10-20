@@ -3,10 +3,14 @@
  * Unified interface for all tournament bracket generation strategies
  */
 
-import type { TournamentResponse, BracketMatch } from '../../types/tournament.types';
+import type { TournamentResponse } from '../../types/tournament.types';
 
 /**
- * Standard bracket generator result
+ * Bracket generator result: neutral slots only.
+ *
+ * Generators decide the bracket shape (who meets whom, and where winners and
+ * losers go). They do not build game configs: tournamentService asks the
+ * match's game integration for `matches.config` when it persists the slots.
  */
 export interface BracketGeneratorResult {
   matches: Array<{
@@ -20,7 +24,7 @@ export interface BracketGeneratorResult {
      * - 'GF'       → grand final
      * - 'GF_RESET' → optional reset grand final (if supported)
      */
-    bracket?: 'WB' | 'LB' | 'GF' | 'GF_RESET';
+    bracket?: 'WB' | 'LB' | 'GF' | 'GF_RESET' | 'SE' | `G${'A' | 'B' | 'C' | 'D'}`;
     team1Id: string | null;
     team2Id: string | null;
     winnerId: string | null;
@@ -37,7 +41,13 @@ export interface BracketGeneratorResult {
     team1FromOutcome?: 'winner' | 'loser' | null;
     team2FromMatchSlug?: string | null;
     team2FromOutcome?: 'winner' | 'loser' | null;
-    config: string;
+    /** Set for slots that are decided at generation (a Swiss round-1 bye). */
+    completedAt?: number;
+    /** A playoff slot's qualifier seeds (groups, then playoffs: services/groupsTournament.ts). */
+    team1Seed?: number | null;
+    team2Seed?: number | null;
+    /** This slot's series length when it differs from the tournament's (the playoffs). */
+    format?: 'bo1' | 'bo3' | 'bo5';
   }>;
 }
 
@@ -47,15 +57,10 @@ export interface BracketGeneratorResult {
  */
 export interface IBracketGenerator {
   /**
-   * Generate bracket structure for a tournament
+   * Generate the bracket's slots for a tournament. Nothing is persisted here.
    * @param tournament - Tournament configuration
-   * @param getMatchesCallback - Callback to retrieve generated matches from DB
-   * @returns Array of bracket matches
    */
-  generate(
-    tournament: TournamentResponse,
-    getMatchesCallback: () => Promise<BracketMatch[]>
-  ): Promise<BracketMatch[] | BracketGeneratorResult>;
+  generate(tournament: TournamentResponse): Promise<BracketGeneratorResult>;
 
   /**
    * Reset generator state (if stateful)

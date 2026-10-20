@@ -1,8 +1,16 @@
-import { Router, Request, Response } from 'express';
-import { requireAuth } from '../middleware/auth';
+import { readHighlightSettings } from '../services/highlights/settings';
+import type { Request, Response } from 'express';
+import { Router } from 'express';
+import { requireAuth, requestActorId, type AuthedRequest } from '../middleware/auth';
+import { apiTokenService, ApiTokenError, type StoredTokenScope } from '../services/apiTokenService';
 import { settingsService } from '../services/settingsService';
+import { resolveTournamentId } from '../utils/tournamentRow';
 import { log } from '../utils/logger';
+import { db } from '../config/database';
+import { integrationForMatch, listIntegrations } from '../integrations/registry';
 import packageJson from '../../package.json';
+import { runningTournamentIds } from '../services/currentTournament';
+import type { Untrusted } from '../utils/untrusted';
 
 const router = Router();
 
@@ -16,67 +24,210 @@ router.get('/version', async (_req: Request, res: Response) => {
 
 router.use(requireAuth);
 
+/**
+ * Kick off automated veto for the in-progress tournament's waiting matches.
+ * Runs in the background; a failure here must not fail the settings save.
+ */
+async function startAutoVetoForRunningTournament(tournamentId: number): Promise<void> {
+  try {
+    const tournament = await db.queryOneAsync<{ id: number; status: string; game: string | null }>(
+      'SELECT id, status, game FROM tournament WHERE id = ?',
+      [tournamentId]
+    );
+    if (!tournament || tournament.status !== 'in_progress') return;
+
+    const started =
+      (await integrationForMatch(tournament).startPendingPreMatchPhases?.(tournament.id)) ?? [];
+    if (started.length > 0) {
+      log.info(
+        `[VETO-SIM] Simulation enabled mid-tournament; auto-vetoing ${started.length} waiting match(es)`,
+        { matches: started }
+      );
+    }
+  } catch (error) {
+    log.error('[VETO-SIM] Failed to start auto veto after enabling simulation', error);
+  }
+}
+
+/**
+ * The settings response: the core's fields, then each integration's
+ * (`readInstanceSettings`, CS2: the simulation and `at_*` defaults).
+ */
 const mapSettingsResponse = async () => {
-  const webhookUrl = await settingsService.getWebhookUrl();
   const steamApiKey = await settingsService.getSteamApiKey();
   const defaultPlayerElo = null;
-  const simulateMatches = await settingsService.isSimulationModeEnabled();
-  const simulationTimescale = await settingsService.getSimulationTimescale();
-  const matchzyChatPrefix = await settingsService.getMatchzyChatPrefix();
-  const matchzyAdminChatPrefix = await settingsService.getMatchzyAdminChatPrefix();
-  const matchzyKnifeEnabledDefault = await settingsService.isKnifeRoundEnabledByDefault();
   const ratingsEnabled = await settingsService.areRatingsEnabled();
-  const matchzyDebugChatEnabled = await settingsService.isMatchzyDebugChatEnabled();
   const allowSelfRegister = await settingsService.isSelfRegistrationAllowed();
-  const matchzyCore = await settingsService.getMatchzyCoreDefaults();
-  
-  // MatchZy Enhanced v1.3.0 settings
-  const matchzyEnhanced = await settingsService.getMatchzyEnhancedSettings();
+  const playersChooseName = await settingsService.canPlayersChooseName();
+  const siteName = await settingsService.getSiteName();
+  const webhooksAllowPrivateTargets = await settingsService.areWebhookPrivateTargetsAllowed();
+  const highlights = await readHighlightSettings((key) => settingsService.getSetting(key));
+
+  const integrationFields: object = {};
+  for (const integration of listIntegrations()) {
+    Object.assign(integrationFields, await integration.readInstanceSettings?.());
+  }
 
   return {
-    webhookUrl,
+    siteName,
     steamApiKey: null,
     steamApiKeySet: Boolean(steamApiKey),
-    webhookConfigured: Boolean(webhookUrl),
     defaultPlayerElo,
-    simulateMatches,
-    simulationTimescale,
-    matchzyChatPrefix,
-    matchzyAdminChatPrefix,
-    matchzyKnifeEnabledDefault,
     ratingsEnabled,
-    matchzyDebugChatEnabled,
     allowSelfRegister,
-    // MatchZy core defaults
-    matchzyAutostartMode: matchzyCore.autostartMode,
-    matchzyMinimumReadyRequired: matchzyCore.minimumReadyRequired,
-    matchzyAllowForceReady: matchzyCore.allowForceReady,
-    matchzyKickWhenNoMatchLoaded: matchzyCore.kickWhenNoMatchLoaded,
-    matchzyWhitelistEnabledDefault: matchzyCore.whitelistEnabledDefault,
-    matchzyPauseAfterRestore: matchzyCore.pauseAfterRestore,
-    matchzyStopCommandAvailable: matchzyCore.stopCommandAvailable,
-    matchzyStopCommandNoDamage: matchzyCore.stopCommandNoDamage,
-    matchzyUsePauseCommandForTacticalPause: matchzyCore.usePauseCommandForTacticalPause,
-    matchzyDemoPath: matchzyCore.demoPath,
-    matchzyDemoNameFormat: matchzyCore.demoNameFormat,
-    matchzySeriesEndKickDelayNoDemo: matchzyCore.seriesEndKickDelayNoDemo,
-    matchzySeriesEndKickDelayDemoNoUpload: matchzyCore.seriesEndKickDelayDemoNoUpload,
-    matchzySeriesEndKickDelayDemoUpload: matchzyCore.seriesEndKickDelayDemoUpload,
-    // MatchZy Enhanced v1.3.0 settings (null = use tournament defaults)
-    matchzyAutoreadyEnabled: matchzyEnhanced.matchzy_autoready_enabled,
-    matchzyBothTeamsUnpauseRequired: matchzyEnhanced.matchzy_both_teams_unpause_required,
-    matchzyMaxPausesPerTeam: matchzyEnhanced.matchzy_max_pauses_per_team,
-    matchzyPauseDuration: matchzyEnhanced.matchzy_pause_duration,
-    matchzySideSelectionEnabled: matchzyEnhanced.matchzy_side_selection_enabled,
-    matchzySideSelectionTime: matchzyEnhanced.matchzy_side_selection_time,
-    matchzyGgEnabled: matchzyEnhanced.matchzy_gg_enabled,
-    matchzyGgThreshold: matchzyEnhanced.matchzy_gg_threshold,
-    matchzyGgMinScoreDiff: matchzyEnhanced.matchzy_gg_min_score_diff,
-    matchzyFfwEnabled: matchzyEnhanced.matchzy_ffw_enabled,
-    matchzyFfwTime: matchzyEnhanced.matchzy_ffw_time,
-    matchzyDemoRecordingEnabled: matchzyEnhanced.matchzy_demo_recording_enabled,
+    playersChooseName,
+    ...highlights,
+    webhooksAllowPrivateTargets,
+    ...integrationFields,
   };
 };
+
+/**
+ * @openapi
+ * /api/settings/site-url:
+ *   get:
+ *     tags: [Settings]
+ *     summary: The address this site is set up for (FRONTEND_BASE_URL)
+ *     description: The admin UI compares it with the address it was opened on, and says so when they differ.
+ *     security: [{ BearerAuth: [] }]
+ *     responses:
+ *       200: { description: "`url` (null when not set)" }
+ */
+router.get('/site-url', (_req: Request, res: Response) => {
+  const url = (process.env.FRONTEND_BASE_URL || '').trim().replace(/\/+$/, '');
+  res.json({ url: url || null });
+});
+
+/**
+ * @openapi
+ * /api/settings/discord-bot:
+ *   get:
+ *     tags: [Settings]
+ *     summary: Whether a Discord bot token is set (for players' DMs), and the bot's name
+ *     security: [{ BearerAuth: [] }]
+ *     responses:
+ *       200: { description: "`set`, `name`" }
+ *   put:
+ *     tags: [Settings]
+ *     summary: Set (checked with Discord, stored encrypted) or clear the bot token
+ *     description: A signed-in admin only. `token` empty or null clears it.
+ *     security: [{ BearerAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema: { type: object, properties: { token: { type: string, nullable: true } } }
+ *     responses:
+ *       200: { description: "`set`, `name`" }
+ *       400: { description: Discord refused the token }
+ *       403: { description: Called with an API token }
+ */
+router.get('/discord-bot', async (_req: Request, res: Response) => {
+  try {
+    const { discordBot } = await import('../services/notifyChannels');
+    return res.json({ success: true, ...(await discordBot.status()) });
+  } catch (error) {
+    log.error('Reading the Discord bot failed', error as Error);
+    return res.status(500).json({ success: false, error: 'Could not read the Discord bot' });
+  }
+});
+
+router.put('/discord-bot', async (req: Request, res: Response) => {
+  if ((req as AuthedRequest).serviceToken) {
+    return res.status(403).json({ success: false, error: 'Only a signed-in admin can set it' });
+  }
+  try {
+    const { discordBot, ChannelError } = await import('../services/notifyChannels');
+    const raw = (req.body ?? {}).token;
+    const token = typeof raw === 'string' ? raw : null;
+    try {
+      return res.json({ success: true, ...(await discordBot.setToken(token)) });
+    } catch (error) {
+      if (error instanceof ChannelError) {
+        return res.status(error.status).json({ success: false, error: error.message });
+      }
+      throw error;
+    }
+  } catch (error) {
+    log.error('Setting the Discord bot failed', error as Error);
+    return res.status(500).json({ success: false, error: 'Could not save the Discord bot' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/settings/api-tokens:
+ *   get:
+ *     tags: [Settings]
+ *     summary: API tokens made in Settings (never their secrets)
+ *     security: [{ BearerAuth: [] }]
+ *     responses:
+ *       200: { description: The active tokens }
+ *   post:
+ *     tags: [Settings]
+ *     summary: Make an API token; the secret is in this answer only
+ *     description: A signed-in admin only; an API token cannot make tokens.
+ *     security: [{ BearerAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               label: { type: string, description: '1-32 letters, digits, - or _' }
+ *               scope: { type: string, enum: [admin, readonly] }
+ *     responses:
+ *       201: { description: The token and its secret }
+ *       400: { description: Not a valid name or scope }
+ *       403: { description: Called with an API token }
+ */
+router.get('/api-tokens', async (_req: Request, res: Response) => {
+  return res.json({ success: true, tokens: await apiTokenService.list() });
+});
+
+router.post('/api-tokens', async (req: Request, res: Response) => {
+  // A leaked token must not be able to make more of itself.
+  if ((req as AuthedRequest).serviceToken) {
+    return res
+      .status(403)
+      .json({ success: false, error: 'Sign in as an admin to make API tokens.' });
+  }
+  try {
+    const { label, scope } = (req.body ?? {}) as { label?: Untrusted; scope?: Untrusted };
+    const made = await apiTokenService.create(
+      typeof label === 'string' ? label : '',
+      String(scope ?? '') as StoredTokenScope,
+      requestActorId(req)
+    );
+    return res.status(201).json({ success: true, ...made });
+  } catch (error) {
+    if (error instanceof ApiTokenError) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    log.error('Making an API token failed', error as Error);
+    return res.status(500).json({ success: false, error: 'Could not make the token' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/settings/api-tokens/{id}:
+ *   delete:
+ *     tags: [Settings]
+ *     summary: Revoke an API token made in Settings
+ *     security: [{ BearerAuth: [] }]
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: Revoked }
+ *       404: { description: No such active token }
+ */
+router.delete('/api-tokens/:id', async (req: Request, res: Response) => {
+  const ok = await apiTokenService.revoke(Number(req.params.id), requestActorId(req));
+  if (!ok) return res.status(404).json({ success: false, error: 'No such token' });
+  return res.json({ success: true });
+});
 
 router.get('/', async (_req: Request, res: Response) => {
   return res.json({
@@ -85,556 +236,27 @@ router.get('/', async (_req: Request, res: Response) => {
   });
 });
 
+/**
+ * Update settings. Each field is optional; `null` clears it. The fields are
+ * the core's and the integrations' (`settingsService.applyUpdate`); a
+ * rejected one returns 400, and the fields applied before it stay saved.
+ */
 router.put('/', async (req: Request, res: Response) => {
-  const {
-    webhookUrl,
-    simulateMatches,
-    simulationTimescale,
-    matchzyChatPrefix,
-    matchzyAdminChatPrefix,
-    matchzyKnifeEnabledDefault,
-    ratingsEnabled,
-    matchzyDebugChatEnabled,
-    allowSelfRegister,
-    // MatchZy core defaults
-    matchzyAutostartMode,
-    matchzyMinimumReadyRequired,
-    matchzyAllowForceReady,
-    matchzyKickWhenNoMatchLoaded,
-    matchzyWhitelistEnabledDefault,
-    matchzyPauseAfterRestore,
-    matchzyStopCommandAvailable,
-    matchzyStopCommandNoDamage,
-    matchzyUsePauseCommandForTacticalPause,
-    matchzyDemoPath,
-    matchzyDemoNameFormat,
-    matchzySeriesEndKickDelayNoDemo,
-    matchzySeriesEndKickDelayDemoNoUpload,
-    matchzySeriesEndKickDelayDemoUpload,
-    // MatchZy Enhanced v1.3.0 settings
-    matchzyAutoreadyEnabled,
-    matchzyBothTeamsUnpauseRequired,
-    matchzyMaxPausesPerTeam,
-    matchzyPauseDuration,
-    matchzySideSelectionEnabled,
-    matchzySideSelectionTime,
-    matchzyGgEnabled,
-    matchzyGgThreshold,
-    matchzyGgMinScoreDiff,
-    matchzyFfwEnabled,
-    matchzyFfwTime,
-    matchzyDemoRecordingEnabled,
-  } = req.body as {
-    webhookUrl?: unknown;
-    simulateMatches?: unknown;
-    simulationTimescale?: unknown;
-    matchzyChatPrefix?: unknown;
-    matchzyAdminChatPrefix?: unknown;
-    matchzyKnifeEnabledDefault?: unknown;
-    ratingsEnabled?: unknown;
-    matchzyDebugChatEnabled?: unknown;
-    allowSelfRegister?: unknown;
-    // MatchZy core defaults
-    matchzyAutostartMode?: unknown;
-    matchzyMinimumReadyRequired?: unknown;
-    matchzyAllowForceReady?: unknown;
-    matchzyKickWhenNoMatchLoaded?: unknown;
-    matchzyWhitelistEnabledDefault?: unknown;
-    matchzyPauseAfterRestore?: unknown;
-    matchzyStopCommandAvailable?: unknown;
-    matchzyStopCommandNoDamage?: unknown;
-    matchzyUsePauseCommandForTacticalPause?: unknown;
-    matchzyDemoPath?: unknown;
-    matchzyDemoNameFormat?: unknown;
-    matchzySeriesEndKickDelayNoDemo?: unknown;
-    matchzySeriesEndKickDelayDemoNoUpload?: unknown;
-    matchzySeriesEndKickDelayDemoUpload?: unknown;
-    // MatchZy Enhanced v1.3.0 settings
-    matchzyAutoreadyEnabled?: unknown;
-    matchzyBothTeamsUnpauseRequired?: unknown;
-    matchzyMaxPausesPerTeam?: unknown;
-    matchzyPauseDuration?: unknown;
-    matchzySideSelectionEnabled?: unknown;
-    matchzySideSelectionTime?: unknown;
-    matchzyGgEnabled?: unknown;
-    matchzyGgThreshold?: unknown;
-    matchzyGgMinScoreDiff?: unknown;
-    matchzyFfwEnabled?: unknown;
-    matchzyFfwTime?: unknown;
-    matchzyDemoRecordingEnabled?: unknown;
-  };
+  const tournamentId = resolveTournamentId(req);
+  const body = req.body as Record<string, Untrusted>;
 
   try {
-    if (webhookUrl !== undefined) {
-      if (typeof webhookUrl !== 'string' && webhookUrl !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'webhookUrl must be a string or null',
-        });
-      }
-      await settingsService.setSetting(
-        'webhook_url',
-        typeof webhookUrl === 'string' ? webhookUrl : null
-      );
-    }
-
-    if (simulateMatches !== undefined) {
-      // This is a **developer-only** option.
-      // In production, ignore it by default for safety, unless explicitly enabled
-      // via MATCHZY_ENABLE_SIMULATION_IN_PROD=true (e.g. lab/test environments).
-      const simulationAllowedInProd =
-        process.env.MATCHZY_ENABLE_SIMULATION_IN_PROD?.toLowerCase() === 'true';
-      if (process.env.NODE_ENV === 'production' && !simulationAllowedInProd) {
-        log.warn(
-          'Received simulateMatches setting update in production environment – ignoring for safety'
-        );
-      } else {
-        if (typeof simulateMatches !== 'boolean' && simulateMatches !== null) {
-          return res.status(400).json({
-            success: false,
-            error: 'simulateMatches must be a boolean or null',
-          });
+    const error = await settingsService.applyUpdate(body, {
+      tournamentId,
+      // Instance settings: every running tournament's pending pre-match phases.
+      startPendingPreMatchPhases: async () => {
+        for (const id of new Set([tournamentId, ...(await runningTournamentIds())])) {
+          await startAutoVetoForRunningTournament(id);
         }
-
-        const value =
-          simulateMatches === null ? null : simulateMatches === true ? '1' : '0';
-
-        await settingsService.setSetting('simulate_matches', value);
-      }
-    }
-
-    if (simulationTimescale !== undefined) {
-      if (typeof simulationTimescale !== 'number' && simulationTimescale !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'simulationTimescale must be a number or null',
-        });
-      }
-
-      let value: string | null = null;
-      if (typeof simulationTimescale === 'number' && Number.isFinite(simulationTimescale)) {
-        const clamped = Math.min(4, Math.max(0.1, simulationTimescale));
-        value = String(clamped);
-      }
-
-      await settingsService.setSetting('simulation_timescale', value);
-    }
-
-    if (matchzyChatPrefix !== undefined) {
-      if (typeof matchzyChatPrefix !== 'string' && matchzyChatPrefix !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyChatPrefix must be a string or null',
-        });
-      }
-
-      await settingsService.setSetting(
-        'matchzy_chat_prefix',
-        typeof matchzyChatPrefix === 'string' ? matchzyChatPrefix : null
-      );
-    }
-
-    if (matchzyAdminChatPrefix !== undefined) {
-      if (typeof matchzyAdminChatPrefix !== 'string' && matchzyAdminChatPrefix !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyAdminChatPrefix must be a string or null',
-        });
-      }
-
-      await settingsService.setSetting(
-        'matchzy_admin_chat_prefix',
-        typeof matchzyAdminChatPrefix === 'string' ? matchzyAdminChatPrefix : null
-      );
-    }
-
-    if (matchzyKnifeEnabledDefault !== undefined) {
-      if (typeof matchzyKnifeEnabledDefault !== 'boolean' && matchzyKnifeEnabledDefault !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyKnifeEnabledDefault must be a boolean or null',
-        });
-      }
-
-      const value =
-        matchzyKnifeEnabledDefault === null
-          ? null
-          : matchzyKnifeEnabledDefault === true
-          ? '1'
-          : '0';
-
-      await settingsService.setSetting('matchzy_knife_enabled_default', value);
-    }
-
-    if (ratingsEnabled !== undefined) {
-      if (typeof ratingsEnabled !== 'boolean' && ratingsEnabled !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'ratingsEnabled must be a boolean or null',
-        });
-      }
-
-      const value =
-        ratingsEnabled === null ? null : ratingsEnabled === true ? '1' : '0';
-
-      await settingsService.setSetting('ratings_enabled', value);
-    }
-
-    if (matchzyDebugChatEnabled !== undefined) {
-      if (typeof matchzyDebugChatEnabled !== 'boolean' && matchzyDebugChatEnabled !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyDebugChatEnabled must be a boolean or null',
-        });
-      }
-
-      const value =
-        matchzyDebugChatEnabled === null
-          ? null
-          : matchzyDebugChatEnabled === true
-          ? '1'
-          : '0';
-
-      await settingsService.setSetting('matchzy_debug_chat', value);
-    }
-
-    if (allowSelfRegister !== undefined) {
-      if (typeof allowSelfRegister !== 'boolean' && allowSelfRegister !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'allowSelfRegister must be a boolean or null',
-        });
-      }
-
-      const value =
-        allowSelfRegister === null ? null : allowSelfRegister === true ? '1' : '0';
-
-      await settingsService.setSetting('allow_self_register', value);
-    }
-
-    if (matchzyMinimumReadyRequired !== undefined) {
-      if (
-        typeof matchzyMinimumReadyRequired !== 'number' &&
-        matchzyMinimumReadyRequired !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyMinimumReadyRequired must be a number or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_minimum_ready_required',
-        matchzyMinimumReadyRequired === null ? null : String(matchzyMinimumReadyRequired)
-      );
-    }
-
-    if (matchzyAutostartMode !== undefined) {
-      if (typeof matchzyAutostartMode !== 'number' && matchzyAutostartMode !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyAutostartMode must be a number (0-2) or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_autostart_mode',
-        matchzyAutostartMode === null ? null : String(matchzyAutostartMode)
-      );
-    }
-
-    const putBoolOrNull = async (key: Parameters<typeof settingsService.setSetting>[0], v: unknown, label: string) => {
-      if (v === undefined) return;
-      if (typeof v !== 'boolean' && v !== null) {
-        return res.status(400).json({
-          success: false,
-          error: `${label} must be a boolean or null`,
-        });
-      }
-      const value = v === null ? null : v === true ? '1' : '0';
-      await settingsService.setSetting(key, value);
-      return;
-    };
-
-    const putStringOrNull = async (key: Parameters<typeof settingsService.setSetting>[0], v: unknown, label: string) => {
-      if (v === undefined) return;
-      if (typeof v !== 'string' && v !== null) {
-        return res.status(400).json({
-          success: false,
-          error: `${label} must be a string or null`,
-        });
-      }
-      await settingsService.setSetting(key, typeof v === 'string' ? v : null);
-      return;
-    };
-
-    const putNumberOrNull = async (key: Parameters<typeof settingsService.setSetting>[0], v: unknown, label: string) => {
-      if (v === undefined) return;
-      if (typeof v !== 'number' && v !== null) {
-        return res.status(400).json({
-          success: false,
-          error: `${label} must be a number or null`,
-        });
-      }
-      await settingsService.setSetting(key, v === null ? null : String(v));
-      return;
-    };
-
-    // MatchZy core defaults (booleans)
-    if (matchzyAllowForceReady !== undefined) {
-      const resp = await putBoolOrNull('matchzy_allow_force_ready', matchzyAllowForceReady, 'matchzyAllowForceReady');
-      if (resp) return resp;
-    }
-    if (matchzyKickWhenNoMatchLoaded !== undefined) {
-      const resp = await putBoolOrNull('matchzy_kick_when_no_match_loaded', matchzyKickWhenNoMatchLoaded, 'matchzyKickWhenNoMatchLoaded');
-      if (resp) return resp;
-    }
-    if (matchzyWhitelistEnabledDefault !== undefined) {
-      const resp = await putBoolOrNull('matchzy_whitelist_enabled_default', matchzyWhitelistEnabledDefault, 'matchzyWhitelistEnabledDefault');
-      if (resp) return resp;
-    }
-    if (matchzyPauseAfterRestore !== undefined) {
-      const resp = await putBoolOrNull('matchzy_pause_after_restore', matchzyPauseAfterRestore, 'matchzyPauseAfterRestore');
-      if (resp) return resp;
-    }
-    if (matchzyStopCommandAvailable !== undefined) {
-      const resp = await putBoolOrNull('matchzy_stop_command_available', matchzyStopCommandAvailable, 'matchzyStopCommandAvailable');
-      if (resp) return resp;
-    }
-    if (matchzyStopCommandNoDamage !== undefined) {
-      const resp = await putBoolOrNull('matchzy_stop_command_no_damage', matchzyStopCommandNoDamage, 'matchzyStopCommandNoDamage');
-      if (resp) return resp;
-    }
-    if (matchzyUsePauseCommandForTacticalPause !== undefined) {
-      const resp = await putBoolOrNull('matchzy_use_pause_command_for_tactical_pause', matchzyUsePauseCommandForTacticalPause, 'matchzyUsePauseCommandForTacticalPause');
-      if (resp) return resp;
-    }
-
-    // MatchZy core defaults (strings)
-    if (matchzyDemoPath !== undefined) {
-      const resp = await putStringOrNull('matchzy_demo_path', matchzyDemoPath, 'matchzyDemoPath');
-      if (resp) return resp;
-    }
-    if (matchzyDemoNameFormat !== undefined) {
-      const resp = await putStringOrNull('matchzy_demo_name_format', matchzyDemoNameFormat, 'matchzyDemoNameFormat');
-      if (resp) return resp;
-    }
-
-    // MatchZy core defaults (numbers)
-    if (matchzySeriesEndKickDelayNoDemo !== undefined) {
-      const resp = await putNumberOrNull('matchzy_series_end_kick_delay_no_demo', matchzySeriesEndKickDelayNoDemo, 'matchzySeriesEndKickDelayNoDemo');
-      if (resp) return resp;
-    }
-    if (matchzySeriesEndKickDelayDemoNoUpload !== undefined) {
-      const resp = await putNumberOrNull('matchzy_series_end_kick_delay_demo_no_upload', matchzySeriesEndKickDelayDemoNoUpload, 'matchzySeriesEndKickDelayDemoNoUpload');
-      if (resp) return resp;
-    }
-    if (matchzySeriesEndKickDelayDemoUpload !== undefined) {
-      const resp = await putNumberOrNull('matchzy_series_end_kick_delay_demo_upload', matchzySeriesEndKickDelayDemoUpload, 'matchzySeriesEndKickDelayDemoUpload');
-      if (resp) return resp;
-    }
-
-    // MatchZy Enhanced v1.3.0 settings
-    if (matchzyAutoreadyEnabled !== undefined) {
-      if (
-        typeof matchzyAutoreadyEnabled !== 'number' &&
-        typeof matchzyAutoreadyEnabled !== 'boolean' &&
-        matchzyAutoreadyEnabled !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyAutoreadyEnabled must be 0, 1, boolean, or null',
-        });
-      }
-      const value =
-        matchzyAutoreadyEnabled === null
-          ? null
-          : matchzyAutoreadyEnabled === true || matchzyAutoreadyEnabled === 1
-          ? '1'
-          : '0';
-      await settingsService.setSetting('matchzy_autoready_enabled', value);
-    }
-
-    if (matchzyBothTeamsUnpauseRequired !== undefined) {
-      if (
-        typeof matchzyBothTeamsUnpauseRequired !== 'number' &&
-        typeof matchzyBothTeamsUnpauseRequired !== 'boolean' &&
-        matchzyBothTeamsUnpauseRequired !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyBothTeamsUnpauseRequired must be 0, 1, boolean, or null',
-        });
-      }
-      const value =
-        matchzyBothTeamsUnpauseRequired === null
-          ? null
-          : matchzyBothTeamsUnpauseRequired === true || matchzyBothTeamsUnpauseRequired === 1
-          ? '1'
-          : '0';
-      await settingsService.setSetting('matchzy_both_teams_unpause_required', value);
-    }
-
-    if (matchzyMaxPausesPerTeam !== undefined) {
-      if (
-        typeof matchzyMaxPausesPerTeam !== 'number' &&
-        matchzyMaxPausesPerTeam !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyMaxPausesPerTeam must be a number or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_max_pauses_per_team',
-        matchzyMaxPausesPerTeam === null ? null : String(matchzyMaxPausesPerTeam)
-      );
-    }
-
-    if (matchzyPauseDuration !== undefined) {
-      if (typeof matchzyPauseDuration !== 'number' && matchzyPauseDuration !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyPauseDuration must be a number or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_pause_duration',
-        matchzyPauseDuration === null ? null : String(matchzyPauseDuration)
-      );
-    }
-
-    if (matchzySideSelectionEnabled !== undefined) {
-      if (
-        typeof matchzySideSelectionEnabled !== 'number' &&
-        typeof matchzySideSelectionEnabled !== 'boolean' &&
-        matchzySideSelectionEnabled !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzySideSelectionEnabled must be 0, 1, boolean, or null',
-        });
-      }
-      const value =
-        matchzySideSelectionEnabled === null
-          ? null
-          : matchzySideSelectionEnabled === true || matchzySideSelectionEnabled === 1
-          ? '1'
-          : '0';
-      await settingsService.setSetting('matchzy_side_selection_enabled', value);
-    }
-
-    if (matchzySideSelectionTime !== undefined) {
-      if (
-        typeof matchzySideSelectionTime !== 'number' &&
-        matchzySideSelectionTime !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzySideSelectionTime must be a number or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_side_selection_time',
-        matchzySideSelectionTime === null ? null : String(matchzySideSelectionTime)
-      );
-    }
-
-    if (matchzyGgEnabled !== undefined) {
-      if (
-        typeof matchzyGgEnabled !== 'number' &&
-        typeof matchzyGgEnabled !== 'boolean' &&
-        matchzyGgEnabled !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyGgEnabled must be 0, 1, boolean, or null',
-        });
-      }
-      const value =
-        matchzyGgEnabled === null
-          ? null
-          : matchzyGgEnabled === true || matchzyGgEnabled === 1
-          ? '1'
-          : '0';
-      await settingsService.setSetting('matchzy_gg_enabled', value);
-    }
-
-    if (matchzyGgThreshold !== undefined) {
-      if (typeof matchzyGgThreshold !== 'number' && matchzyGgThreshold !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyGgThreshold must be a number (0.0-1.0) or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_gg_threshold',
-        matchzyGgThreshold === null ? null : String(matchzyGgThreshold)
-      );
-    }
-
-    if (matchzyGgMinScoreDiff !== undefined) {
-      if (typeof matchzyGgMinScoreDiff !== 'number' && matchzyGgMinScoreDiff !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyGgMinScoreDiff must be a number (0-16) or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_gg_min_score_diff',
-        matchzyGgMinScoreDiff === null ? null : String(matchzyGgMinScoreDiff)
-      );
-    }
-
-    if (matchzyFfwEnabled !== undefined) {
-      if (
-        typeof matchzyFfwEnabled !== 'number' &&
-        typeof matchzyFfwEnabled !== 'boolean' &&
-        matchzyFfwEnabled !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyFfwEnabled must be 0, 1, boolean, or null',
-        });
-      }
-      const value =
-        matchzyFfwEnabled === null
-          ? null
-          : matchzyFfwEnabled === true || matchzyFfwEnabled === 1
-          ? '1'
-          : '0';
-      await settingsService.setSetting('matchzy_ffw_enabled', value);
-    }
-
-    if (matchzyFfwTime !== undefined) {
-      if (typeof matchzyFfwTime !== 'number' && matchzyFfwTime !== null) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyFfwTime must be a number or null',
-        });
-      }
-      await settingsService.setSetting(
-        'matchzy_ffw_time',
-        matchzyFfwTime === null ? null : String(matchzyFfwTime)
-      );
-    }
-
-    if (matchzyDemoRecordingEnabled !== undefined) {
-      if (
-        typeof matchzyDemoRecordingEnabled !== 'number' &&
-        typeof matchzyDemoRecordingEnabled !== 'boolean' &&
-        matchzyDemoRecordingEnabled !== null
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: 'matchzyDemoRecordingEnabled must be 0, 1, boolean, or null',
-        });
-      }
-      const value =
-        matchzyDemoRecordingEnabled === null
-          ? null
-          : matchzyDemoRecordingEnabled === true || matchzyDemoRecordingEnabled === 1
-          ? '1'
-          : '0';
-      await settingsService.setSetting('matchzy_demo_recording_enabled', value);
+      },
+    });
+    if (error) {
+      return res.status(400).json({ success: false, error });
     }
 
     return res.json({
@@ -652,4 +274,3 @@ router.put('/', async (req: Request, res: Response) => {
 });
 
 export default router;
-

@@ -16,23 +16,20 @@ import {
   IconButton,
   Collapse,
 } from '@mui/material';
-import {
-  Close as CloseIcon,
-  CheckCircle as CheckCircleIcon,
-  ExpandMore as ExpandMoreIcon,
-  ExpandLess as ExpandLessIcon,
-  OpenInNew as OpenInNewIcon,
-} from '@mui/icons-material';
-import Link from '@mui/material/Link';
+import { CaretDownIcon, CaretUpIcon, CheckCircleIcon, XIcon } from '@phosphor-icons/react';
 import { CircularProgress } from '@mui/material';
 import { useSnackbar } from '../../contexts/SnackbarContext';
 import { useTranslation } from 'react-i18next';
+import { ExternalLink } from '../common/ExternalLink';
+import type { Untrusted } from '../../utils/untrusted';
 
 interface ImportPlayer {
-  steamId: string;
+  /** Optional: without one the player gets an account of their own (CS2 needs it). */
+  steamId?: string;
   name: string;
   initialELO?: number;
   avatarUrl?: string;
+  discordId?: string; // Optional Discord user ID (17–20 digit string); validated by the API
 }
 
 interface PlayerImportModalProps {
@@ -73,21 +70,22 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
     handleClose();
   };
 
-  const validatePlayer = (player: unknown, index: number): string | null => {
+  const validatePlayer = (player: Untrusted, index: number): string | null => {
     if (typeof player !== 'object' || player === null) {
       return `Player ${index + 1}: Invalid player object`;
     }
-    if (!player.steamId || typeof player.steamId !== 'string') {
-      return `Player ${index + 1}: Missing or invalid steamId`;
+    // `typeof x === 'object'` narrows to `object`, which has no index
+    // signature, so reading fields off it is a type error. Go through a
+    // record and let the guards below do the actual narrowing.
+    const { steamId, name, initialELO } = player as Record<string, Untrusted>;
+    if (steamId !== undefined && (typeof steamId !== 'string' || !steamId.trim())) {
+      return `Player ${index + 1}: steamId must be a Steam ID or left out`;
     }
-    if (!player.name || typeof player.name !== 'string') {
-      return `Player ${index + 1} (${player.steamId}): Missing or invalid name`;
+    if (!name || typeof name !== 'string') {
+      return `Player ${index + 1}${steamId ? ` (${steamId})` : ''}: Missing or invalid name`;
     }
-    if (
-      player.initialELO !== undefined &&
-      (typeof player.initialELO !== 'number' || player.initialELO < 0)
-    ) {
-      return `Player "${player.name}": initialELO must be a positive number or omitted`;
+    if (initialELO !== undefined && (typeof initialELO !== 'number' || initialELO < 0)) {
+      return `Player "${name}": initialELO must be a positive number or omitted`;
     }
     return null;
   };
@@ -118,13 +116,15 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
           headers.forEach((header, i) => {
             const value = values[i] || '';
             if (header === 'steamid' || header === 'steam_id') {
-              player.steamId = value;
+              player.steamId = value || undefined;
             } else if (header === 'name') {
               player.name = value;
             } else if (header === 'initialelo' || header === 'initial_elo' || header === 'elo') {
               player.initialELO = value ? parseInt(value, 10) : undefined;
             } else if (header === 'avatarurl' || header === 'avatar_url' || header === 'avatar') {
               player.avatarUrl = value || undefined;
+            } else if (header === 'discordid' || header === 'discord_id') {
+              player.discordId = value || undefined;
             }
           });
           return player;
@@ -172,9 +172,7 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
       await onImport(parsedPlayers);
       handleClose();
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : t('playerImportModal.errors.importFailed')
-      );
+      setError(err instanceof Error ? err.message : t('playerImportModal.errors.importFailed'));
     } finally {
       setImporting(false);
     }
@@ -191,18 +189,12 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
   };
 
   return (
-    <Dialog
-      open={open}
-      onClose={handleDialogClose}
-      maxWidth="md"
-      fullWidth
-      disableEscapeKeyDown
-    >
+    <Dialog open={open} onClose={handleDialogClose} maxWidth="md" fullWidth disableEscapeKeyDown>
       <DialogTitle>
         <Box display="flex" justifyContent="space-between" alignItems="center">
           <Typography variant="h6">{t('playerImportModal.title')}</Typography>
           <IconButton size="small" onClick={handleClose}>
-            <CloseIcon />
+            <XIcon />
           </IconButton>
         </Box>
       </DialogTitle>
@@ -212,10 +204,8 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
             {t('playerImportModal.info.description')}
           </Typography>
           <Typography variant="caption" component="div">
-            <Link
-              href="https://docs.sivert.io/docs/mat/user/shuffle-tournaments#importing-players"
-              target="_blank"
-              rel="noopener noreferrer"
+            <ExternalLink
+              href="https://docs.autotournament.gg/guides/teams-and-players#import-players"
               sx={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -225,8 +215,7 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
               }}
             >
               {t('playerImportModal.info.link')}
-              <OpenInNewIcon sx={{ fontSize: '0.875rem' }} />
-            </Link>
+            </ExternalLink>
           </Typography>
         </Alert>
 
@@ -285,11 +274,13 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
                     onClick={() => toggleExpand(index)}
                   >
                     <Box display="flex" alignItems="center" gap={1}>
-                      {expandedPlayers.has(index) ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                      {expandedPlayers.has(index) ? <CaretUpIcon /> : <CaretDownIcon />}
                       <Typography variant="body2" fontWeight={600}>
                         {player.name}
                       </Typography>
-                      <Chip label={player.steamId} size="small" variant="outlined" />
+                      {player.steamId && (
+                        <Chip label={player.steamId} size="small" variant="outlined" />
+                      )}
                       {player.initialELO !== undefined && (
                         <Chip label={`ELO: ${player.initialELO}`} size="small" />
                       )}
@@ -297,9 +288,11 @@ export const PlayerImportModal: React.FC<PlayerImportModalProps> = ({
                   </Box>
                   <Collapse in={expandedPlayers.has(index)}>
                     <Box sx={{ pl: 4, pt: 1 }}>
-                      <Typography variant="caption" color="text.secondary" display="block">
-                        {t('playerImportModal.preview.steamId', { steamId: player.steamId })}
-                      </Typography>
+                      {player.steamId && (
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          {t('playerImportModal.preview.steamId', { steamId: player.steamId })}
+                        </Typography>
+                      )}
                       <Typography variant="caption" color="text.secondary" display="block">
                         {t('playerImportModal.preview.name', { name: player.name })}
                       </Typography>

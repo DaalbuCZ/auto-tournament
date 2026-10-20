@@ -1,10 +1,29 @@
+import { withoutConfigSecrets } from '../utils/matchConfigSecrets';
+import { discardTournamentRatings } from './ratingService';
 import { db } from '../config/database';
 import { log } from '../utils/logger';
 import { getBracketGenerator } from './bracketGenerators';
 import { validateTeamCount, calculateTotalRounds } from '../utils/tournamentHelpers';
-import { enrichMatch } from '../utils/matchEnrichment';
+import { moduleTournamentFields, normalizeTournamentSettings } from '../utils/tournamentRow';
+import { matchTimeFields } from './matchTimes';
+import { moduleSettingsChangeBracket, withModuleSettings } from '../utils/moduleTournamentSettings';
+import {
+  buildMatchConfigFor,
+  describeMatch,
+  parseStoredMatchConfig,
+  serializeMatchConfig,
+} from '../utils/matchIntegration';
+import { applyScoreFields, enrichMatch } from '../utils/matchEnrichment';
+import { getMapResults } from './matchMapResultService';
+import { forgetMatches } from './forgetMatches';
 import { matchLiveStatsService } from './matchLiveStatsService';
+import { getSwissStandings, getSwissStandingEntries } from './swissProgressionService';
+import { getRoundRobinStandings, getRoundRobinStandingEntries } from './roundRobinStandingsService';
 import type { DbMatchRow, DbTeamRow } from '../types/database.types';
+import { DEFAULT_GAME, type GameId } from '../integrations/types';
+import { integrationForMatch } from '../integrations/registry';
+import { determineInitialMatchStatus } from '../utils/matchStatusHelpers';
+import { bannerUrl } from './tournamentBannerService';
 import type {
   Tournament,
   TournamentRow,
@@ -15,6 +34,47 @@ import type {
   BracketMatch,
   BracketResponse,
 } from '../types/tournament.types';
+import {
+  nextTournamentId,
+  noteTournamentId,
+  refreshCurrentTournamentId,
+} from './currentTournament';
+import { playerEmailService } from './playerEmailService';
+import {
+  bareSlug,
+  isGrandFinalSlug,
+  isLosersBracketSlug,
+  shuffleTeamLike,
+  tournamentSlugPrefix,
+} from '../utils/matchSlug';
+import type { SqlValue } from '../config/database';
+import type { Untrusted } from '../utils/untrusted';
+
+/** Players per team from a request (2-10), or null when it names none. */
+function validTeamSize(value: Untrusted): number | null {
+  if (value === undefined || value === null) return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 10)
+    throw new Error('Players per team must be a whole number from 1 to 10.');
+  return n;
+}
+
+/**
+ * A generated slot's stored status. The generators hold every match with both
+ * teams as `pending` for the map veto (all series formats have one); a game
+ * without a pre-match phase gets the status the same helper gives a format
+ * without a veto, so its first-round matches are ready to allocate.
+ */
+function initialSlotStatus<S extends string>(
+  slot: { team1Id: string | null; team2Id: string | null; round: number; status: S },
+  format: string,
+  preMatchPhase: boolean
+): S | 'pending' | 'ready' | 'completed' {
+  if (preMatchPhase || slot.status !== 'pending') return slot.status;
+  return determineInitialMatchStatus(slot.team1Id, slot.team2Id, format, slot.round, {
+    preMatchPhase: false,
+  });
+}
 
 export const DEFAULT_SETTINGS: TournamentSettings = {
   matchFormat: 'bo3',
@@ -25,12 +85,26 @@ export const DEFAULT_SETTINGS: TournamentSettings = {
   grandFinalMode: 'simple',
 };
 
+function signupIsOpen(settings: Untrusted): boolean {
+  return (settings as { registrationOpen?: Untrusted } | undefined)?.registrationOpen === true;
+}
+
+/** Sign-up has just opened: email the players who asked for it (in the background). */
+function emailSignupOpen(t: { id: number; name: string }): void {
+  void playerEmailService
+    .notifySignupOpen({ id: t.id, name: t.name })
+    .catch((error) => log.error('[EMAIL] Sign-up open emails failed', error as Error));
+}
+
 class TournamentService {
   /**
-   * Get the current tournament (only one tournament exists at a time)
+   * Get a tournament by id. Callers resolve the id through utils/tournamentRow
+   * (3.0 has a single row; 3.1 resolves it per request).
    */
-  async getTournament(): Promise<TournamentResponse | null> {
-    const row = await db.queryOneAsync<TournamentRow>('SELECT * FROM tournament WHERE id = 1');
+  async getTournament(tournamentId: number): Promise<TournamentResponse | null> {
+    const row = await db.queryOneAsync<TournamentRow>('SELECT * FROM tournament WHERE id = ?', [
+      tournamentId,
+    ]);
     if (!row) return null;
 
     const tournament = this.rowToTournament(row);
@@ -55,94 +129,217 @@ class TournamentService {
       type: tournament.type,
       format: tournament.format,
       status: tournament.status,
+      game: tournament.game,
       maps: tournament.maps,
       teamIds: tournament.team_ids,
       settings: tournament.settings,
-      // Shuffle tournament specific fields (only populated for type === 'shuffle')
+      // The game module's 2.x fields (CS2: from settings.cs2)
       mapSequence: tournament.mapSequence,
       teamSize: tournament.teamSize,
       maxRounds: tournament.maxRounds,
       overtimeMode: tournament.overtimeMode,
       overtimeSegments: tournament.overtimeSegments,
+      ...(tournament.mapPoolId !== undefined ? { mapPoolId: tournament.mapPoolId } : {}),
       eloTemplateId: tournament.eloTemplateId || undefined,
       created_at: tournament.created_at,
       updated_at: tournament.updated_at,
       started_at: tournament.started_at,
       completed_at: tournament.completed_at,
+      bannerUrl: bannerUrl(row.id, row.banner_updated_at),
       teams,
+      winner:
+        tournament.status === 'completed'
+          ? await this.getTournamentWinner(tournament.id, tournament.type, teams)
+          : null,
     };
+  }
+
+  /**
+   * Champion of a completed tournament.
+   *
+   * - Single/double elimination: winner of the final (the grand final `gf`
+   *   when present, otherwise the last winners-bracket round, skipping a
+   *   third-place match fed by losers).
+   * - Swiss: top of the Swiss standings (see utils/swissPairing).
+   * - Round robin: top of the round robin standings (wins, head-to-head,
+   *   round difference, rounds won, seed; see utils/roundRobinStandings).
+   * - Shuffle: null (players, not teams, are ranked on the leaderboard).
+   */
+  async getTournamentWinner(
+    tournamentId: number,
+    type: string,
+    teams: Array<{ id: string; name: string; tag?: string }>
+  ): Promise<{ id: string; name: string; tag?: string } | null> {
+    if (type === 'shuffle') return null;
+
+    const rows = await db.queryAsync<DbMatchRow>(
+      'SELECT id, slug, round, match_number, status, team1_id, team2_id, winner_id, team1_from_outcome, team2_from_outcome FROM matches WHERE tournament_id = ? AND round >= 1',
+      [tournamentId]
+    );
+    if (rows.length === 0) return null;
+
+    const teamById = new Map(teams.map((t) => [t.id, t]));
+    const resolveTeam = async (teamId: string | null | undefined) => {
+      if (!teamId) return null;
+      const known = teamById.get(teamId);
+      if (known) return known;
+      const row = await db.queryOneAsync<DbTeamRow>(
+        'SELECT id, name, tag FROM teams WHERE id = ?',
+        [teamId]
+      );
+      return row ? { id: row.id, name: row.name, tag: row.tag || undefined } : null;
+    };
+
+    if (type === 'single_elimination' || type === 'double_elimination' || type === 'groups') {
+      // Groups: the playoffs' final (its slugs carry `po-`).
+      if (type === 'groups')
+        rows.splice(0, rows.length, ...rows.filter((r) => /(^|-)po-/.test(r.slug)));
+      if (rows.length === 0) return null;
+      const grandFinal = rows.find((r) => isGrandFinalSlug(r.slug));
+      let final: DbMatchRow | undefined = grandFinal;
+      if (!final) {
+        const winnersBracket = rows.filter((r) => !isLosersBracketSlug(r.slug));
+        const maxRound = Math.max(...winnersBracket.map((r) => r.round));
+        const candidates = winnersBracket
+          .filter((r) => r.round === maxRound)
+          .filter((r) => r.team1_from_outcome !== 'loser' && r.team2_from_outcome !== 'loser')
+          .sort((a, b) => a.match_number - b.match_number);
+        final = candidates[0];
+      }
+      if (!final || final.status !== 'completed') return null;
+      return resolveTeam(final.winner_id);
+    }
+
+    // Swiss: top of the standings (wins, losses, Buchholz, round differential,
+    // then seed), so there is always a champion once every round is played.
+    if (type === 'swiss') {
+      const [top] = await getSwissStandings(tournamentId);
+      return top ? resolveTeam(top.teamId) : null;
+    }
+
+    // Round robin: top of the standings. The tiebreaks make the order strict,
+    // so a finished round robin always has a champion (#225).
+    if (type === 'round_robin') {
+      if (!rows.some((r) => r.status === 'completed' && r.winner_id)) return null;
+      const [top] = await getRoundRobinStandings(tournamentId);
+      return top ? resolveTeam(top.teamId) : null;
+    }
+
+    return null;
   }
 
   /**
    * Create or replace the tournament
    */
-  async createTournament(input: CreateTournamentInput): Promise<TournamentResponse> {
-    const {
-      name,
-      type,
-      format,
-      maps,
-      teamIds,
-      settings,
-      maxRounds,
-      overtimeMode,
-      overtimeSegments,
-    } = input;
+  /**
+   * `options.game` picks the integration that runs the tournament; omitted,
+   * the row gets the column default (CS2). The public create route never
+   * passes it: only built-in callers choose a game (today the test-only fake
+   * integration).
+   */
+  async createTournament(
+    tournamentId: number,
+    input: CreateTournamentInput,
+    options: { game?: GameId; draft?: boolean } = {}
+  ): Promise<TournamentResponse> {
+    const { name, type, format, teamIds, settings } = input;
+    // The team size can come in the settings too (the MCP tool, older clients): the row's
+    // column is what matches and rosters use, so it takes either (it stayed 5 for a 2v2).
+    const teamSize = validTeamSize(
+      input.teamSize ?? (settings as { teamSize?: Untrusted } | undefined)?.teamSize
+    );
+    if (type === 'shuffle' && teamSize !== null && teamSize < 2)
+      throw new Error('Team size must be between 2 and 10 players');
+    // A draft with no teams yet: no count check and no bracket until it has some.
+    const emptyDraft = options.draft === true && (teamIds?.length ?? 0) === 0;
 
-    // Shuffle tournaments don't use teams, skip validation
-    if (type !== 'shuffle') {
+    // Shuffle tournaments don't use teams, skip validation. With sign-up open
+    // the teams sign themselves up later; the count is checked at start.
+    const signupOpen =
+      (settings as { registrationOpen?: Untrusted } | undefined)?.registrationOpen === true;
+    if (type !== 'shuffle' && !signupOpen && !emptyDraft) {
       // Validate team count based on tournament type
       validateTeamCount(type, teamIds.length);
     }
 
-    const tournamentSettings: TournamentSettings = {
-      ...DEFAULT_SETTINGS,
-      matchFormat: format,
-      ...settings,
-    };
+    // `format` wins over any matchFormat inside settings: the two must agree.
+    // The game module's object (CS2: settings.cs2, the map pool and round
+    // rules) is built by the module from the request.
+    const tournamentSettings: TournamentSettings = withModuleSettings(
+      options.game ?? DEFAULT_GAME,
+      normalizeTournamentSettings({ ...DEFAULT_SETTINGS, ...settings }, format),
+      { ...input },
+      undefined,
+      'tournament'
+    );
 
     const now = Math.floor(Date.now() / 1000);
 
-    // Delete existing tournament (if any) - we only support one tournament at a time
-    await db.execAsync('DELETE FROM tournament WHERE id = 1');
+    // A tournament id whose matches were played is never given again: the new
+    // tournament's slugs (t<id>-r1m1) must not meet the old ones' demos,
+    // clips and analyses. A finished one at this id stays, with its matches;
+    // a running one is replaced and its matches forgotten. A draft nobody
+    // played (its matches never loaded) is replaced in place.
+    const existing = await db.queryOneAsync<{ status: string }>(
+      'SELECT status FROM tournament WHERE id = ?',
+      [tournamentId]
+    );
+    if (existing) {
+      const played = await tournamentWasPlayed(tournamentId);
+      if (existing.status === 'completed') {
+        await noteTournamentId(tournamentId);
+      } else {
+        const gone = await db.queryAsync<{ slug: string }>(
+          'SELECT slug FROM matches WHERE tournament_id = ?',
+          [tournamentId]
+        );
+        if (played) await noteTournamentId(tournamentId);
+        await db.runAsync('DELETE FROM tournament WHERE id = ?', [tournamentId]);
+        await forgetMatches(gone.map((r) => r.slug));
+      }
+      if (existing.status === 'completed' || played) tournamentId = await nextTournamentId();
+    }
 
     // Insert new tournament
     await db.insertAsync('tournament', {
-      id: 1,
+      id: tournamentId,
       name,
       type,
       format,
       status: 'setup',
-      maps: JSON.stringify(maps),
+      ...(options.game ? { game: options.game } : {}),
       team_ids: JSON.stringify(teamIds || []), // Shuffle tournaments have no fixed teams
+      // A shuffle too: it draws teams of this size (it stayed 5 for a wingman shuffle made here).
+      ...(teamSize !== null ? { team_size: teamSize } : {}),
       settings: JSON.stringify(tournamentSettings),
-      max_rounds: maxRounds ?? 24,
-      overtime_mode: overtimeMode ?? 'enabled',
-      // Keep semantics aligned with shuffle and manual matches:
-      // - NULL → MatchZy default (unlimited OT / draws)
-      // - 0 with overtimeMode === 'disabled' → "no OT, no draws" (damage tiebreak)
-      // - >0 with overtimeMode === 'enabled' → OT with damage tiebreak after N segments
-      overtime_segments:
-        typeof overtimeSegments === 'number' && Number.isFinite(overtimeSegments)
-          ? overtimeSegments
-          : null,
       created_at: now,
       updated_at: now,
     });
 
     log.success(`Tournament created: ${name} (${type})`);
 
-    // Shuffle tournaments don't use bracket generation
-    if (type !== 'shuffle') {
+    // Shuffle tournaments don't use bracket generation. With sign-up open and
+    // too few teams for the format yet, the bracket is drawn as teams sign up.
+    let drawNow = !emptyDraft;
+    if (signupOpen && drawNow) {
+      try {
+        validateTeamCount(type, teamIds.length);
+      } catch {
+        drawNow = false;
+      }
+    }
+    if (type !== 'shuffle' && !drawNow) {
+      log.info('Sign-up tournament created - the bracket is drawn once enough teams are in');
+    } else if (type !== 'shuffle') {
       // Auto-generate bracket
       try {
-        await this.generateBracket();
+        await this.generateBracket(tournamentId);
         log.success('Bracket automatically generated');
       } catch (err) {
         log.error('Failed to auto-generate bracket', err);
 
         // Clean up: Delete the tournament since bracket generation failed
-        await db.execAsync('DELETE FROM tournament WHERE id = 1');
+        await db.runAsync('DELETE FROM tournament WHERE id = ?', [tournamentId]);
         log.warn('Tournament deleted due to bracket generation failure');
 
         // Re-throw to prevent returning tournament in broken state
@@ -154,28 +351,37 @@ class TournamentService {
       log.info('Shuffle tournament created - bracket generation skipped (not applicable)');
     }
 
-    const created = await this.getTournament();
+    const created = await this.getTournament(tournamentId);
     if (!created) {
       throw new Error('Failed to create tournament');
     }
 
+    await refreshCurrentTournamentId();
+    if (signupIsOpen(created.settings)) emailSignupOpen(created);
     return created;
   }
 
   /**
    * Update existing tournament
    */
-  async updateTournament(input: UpdateTournamentInput): Promise<TournamentResponse> {
-    const existing = await this.getTournament();
+  async updateTournament(
+    tournamentId: number,
+    input: UpdateTournamentInput
+  ): Promise<TournamentResponse> {
+    const existing = await this.getTournament(tournamentId);
     if (!existing) {
       throw new Error('No tournament exists to update');
     }
 
-    const { name, type, format, maps, teamIds, settings, maxRounds, overtimeMode, overtimeSegments } =
-      input;
+    const { name, type, format, teamIds, settings } = input;
 
-    // Validate team count if changing teams or type
-    if (type || teamIds) {
+    // Validate team count if changing teams or type (not while teams sign
+    // themselves up: then it is checked at start)
+    const signupOpen =
+      ((settings as { registrationOpen?: Untrusted } | undefined)?.registrationOpen ??
+        (existing.settings as { registrationOpen?: Untrusted } | undefined)?.registrationOpen) ===
+      true;
+    if ((type || teamIds) && !signupOpen) {
       validateTeamCount(type || existing.type, (teamIds || existing.teamIds).length);
     }
 
@@ -186,49 +392,79 @@ class TournamentService {
     if (name) updates.name = name;
     if (type) updates.type = type;
     if (format) updates.format = format;
-    if (maps) updates.maps = JSON.stringify(maps);
     if (teamIds) updates.team_ids = JSON.stringify(teamIds);
-    if (settings) {
-      const merged = { ...existing.settings, ...settings };
+    const teamSize = validTeamSize(
+      input.teamSize ?? (input.settings as { teamSize?: Untrusted } | undefined)?.teamSize
+    );
+    if (teamSize !== null && (type ?? existing.type) === 'shuffle' && teamSize < 2)
+      throw new Error('Team size must be between 2 and 10 players');
+    // A shuffle's team size is the size of the teams each round draws.
+    if (teamSize !== null) updates.team_size = teamSize;
+    // settings.matchFormat mirrors `format`, so settings are rewritten when
+    // either changes (or an edited format leaves the old value behind in
+    // settings), and whenever the game module's object changes: the module
+    // reads its own fields (CS2: settings.cs2, or the 2.x top-level maps,
+    // maxRounds, overtimeMode, overtimeSegments) from the request.
+    const merged = withModuleSettings(
+      existing.game,
+      normalizeTournamentSettings(
+        { ...existing.settings, ...(settings ?? {}) },
+        format || existing.format
+      ),
+      { ...input },
+      existing.settings,
+      'tournament'
+    );
+    if (settings || format || JSON.stringify(merged) !== JSON.stringify(existing.settings)) {
       updates.settings = JSON.stringify(merged);
     }
-    if (typeof maxRounds === 'number') {
-      updates.max_rounds = maxRounds;
-    }
-    if (overtimeMode) {
-      updates.overtime_mode = overtimeMode;
-    }
-    if (typeof overtimeSegments === 'number') {
-      updates.overtime_segments = overtimeSegments;
-    }
 
-    await db.updateAsync('tournament', updates, 'id = ?', [1]);
+    await db.updateAsync('tournament', updates, 'id = ?', [tournamentId]);
 
     log.debug('Tournament updated');
 
-    // Auto-regenerate bracket if structural changes were made
-    const needsRegeneration = type || teamIds || (maps && maps.length !== existing.maps.length);
+    // Auto-regenerate bracket if structural changes were made (CS2: the map
+    // pool changed size).
+    const needsRegeneration =
+      type || teamIds || moduleSettingsChangeBracket(existing.game, existing.settings, merged);
+    let teamsReverted = false;
     if (needsRegeneration) {
       try {
-        await this.regenerateBracket(true);
+        await this.regenerateBracket(tournamentId, true);
         log.debug('Bracket regenerated after update');
       } catch (err) {
-        log.error('Failed to regenerate bracket after update', err);
-        // Revert changes to teams if bracket generation fails
-        if (teamIds) {
-          const oldTeamId = existing.teamIds;
-          await db.updateAsync('tournament', { team_ids: JSON.stringify(oldTeamId) }, 'id = ?', [
-            1,
+        if (signupOpen) {
+          // Teams are still signing up: a count the format cannot draw yet
+          // (3 of 4) stands, with no bracket until it can (as a sign-up does).
+          await db.runAsync("DELETE FROM matches WHERE tournament_id = ? AND status = 'pending'", [
+            tournamentId,
           ]);
+        } else {
+          log.error('Failed to regenerate bracket after update', err);
+          // Revert changes to teams if bracket generation fails
+          if (teamIds) {
+            teamsReverted = true;
+            const oldTeamId = existing.teamIds;
+            await db.updateAsync('tournament', { team_ids: JSON.stringify(oldTeamId) }, 'id = ?', [
+              tournamentId,
+            ]);
+          }
         }
       }
     }
+    if (teamIds && !teamsReverted) {
+      // A signed-up team taken out loses its sign-up, lineup and check-ins.
+      const { tournamentSignupService } = await import('./tournamentSignupService');
+      await tournamentSignupService.dropRemovedTeams(tournamentId, teamIds);
+    }
 
-    const updated = await this.getTournament();
+    const updated = await this.getTournament(tournamentId);
     if (!updated) {
       throw new Error('Failed to retrieve updated tournament');
     }
 
+    if (!signupIsOpen(existing.settings) && signupIsOpen(updated.settings))
+      emailSignupOpen(updated);
     return updated;
   }
 
@@ -236,21 +472,64 @@ class TournamentService {
    * Delete tournament and all associated matches
    * Note: Server cleanup (ending matches) should be done by the caller before this
    */
-  async deleteTournament(): Promise<void> {
+  /**
+   * Delete a tournament. With `keepPlayed` (the admin UI's delete), its
+   * played matches stay; without it (scripts, tests, wipes) everything goes,
+   * as it always did.
+   */
+  async deleteTournament(
+    tournamentId: number,
+    options: { keepPlayed?: boolean } = {}
+  ): Promise<void> {
+    // Its matches' live stats go with it; other tournaments' stay.
+    const slugs = await db.queryAsync<{ slug: string }>(
+      'SELECT slug FROM matches WHERE tournament_id = ?',
+      [tournamentId]
+    );
     // First, clear server_id from all matches to clean up references
-    await db.execAsync('UPDATE matches SET server_id = NULL WHERE tournament_id = 1');
+    await db.runAsync('UPDATE matches SET server_id = NULL WHERE tournament_id = ?', [
+      tournamentId,
+    ]);
     log.debug('Cleared server references from matches');
 
+    // Matches that were played stay, with their stats, ratings and demos
+    // (Vikunja 1834): they leave the tournament (tournament_id NULL, like a
+    // standalone match) and keep its name in played_in. Their slugs carry the
+    // tournament's id, so that id is never given out again
+    // (currentTournament.nextTournamentId).
+    const keptSlugs = new Set<string>();
+    if (options.keepPlayed) {
+      const kept = await db.queryAsync<{ slug: string }>(
+        `UPDATE matches SET tournament_id = NULL,
+                played_in = (SELECT name FROM tournament WHERE id = ?), played_in_id = ?,
+                team1_from_match_id = NULL, team2_from_match_id = NULL, next_match_id = NULL
+          WHERE tournament_id = ? AND status = 'completed' RETURNING slug`,
+        [tournamentId, tournamentId, tournamentId]
+      );
+      for (const { slug } of kept) keptSlugs.add(slug);
+      if (kept.length > 0) {
+        log.info(`Kept ${kept.length} played match(es) of deleted tournament ${tournamentId}`);
+      }
+    }
+
+    // A played tournament's id is not given out again (its slugs had data).
+    if (await tournamentWasPlayed(tournamentId)) await noteTournamentId(tournamentId);
+
     // Delete tournament (CASCADE will also delete matches and events)
-    await db.execAsync('DELETE FROM tournament WHERE id = 1');
+    await db.runAsync('DELETE FROM tournament WHERE id = ?', [tournamentId]);
     log.debug('Tournament deleted from database');
+
+    // The next tournament gets this id and so these slugs: the gone matches
+    // leave nothing under them. Kept ones keep theirs (and their id stays taken).
+    await forgetMatches(slugs.map((r) => r.slug).filter((slug) => !keptSlugs.has(slug)));
+    await refreshCurrentTournamentId();
   }
 
   /**
    * Generate bracket for the tournament
    */
-  async generateBracket(): Promise<BracketResponse> {
-    const tournament = await this.getTournament();
+  async generateBracket(tournamentId: number): Promise<BracketResponse> {
+    const tournament = await this.getTournament(tournamentId);
     if (!tournament) {
       throw new Error('No tournament exists');
     }
@@ -260,7 +539,7 @@ class TournamentService {
     }
 
     // Delete existing matches
-    await db.execAsync('DELETE FROM matches WHERE tournament_id = 1');
+    await db.runAsync('DELETE FROM matches WHERE tournament_id = ?', [tournamentId]);
 
     let matches: BracketMatch[] = [];
 
@@ -273,103 +552,150 @@ class TournamentService {
         generator.reset();
       }
 
-      const result = await generator.generate(tournament, () => this.getMatches());
+      const result = await generator.generate(tournament);
 
-      // Handle different result types (Swiss returns BracketMatch[], others return BracketGeneratorResult)
-      if (Array.isArray(result)) {
-        // Swiss generator returns BracketMatch[] directly (already in DB)
-        matches = result;
-      } else {
-        // Standard generators return BracketGeneratorResult (needs DB insertion)
+      // Every match belongs to the tournament's game.
+      const game = tournament.game || DEFAULT_GAME;
+      const integration = integrationForMatch({ game });
+      const preMatchPhase =
+        integration.capabilities.veto && (integration.usesPreMatchPhase?.(tournament) ?? true);
 
-        // Insert matches into database and track IDs for linking
-        const slugToDbId: Map<string, number> = new Map();
+      // The generator returns neutral slots. Each slot's game config comes
+      // from the match's integration, built before the rows are inserted (the
+      // slugs have no row yet, exactly as when the generators built them).
+      // A tournament after the first carries its id in its slugs (utils/matchSlug.ts).
+      const slugPrefix = tournamentSlugPrefix(tournamentId);
+      const configs = await Promise.all(
+        result.matches.map((slot) =>
+          buildMatchConfigFor(
+            {
+              slug: slugPrefix + slot.slug,
+              game,
+              round: slot.round,
+              bracket: slot.bracket ?? null,
+              team1Id: slot.team1Id,
+              team2Id: slot.team2Id,
+            },
+            slot.format ? { ...tournament, format: slot.format } : tournament
+          )
+        )
+      );
 
-        for (const matchData of result.matches) {
-          const config = JSON.parse(matchData.config);
-          const insertResult = await db.insertAsync('matches', {
-            slug: matchData.slug,
-            tournament_id: 1,
-            round: matchData.round,
-            match_number: matchData.matchNum,
-            bracket: matchData.bracket ?? null,
-            team1_id: matchData.team1Id,
-            team2_id: matchData.team2Id,
-            winner_id: matchData.winnerId,
-            server_id: null,
-            config: matchData.config,
-            status: matchData.status,
-            next_match_id: null, // Will be set in a second pass
-            created_at: Math.floor(Date.now() / 1000),
-          });
+      // Insert matches into database and track IDs for linking
+      const slugToDbId: Map<string, number> = new Map();
 
-          slugToDbId.set(matchData.slug, insertResult.lastInsertRowid as number);
+      for (const [index, matchData] of result.matches.entries()) {
+        const config = configs[index];
+        const description = describeMatch({ game, config });
+        const status = initialSlotStatus(matchData, tournament.format, preMatchPhase);
+        const createdAt = Math.floor(Date.now() / 1000);
+        const insertResult = await db.insertAsync('matches', {
+          slug: slugPrefix + matchData.slug,
+          tournament_id: tournamentId,
+          game,
+          round: matchData.round,
+          match_number: matchData.matchNum,
+          bracket: matchData.bracket ?? null,
+          team1_id: matchData.team1Id,
+          team2_id: matchData.team2Id,
+          winner_id: matchData.winnerId,
+          server_id: null,
+          config: serializeMatchConfig(config),
+          status,
+          next_match_id: null, // Will be set in a second pass
+          created_at: createdAt,
+          // A playoff slot's qualifier seeds (groups, then playoffs).
+          ...(matchData.team1Seed ? { team1_seed: matchData.team1Seed } : {}),
+          ...(matchData.team2Seed ? { team2_seed: matchData.team2Seed } : {}),
+          ...(matchData.completedAt ? { completed_at: matchData.completedAt } : {}),
+        });
 
-          matches.push({
-            id: insertResult.lastInsertRowid as number,
-            slug: matchData.slug,
-            round: matchData.round,
-            matchNumber: matchData.matchNum,
-            // Bracket grouping is currently inferred from slug in the client,
-            // so we don't need to expose it explicitly here yet.
-            team1: matchData.team1Id
-              ? {
-                  id: matchData.team1Id,
-                  name: config.team1?.name || 'TBD',
-                  tag: config.team1?.tag || 'TBD',
-                }
-              : null,
-            team2: matchData.team2Id
-              ? {
-                  id: matchData.team2Id,
-                  name: config.team2?.name || 'TBD',
-                  tag: config.team2?.tag || 'TBD',
-                }
-              : null,
-            winner: null,
-            status: matchData.status,
-            serverId: null,
-            config,
-            nextMatchId: null,
-            createdAt: Math.floor(Date.now() / 1000),
-          });
+        slugToDbId.set(matchData.slug, insertResult.lastInsertRowid as number);
+
+        matches.push({
+          id: insertResult.lastInsertRowid as number,
+          slug: slugPrefix + matchData.slug,
+          round: matchData.round,
+          matchNumber: matchData.matchNum,
+          // Bracket grouping is currently inferred from slug in the client,
+          // so we don't need to expose it explicitly here yet.
+          team1: matchData.team1Id
+            ? {
+                id: matchData.team1Id,
+                name: description.team1.name || 'TBD',
+                tag: description.team1.tag || 'TBD',
+              }
+            : null,
+          team2: matchData.team2Id
+            ? {
+                id: matchData.team2Id,
+                name: description.team2.name || 'TBD',
+                tag: description.team2.tag || 'TBD',
+              }
+            : null,
+          winner: null,
+          status,
+          serverId: null,
+          // Integration-owned config, forwarded as-is (client slots: PR 12).
+          config: config as BracketMatch['config'],
+          nextMatchId: null,
+          createdAt,
+        });
+      }
+
+      // Link matches (set next_match_id based on bracket structure). Groups:
+      // the playoff slots' wiring below gives each match its next one instead.
+      if (tournament.type !== 'groups') {
+        await this.linkMatches(matches, slugToDbId, tournament.type);
+      }
+
+      // Apply declarative slot wiring (team*_from_match_id / outcome)
+      // using the slugs produced by the generator. This makes runtime
+      // progression size-agnostic and independent of any slug heuristics.
+      for (const matchData of result.matches) {
+        const dbId = slugToDbId.get(matchData.slug);
+        if (!dbId) continue;
+
+        const updates: Record<string, SqlValue> = {};
+
+        if (matchData.team1FromMatchSlug) {
+          const fromId = slugToDbId.get(matchData.team1FromMatchSlug) ?? null;
+          updates.team1_from_match_id = fromId;
+          updates.team1_from_outcome = matchData.team1FromOutcome ?? null;
         }
 
-        // Link matches (set next_match_id based on bracket structure)
-        await this.linkMatches(matches, slugToDbId, tournament.type);
+        if (matchData.team2FromMatchSlug) {
+          const fromId = slugToDbId.get(matchData.team2FromMatchSlug) ?? null;
+          updates.team2_from_match_id = fromId;
+          updates.team2_from_outcome = matchData.team2FromOutcome ?? null;
+        }
 
-        // Apply declarative slot wiring (team*_from_match_id / outcome)
-        // using the slugs produced by the generator. This makes runtime
-        // progression size-agnostic and independent of any slug heuristics.
-        for (const matchData of result.matches) {
-          const dbId = slugToDbId.get(matchData.slug);
-          if (!dbId) continue;
-
-          const updates: Partial<DbMatchRow> = {};
-
-          if (matchData.team1FromMatchSlug) {
-            const fromId = slugToDbId.get(matchData.team1FromMatchSlug) ?? null;
-            updates.team1_from_match_id = fromId;
-            updates.team1_from_outcome = matchData.team1FromOutcome ?? null;
-          }
-
-          if (matchData.team2FromMatchSlug) {
-            const fromId = slugToDbId.get(matchData.team2FromMatchSlug) ?? null;
-            updates.team2_from_match_id = fromId;
-            updates.team2_from_outcome = matchData.team2FromOutcome ?? null;
-          }
-
-          if (Object.keys(updates).length > 0) {
-            await db.updateAsync('matches', updates as Record<string, unknown>, 'id = ?', [
-              dbId,
-            ]);
+        if (Object.keys(updates).length > 0) {
+          await db.updateAsync('matches', updates, 'id = ?', [dbId]);
+        }
+        // Groups' playoffs: a winner's slot is the match's next one (placements read it).
+        if (tournament.type === 'groups') {
+          for (const [from, outcome] of [
+            [matchData.team1FromMatchSlug, matchData.team1FromOutcome],
+            [matchData.team2FromMatchSlug, matchData.team2FromOutcome],
+          ] as const) {
+            const fromId = from ? slugToDbId.get(from) : undefined;
+            if (fromId && outcome === 'winner') {
+              await db.updateAsync('matches', { next_match_id: dbId }, 'id = ?', [fromId]);
+            }
           }
         }
       }
 
+      // Swiss always answered with the stored rows (scores and standings
+      // enrichment included); keep that response.
+      if (tournament.type === 'swiss') {
+        matches = await this.getMatches(tournamentId);
+      }
+
       // Keep tournament in 'setup' status - it will change to 'ready' when user starts it
       await db.updateAsync('tournament', { updated_at: Math.floor(Date.now() / 1000) }, 'id = ?', [
-        1,
+        tournamentId,
       ]);
 
       log.debug(`Bracket generated: ${matches.length} matches created`);
@@ -386,8 +712,8 @@ class TournamentService {
    * Explicitly regenerate brackets (DESTRUCTIVE - wipes all match data)
    * Should only be called with user confirmation
    */
-  async regenerateBracket(force: boolean = false): Promise<BracketResponse> {
-    const tournament = await this.getTournament();
+  async regenerateBracket(tournamentId: number, force: boolean = false): Promise<BracketResponse> {
+    const tournament = await this.getTournament(tournamentId);
     if (!tournament) {
       throw new Error('No tournament exists');
     }
@@ -403,7 +729,7 @@ class TournamentService {
     log.warn('Regenerating bracket - all existing match data will be deleted');
 
     // Generate new bracket (this also sets status to 'ready')
-    const result = await this.generateBracket();
+    const result = await this.generateBracket(tournamentId);
 
     log.success('Bracket regenerated successfully');
     return result;
@@ -413,22 +739,32 @@ class TournamentService {
    * Reset tournament back to setup mode
    * Clears all matches and resets status
    */
-  async resetTournament(): Promise<TournamentResponse> {
-    const tournament = await this.getTournament();
+  async resetTournament(tournamentId: number): Promise<TournamentResponse> {
+    const tournament = await this.getTournament(tournamentId);
     if (!tournament) {
       throw new Error('No tournament exists');
     }
 
     // Count matches before deletion for logging
     const matchCount = await db.queryOneAsync<{ count: number }>(
-      'SELECT COUNT(*) as count FROM matches WHERE tournament_id = 1'
+      'SELECT COUNT(*) as count FROM matches WHERE tournament_id = ?',
+      [tournamentId]
     );
 
-    // Delete all matches (this also clears all veto states stored in matches)
-    await db.execAsync('DELETE FROM matches WHERE tournament_id = 1');
+    // Reset means "play it again": roll ratings back and drop this run's
+    // history before the matches go. (deleteTournament keeps both.)
+    await discardTournamentRatings(tournamentId);
 
-    // Also clear any in-memory live stats so new brackets don't inherit stale scores
-    matchLiveStatsService.clearAll();
+    // The new bracket reuses these slugs: the old matches leave nothing under
+    // them (live stats, clips, demos); other tournaments' stay.
+    const resetSlugs = await db.queryAsync<{ slug: string }>(
+      'SELECT slug FROM matches WHERE tournament_id = ?',
+      [tournamentId]
+    );
+    await forgetMatches(resetSlugs.map((r) => r.slug));
+
+    // Delete all matches (this also clears all veto states stored in matches)
+    await db.runAsync('DELETE FROM matches WHERE tournament_id = ?', [tournamentId]);
 
     // Shuffle tournaments have their own dynamic match/round generation and
     // temporary teams. Resetting should NOT attempt to regenerate a static bracket.
@@ -436,7 +772,7 @@ class TournamentService {
       // Clean up shuffle-specific state. We intentionally KEEP registrations in
       // shuffle_tournament_players so admins don't lose their selected player
       // pool when resetting back to setup.
-      await db.execAsync("DELETE FROM teams WHERE id LIKE 'shuffle-r%'");
+      await db.runAsync('DELETE FROM teams WHERE id LIKE ?', [shuffleTeamLike(tournamentId)]);
 
       await db.updateAsync(
         'tournament',
@@ -447,7 +783,7 @@ class TournamentService {
           completed_at: null,
         },
         'id = ?',
-        [1]
+        [tournamentId]
       );
 
       log.success(
@@ -456,7 +792,7 @@ class TournamentService {
         } match(es) and cleared shuffle teams (registrations preserved).`
       );
 
-      const result = await this.getTournament();
+      const result = await this.getTournament(tournamentId);
       if (!result) throw new Error('Failed to retrieve tournament after reset');
       return result;
     }
@@ -471,7 +807,7 @@ class TournamentService {
         completed_at: null,
       },
       'id = ?',
-      [1]
+      [tournamentId]
     );
 
     log.success(
@@ -482,7 +818,7 @@ class TournamentService {
 
     // Regenerate bracket after reset
     try {
-      await this.generateBracket();
+      await this.generateBracket(tournamentId);
       log.success('Bracket regenerated after tournament reset');
     } catch (err) {
       log.error('Failed to regenerate bracket after reset', err);
@@ -493,7 +829,7 @@ class TournamentService {
       );
     }
 
-    const result = await this.getTournament();
+    const result = await this.getTournament(tournamentId);
     if (!result) throw new Error('Failed to retrieve tournament after reset');
     return result;
   }
@@ -501,22 +837,55 @@ class TournamentService {
   /**
    * Get bracket with all matches
    */
-  async getBracket(): Promise<BracketResponse | null> {
-    const tournament = await this.getTournament();
+  async getBracket(tournamentId: number): Promise<BracketResponse | null> {
+    const tournament = await this.getTournament(tournamentId);
     if (!tournament) return null;
 
-    const matches = await this.getMatches();
+    const matches = await this.getMatches(tournamentId);
+    // Start times and when each veto opens (Manage › Schedule).
+    for (const match of matches) {
+      Object.assign(
+        match,
+        matchTimeFields({ round: match.round, starts_at: match.ownStartsAt }, tournament.settings)
+      );
+    }
     const totalRounds = calculateTotalRounds(tournament.teamIds.length, tournament.type);
 
+    if (tournament.type === 'swiss') {
+      const swissStandings = await getSwissStandingEntries(tournament.id);
+      return { tournament, matches, totalRounds, swissStandings };
+    }
+    if (tournament.type === 'round_robin') {
+      const roundRobinStandings = await getRoundRobinStandingEntries(tournament.id);
+      return { tournament, matches, totalRounds, roundRobinStandings };
+    }
+    if (tournament.type === 'groups') {
+      const { groupStandings } = await import('./groupsTournament');
+      const groups = (await groupStandings(tournament.id)).map((g) => ({
+        group: g.group,
+        done: g.done,
+        standings: g.standings.map((s) => ({
+          rank: s.rank,
+          teamId: s.teamId,
+          wins: s.wins,
+          losses: s.losses,
+          roundDiff: s.roundDiff,
+          roundsWon: s.roundsWon,
+        })),
+      }));
+      const rounds = Math.max(0, ...matches.map((m) => m.round ?? 0));
+      return { tournament, matches, totalRounds: rounds, groupStandings: groups };
+    }
     return { tournament, matches, totalRounds };
   }
 
   /**
    * Get all matches for the tournament
    */
-  private async getMatches(): Promise<BracketMatch[]> {
+  private async getMatches(tournamentId: number): Promise<BracketMatch[]> {
     const rows = await db.queryAsync<DbMatchRow>(
-      'SELECT * FROM matches WHERE tournament_id = 1 ORDER BY round, match_number'
+      'SELECT * FROM matches WHERE tournament_id = ? ORDER BY round, match_number',
+      [tournamentId]
     );
 
     const matches: BracketMatch[] = [];
@@ -533,15 +902,22 @@ class TournamentService {
         createdAt: row.created_at,
         loadedAt: row.loaded_at,
         completedAt: row.completed_at,
+        bracket: row.bracket ?? null,
+        currentMap: row.current_map ?? null,
+        mapNumber: row.map_number ?? null,
+        ownStartsAt: (row as { starts_at?: number | null }).starts_at ?? null,
+        vetoing:
+          row.status === 'pending' &&
+          Boolean(row.team1_id && row.team2_id) &&
+          !String(row.veto_state ?? '').includes('"status":"completed"'),
       };
 
-      // Parse config for additional details
+      // Integration-owned config, forwarded as-is (client slots: PR 12).
       if (row.config) {
-        try {
-          match.config = JSON.parse(row.config);
-        } catch {
-          // Ignore parse errors
-        }
+        // The public bracket: no GOTV password with no delay (utils/matchConfigSecrets).
+        match.config = withoutConfigSecrets(
+          parseStoredMatchConfig(row.config)
+        ) as BracketMatch['config'];
       }
 
       // Attach team info if available
@@ -571,36 +947,18 @@ class TournamentService {
       // Enrich match with player stats and scores from persisted events
       await enrichMatch(match, row.slug);
 
-      // For matches that are still in progress, optionally overlay in‑memory live
-      // stats so the bracket reflects the most recent score. For multi‑map
-      // series we prefer the live **series** score when it is positive
-      // (e.g. 1–0 in a BO3). For BO1 / early maps where seriesScore is still 0,
-      // we instead surface the current **map rounds** (e.g. 8–5) so the UI
-      // doesn't get stuck showing 0–0 until the final result is known.
-      //
-      // For completed matches we ALWAYS trust persisted results and DO NOT let
-      // transient live stats overwrite the final series score (e.g. 2–1).
-      if (row.status !== 'completed') {
-        const liveStats = matchLiveStatsService.getStats(row.slug);
-        if (liveStats) {
-          // Prefer positive series scores; otherwise fall back to current map rounds.
-          const liveTeam1 =
-            typeof liveStats.team1SeriesScore === 'number' && liveStats.team1SeriesScore > 0
-              ? liveStats.team1SeriesScore
-              : liveStats.team1Score;
-          const liveTeam2 =
-            typeof liveStats.team2SeriesScore === 'number' && liveStats.team2SeriesScore > 0
-              ? liveStats.team2SeriesScore
-              : liveStats.team2Score;
-
-          if (typeof liveTeam1 === 'number' && Number.isFinite(liveTeam1)) {
-            match.team1Score = liveTeam1;
-          }
-          if (typeof liveTeam2 === 'number' && Number.isFinite(liveTeam2)) {
-            match.team2Score = liveTeam2;
-          }
-        }
+      // Normalise score fields (series = maps won, map score = current map
+      // rounds, headline team1Score/team2Score). Completed matches keep their
+      // persisted series result; live stats are only consulted in progress.
+      const mapResults = await getMapResults(row.slug);
+      if (mapResults.length > 0) {
+        match.mapResults = mapResults;
       }
+      applyScoreFields(match, {
+        status: row.status,
+        mapResults,
+        liveStats: row.status !== 'completed' ? matchLiveStatsService.getStats(row.slug) : null,
+      });
 
       matches.push(match);
     }
@@ -617,7 +975,9 @@ class TournamentService {
   ): Promise<void> {
     // Link winners‑bracket matches (both single and double elimination)
     if (tournamentType === 'single_elimination' || tournamentType === 'double_elimination') {
-      const winnersMatches = matches.filter((m) => !m.slug.startsWith('lb-') && m.slug !== 'gf');
+      const winnersMatches = matches.filter(
+        (m) => !isLosersBracketSlug(m.slug) && !isGrandFinalSlug(m.slug)
+      );
       if (winnersMatches.length > 0) {
         const maxRound = Math.max(...winnersMatches.map((m) => m.round));
 
@@ -661,7 +1021,7 @@ class TournamentService {
         //
         // This matches the standard double‑elimination structure where some
         // losers rounds "fan in" multiple prior matches.
-        const lbMatches = matches.filter((m) => m.slug.startsWith('lb-'));
+        const lbMatches = matches.filter((m) => isLosersBracketSlug(m.slug));
         if (lbMatches.length > 0) {
           const lbRounds = Array.from(new Set(lbMatches.map((m) => m.round))).sort((a, b) => a - b);
 
@@ -706,40 +1066,40 @@ class TournamentService {
               const target = nextRoundMatches.find((nm) => nm.matchNumber === targetMatchNumber);
               if (!target) continue;
 
-              const nextMatchId = slugToDbId.get(target.slug);
+              const nextMatchId = slugToDbId.get(bareSlug(target.slug));
               if (!nextMatchId) continue;
 
               await db.updateAsync('matches', { next_match_id: nextMatchId }, 'id = ?', [m.id]);
               m.nextMatchId = nextMatchId;
             }
           }
+        }
 
-          // Finally, wire the winners‑bracket final and losers‑bracket final into
-          // the grand final (slug `gf`) when present. We treat both as parents
-          // of the same terminal match.
-          const grandFinalId = slugToDbId.get('gf');
-          if (grandFinalId) {
-            const lastWinnersRound = Math.max(...winnersMatches.map((m) => m.round));
-            const winnersFinal = winnersMatches.find(
-              (m) => m.round === lastWinnersRound && !m.slug.startsWith('lb-')
-            );
+        // Finally, wire the winners‑bracket final and losers‑bracket final into
+        // the grand final (slug `gf`) when present. We treat both as parents
+        // of the same terminal match.
+        //
+        // A two-team bracket has no losers-bracket matches at all — both grand
+        // finalists come out of the single winners match — so this runs outside
+        // the losers-bracket linking above, which would otherwise skip it and
+        // leave the grand final with no parent link.
+        const grandFinalId = slugToDbId.get('gf');
+        if (grandFinalId && winnersMatches.length > 0) {
+          const lastWinnersRound = Math.max(...winnersMatches.map((m) => m.round));
+          const winnersFinal = winnersMatches.find(
+            (m) => m.round === lastWinnersRound && !isLosersBracketSlug(m.slug)
+          );
 
-            const lastLosersRound = Math.max(...lbMatches.map((m) => m.round));
-            const losersFinal = lbMatches.find((m) => m.round === lastLosersRound);
+          const losersFinal =
+            lbMatches.length > 0
+              ? lbMatches.find((m) => m.round === Math.max(...lbMatches.map((lm) => lm.round)))
+              : undefined;
 
-            const finals = [winnersFinal, losersFinal].filter(
-              (m): m is BracketMatch => Boolean(m)
-            );
+          const finals = [winnersFinal, losersFinal].filter((m): m is BracketMatch => Boolean(m));
 
-            for (const parent of finals) {
-              await db.updateAsync(
-                'matches',
-                { next_match_id: grandFinalId },
-                'id = ?',
-                [parent.id]
-              );
-              parent.nextMatchId = grandFinalId;
-            }
+          for (const parent of finals) {
+            await db.updateAsync('matches', { next_match_id: grandFinalId }, 'id = ?', [parent.id]);
+            parent.nextMatchId = grandFinalId;
           }
         }
       }
@@ -775,32 +1135,39 @@ class TournamentService {
       type: row.type,
       format: row.format,
       status: row.status,
-      map_sequence: row.map_sequence,
       team_size: row.team_size,
-      max_rounds: row.max_rounds,
-      overtime_mode: row.overtime_mode,
-      overtime_segments: row.overtime_segments,
       elo_template_id: row.elo_template_id,
     });
 
+    const game = row.game || DEFAULT_GAME;
+    const settings = normalizeTournamentSettings(JSON.parse(row.settings), row.format);
+    const moduleFields = moduleTournamentFields(game, settings);
     return {
       ...row,
-      maps: JSON.parse(row.maps),
+      game,
       team_ids: JSON.parse(row.team_ids),
-      settings: JSON.parse(row.settings),
-      // Normalize shuffle-specific fields
-      mapSequence: row.map_sequence ? JSON.parse(row.map_sequence) : undefined,
+      settings,
+      // The game module's 2.x fields, from its object in settings.
+      ...moduleFields,
       teamSize: row.team_size === null || row.team_size === undefined ? undefined : row.team_size,
-      maxRounds:
-        row.max_rounds === null || row.max_rounds === undefined ? undefined : row.max_rounds,
-      overtimeMode: (row.overtime_mode as 'enabled' | 'disabled' | null) || undefined,
-      overtimeSegments:
-        row.overtime_segments === null || row.overtime_segments === undefined
-          ? undefined
-          : row.overtime_segments,
       eloTemplateId: row.elo_template_id ?? null,
     };
   }
+}
+
+/**
+ * Whether any match of the tournament was played: put on a server, live or
+ * over (kept matches count too: they still carry its slugs).
+ */
+async function tournamentWasPlayed(tournamentId: number): Promise<boolean> {
+  const row = await db.queryOneAsync<{ one: number }>(
+    `SELECT 1 AS one FROM matches
+      WHERE (tournament_id = ? OR played_in_id = ?)
+        AND (status NOT IN ('pending', 'ready') OR loaded_at IS NOT NULL)
+      LIMIT 1`,
+    [tournamentId, tournamentId]
+  );
+  return !!row;
 }
 
 export const tournamentService = new TournamentService();

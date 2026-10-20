@@ -1,8 +1,13 @@
-import { Router, Request, Response } from 'express';
+import type { Request, Response } from 'express';
+import { Router } from 'express';
 import { templateService } from '../services/templateService';
 import { requireAuth } from '../middleware/auth';
 import { log } from '../utils/logger';
-import type { CreateTemplateInput, UpdateTemplateInput, TournamentTemplate } from '../types/tournament.types';
+import type {
+  CreateTemplateInput,
+  UpdateTemplateInput,
+  TournamentTemplate,
+} from '../types/tournament.types';
 
 const router = Router();
 
@@ -141,7 +146,7 @@ router.post('/', async (req: Request, res: Response) => {
 
 /**
  * @openapi
- * /api/templates/:id:
+ * /api/templates/{id}:
  *   get:
  *     tags:
  *       - Templates
@@ -188,7 +193,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 
 /**
  * @openapi
- * /api/templates/:id:
+ * /api/templates/{id}:
  *   put:
  *     tags:
  *       - Templates
@@ -244,7 +249,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 
 /**
  * @openapi
- * /api/templates/:id:
+ * /api/templates/{id}:
  *   delete:
  *     tags:
  *       - Templates
@@ -291,4 +296,3 @@ router.delete('/:id', async (req: Request, res: Response) => {
 });
 
 export default router;
-

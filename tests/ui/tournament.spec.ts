@@ -1,103 +1,119 @@
 import { test, expect } from '@playwright/test';
-import { ensureSignedIn } from '../helpers/auth';
+import { setupTestContext } from '../helpers/setup';
+import { getAuthHeader } from '../helpers/auth';
+import { createTestTeams } from '../helpers/teams';
+import { createTestServer } from '../helpers/servers';
+import { createTournament, startTournament } from '../helpers/tournaments';
 
 /**
  * Tournament UI tests
- * Tests tournament page functionality
+ *
+ * /tournament renders one of three distinct views depending on tournament state,
+ * and each test below drives the app into a specific one rather than accepting
+ * whichever happens to show up:
+ *
+ *   no tournament   -> setup flow on its first step (tournament-setup)
+ *   created (setup) -> setup flow on its Review step (tournament-name-display)
+ *   in_progress     -> live view (tournament-status, view-bracket-button)
+ *
+ * The previous version of this file guarded every assertion behind
+ * `if (await x.isVisible().catch(() => false))`, so it passed whether or not any
+ * of it worked. Its "view bracket" branch could never run at all: that button
+ * only exists once a tournament is in progress, which the test never arranged.
  *
  * @tag ui
  * @tag tournament
  * @tag crud
  */
 
+const MAPS = [
+  'de_mirage',
+  'de_inferno',
+  'de_ancient',
+  'de_anubis',
+  'de_dust2',
+  'de_vertigo',
+  'de_nuke',
+];
+
 test.describe.serial('Tournament UI', () => {
-  test.beforeEach(async ({ page }) => {
-    await ensureSignedIn(page);
+  let teamIds: string[] = [];
+
+  test.beforeEach(async ({ page, request }) => {
+    await setupTestContext(page, request);
   });
 
-  test.skip(
-    'should navigate to and display tournament page',
-    {
-      tag: ['@ui', '@tournament'],
-    },
-    async ({ page }) => {
-      await page.goto('/tournament');
+  test(
+    'should open the setup flow when no tournament exists',
+    { tag: ['@ui', '@tournament'] },
+    async ({ page, request }) => {
+      await request.delete('/api/tournament', { headers: getAuthHeader() });
+
+      await page.goto('/manage/tournament');
       await expect(page).toHaveURL(/\/tournament/);
       await expect(page).toHaveTitle(/Tournament Setup/i);
-      await page.waitForLoadState('networkidle');
 
-      // Verify tournament page loaded
-      await expect(page.getByTestId('tournament-page')).toBeVisible({ timeout: 5000 });
+      await expect(page.getByTestId('tournament-page')).toBeVisible();
+      await expect(page.getByTestId('tournament-setup')).toBeVisible();
+      await expect(page.getByTestId('tournament-setup-step-game')).toHaveAttribute(
+        'aria-current',
+        'step'
+      );
+      // Nothing to review yet.
+      await expect(page.getByTestId('tournament-name-display')).toHaveCount(0);
 
-      // Check for tournament form elements - form might be visible if no tournament exists
-      const nameInput = page.getByTestId('tournament-name-input');
-      const formVisible = await nameInput.isVisible().catch(() => false);
-
-      // If form is not visible, tournament might already exist - that's okay
-      if (formVisible) {
-        await expect(nameInput).toBeVisible();
-      }
+      // The live view belongs to an in-progress tournament, not an empty one.
+      await expect(page.getByTestId('tournament-status')).toHaveCount(0);
+      await expect(page.getByTestId('view-bracket-button')).toHaveCount(0);
     }
   );
 
   test(
-    'should create tournament and navigate to bracket',
-    {
-      tag: ['@ui', '@tournament', '@crud', '@navigation'],
-    },
-    async ({ page }) => {
-      await page.goto('/tournament');
-      await page.waitForLoadState('networkidle');
+    'should open on the Review step once a tournament is created',
+    { tag: ['@ui', '@tournament', '@crud'] },
+    async ({ page, request }) => {
+      const teams = await createTestTeams(request, 'tournament-ui');
+      expect(teams, 'test teams should be created').toBeTruthy();
+      teamIds = teams!.map((team) => team.id);
 
-      // Check if form is visible (means no tournament exists yet)
-      const nameInput = page.getByTestId('tournament-name-input');
-      const formVisible = await nameInput.isVisible().catch(() => false);
+      const server = await createTestServer(request, 'tournament-ui');
+      expect(server, 'a test server should be created').toBeTruthy();
 
-      if (formVisible) {
-        // Form is visible, we can create a tournament
-        const tournamentName = `UI Test Tournament ${Date.now()}`;
-        await nameInput.fill(tournamentName);
+      const tournament = await createTournament(request, {
+        name: `Tournament UI ${Date.now()}`,
+        type: 'single_elimination',
+        format: 'bo1',
+        maps: MAPS,
+        teamIds,
+      });
+      expect(tournament, 'tournament should be created').toBeTruthy();
 
-        // Submit form if there's a submit button
-        const submitButton = page.getByTestId('tournament-save-button');
-        const submitVisible = await submitButton.isVisible().catch(() => false);
+      await page.goto('/manage/tournament');
+      await expect(page.getByTestId('tournament-name-display')).toBeVisible();
+      await expect(page.getByTestId('tournament-setup-step-review')).toHaveAttribute(
+        'aria-current',
+        'step'
+      );
+    }
+  );
 
-        if (submitVisible) {
-          await submitButton.click();
+  test(
+    'should show live status and a working bracket link once started',
+    { tag: ['@ui', '@tournament', '@navigation'] },
+    async ({ page, request }) => {
+      expect(await startTournament(request), 'tournament should start').toBe(true);
 
-          // Wait for tournament to be created
-          await page.waitForTimeout(2000);
-          const tournamentCreated = await page
-            .getByTestId('tournament-name-display')
-            .isVisible()
-            .catch(() => false);
-          if (!tournamentCreated) {
-            // Tournament might be created but name not immediately visible, check for status
-            const statusVisible = await page
-              .getByTestId('tournament-status')
-              .isVisible()
-              .catch(() => false);
-            expect(statusVisible).toBeTruthy();
-          }
-        }
-      }
+      await page.goto('/manage/tournament');
 
-      // Check for tournament status indicators
-      const statusElement = page.getByTestId('tournament-status');
-      const hasStatus = await statusElement.isVisible().catch(() => false);
+      // Starting flips the page from the configuration view to the live one.
+      await expect(page.getByTestId('tournament-status')).toBeVisible();
+      await expect(page.getByTestId('tournament-name-display')).toHaveCount(0);
+      await expect(page.getByTestId('tournament-setup')).toHaveCount(0);
 
-      if (hasStatus) {
-        await expect(statusElement).toBeVisible();
-      }
-
-      // Look for "View Bracket" or similar button
       const bracketButton = page.getByTestId('view-bracket-button');
-      const bracketButtonVisible = await bracketButton.isVisible().catch(() => false);
-
-      if (bracketButtonVisible) {
-        await bracketButton.click();
-        await expect(page).toHaveURL(/\/bracket/);
-      }
+      await expect(bracketButton).toBeVisible();
+      await bracketButton.click();
+      await expect(page).toHaveURL(/\/bracket/);
     }
   );
 });

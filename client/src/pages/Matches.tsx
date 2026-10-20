@@ -1,50 +1,91 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Box, Typography, Grid, LinearProgress, Snackbar, Alert, Stack, Button, Chip } from '@mui/material';
-import SportsEsportsIcon from '@mui/icons-material/SportsEsports';
-import AddIcon from '@mui/icons-material/Add';
-import { io } from 'socket.io-client';
-import { useNavigate } from 'react-router-dom';
+import { pageTitle } from '../utils/pageTitle';
+import { manageMatchPath } from '../paths';
+import { useState, useEffect, useCallback } from 'react';
+import { Box, Typography, LinearProgress, Snackbar, Alert, Button } from '@mui/material';
+import { GameControllerIcon, PlusIcon } from '@phosphor-icons/react';
+import { scopedSocket } from '../utils/sharedSocket';
+import { onSocketReconnect } from '../utils/socketResync';
+import { useNavigate, useSearchParams, useParams } from 'react-router-dom';
 import { useSnackbar } from '../contexts/SnackbarContext';
-import MatchDetailsModal from '../components/modals/MatchDetailsModal';
-import { CreateManualMatchModal } from '../components/modals/CreateManualMatchModal';
 import { EmptyState } from '../components/shared/EmptyState';
-import { StatusLegend } from '../components/shared/StatusLegend';
-import { MatchCard } from '../components/shared/MatchCard';
-import { ServerAllocationWidget } from '../components/shared/ServerAllocationWidget';
-import { getRoundLabel } from '../utils/matchUtils';
+import { MatchesTable } from '../components/manage/MatchesTable';
+import { useShellIntegrations, shellModule } from '../hooks/useShellIntegrations';
+import { useResourceAvailability } from '../hooks/useResourceAvailability';
+import { getGlobalMatchNumber } from '../utils/matchUtils';
 import { isManualMatch as isManualMatchFlag } from '../utils/matchFlags';
 import { api } from '../utils/api';
-import type { Match, MatchEvent, MatchesResponse, ServerAvailabilityResponse } from '../types';
+import type { Match, MatchEvent, MatchesResponse } from '../types';
 import ConfirmDialog from '../components/modals/ConfirmDialog';
 import { useTranslation } from 'react-i18next';
+import { PageHead } from '../components/common/ui';
 
 export default function Matches() {
+  // One read of the tournament for both of this page's game-dependent parts:
+  // the allocation status panel (CS2: servers the queue waits for) and what
+  // the queued matches are waiting for (3.0 phase E). Both come from the
+  // module the tournament runs; before there is a tournament, from every
+  // installed module, because a standalone match can be created first.
+  const {
+    shell,
+    tournament: tournamentIntegration,
+    tournamentId,
+    loading: tournamentIntegrationLoading,
+  } = useShellIntegrations();
+  // The tournament in the address (/manage/tournaments/:id/matches), else the one loaded.
+  const { id: routeId } = useParams<{ id?: string }>();
+  const scopeId = routeId && routeId !== 'new' ? Number(routeId) : (tournamentId ?? null);
+  const ServerAllocationWidget = shellModule(shell, (i) => i.matchPanels.adminView)?.matchPanels
+    .adminView;
+  // The "create match" dialog is the module's whole form (client API 0.2.0):
+  // the tournament's module, or before there is one the first installed
+  // module that has one, because a standalone match can be created first. A
+  // module with no standalone matches fills nothing, and the list offers none.
+  const StandaloneMatchDialog = shellModule(shell, (i) => i.standaloneMatch)?.standaloneMatch;
   const navigate = useNavigate();
   const [upcomingMatches, setUpcomingMatches] = useState<Match[]>([]);
   const [liveMatches, setLiveMatches] = useState<Match[]>([]);
   const [matchHistory, setMatchHistory] = useState<Match[]>([]);
-  const [selectedMatch, setSelectedMatch] = useState<Match | null>(null);
+  // `?match=<slug>` (an old shared link, paths.ts matchDetailsPath) opens the match room.
+  const [searchParams] = useSearchParams();
+  const linkedSlug = searchParams.get('match');
+  const selectMatch = useCallback(
+    (match: Match) => {
+      if (match.slug) navigate(manageMatchPath(match.slug, scopeId));
+    },
+    [navigate, scopeId]
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [liveEvents, setLiveEvents] = useState<Map<string, MatchEvent['event']>>(new Map());
   const [tournamentStatus, setTournamentStatus] = useState<string>('setup');
   const [createMatchOpen, setCreateMatchOpen] = useState(false);
   const { showSuccess, showError } = useSnackbar();
-  const [allocationCountdown, setAllocationCountdown] = useState<{
-    nextAllocationInSeconds: number | null;
-    gracePeriodSeconds: number;
-  }>({
-    nextAllocationInSeconds: null,
-    gracePeriodSeconds: 120,
-  });
-  const [serverAllocationStatus, setServerAllocationStatus] = useState<ServerAvailabilityResponse | null>(null);
+  // What the queued matches are waiting for, asked of the game's own module
+  // rather than of a route this page names (3.0 phase E). A module with no
+  // resources is never asked, and every queue below then shows nothing, which
+  // is the truth for a match that is simply open.
+  const matchIntegration = tournamentIntegrationLoading
+    ? null
+    : (tournamentIntegration ?? shell[0] ?? null);
+  const { availability: serverAllocationStatus, nextInSeconds: nextAllocationInSeconds } =
+    useResourceAvailability(matchIntegration);
+  // What the waiting matches are waiting for, said in the game's own words:
+  // the pass countdown above the list, the same countdown in the toolbar, and
+  // the per-match line on a card. A module with no resources fills none of
+  // them and the list simply shows the matches.
+  const QueueBanner = matchIntegration?.matchListQueue?.banner;
+  const QueueCountdown = matchIntegration?.matchListQueue?.countdown;
+  const MatchQueueStatus = matchIntegration?.matchListQueue?.cardStatus;
+  // How many wait, as the module reads its own answer (0 without one).
+  const summarizeAvailability = matchIntegration?.summarizeAvailability;
+  const waitingMatches =
+    serverAllocationStatus && summarizeAvailability
+      ? summarizeAvailability(serverAllocationStatus).waitingMatches
+      : 0;
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedMatchSlugs, setSelectedMatchSlugs] = useState<Set<string>>(() => new Set());
   const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false);
   const { t } = useTranslation();
-  
-  // Local countdown state for match allocation ETAs (match.id -> seconds remaining)
-  const [matchETAs, setMatchETAs] = useState<Map<number, number>>(new Map());
 
   // Fetch matches
   const fetchMatches = useCallback(async () => {
@@ -62,10 +103,7 @@ export default function Matches() {
             const cfgTeam1Name = (m.config?.team1 as { name?: string } | undefined)?.name;
             const cfgTeam2Name = (m.config?.team2 as { name?: string } | undefined)?.name;
             return Boolean(
-              cfgTeam1Name &&
-                cfgTeam1Name !== 'TBD' &&
-                cfgTeam2Name &&
-                cfgTeam2Name !== 'TBD'
+              cfgTeam1Name && cfgTeam1Name !== 'TBD' && cfgTeam2Name && cfgTeam2Name !== 'TBD'
             );
           }
 
@@ -117,13 +155,13 @@ export default function Matches() {
 
   // Set dynamic page title
   useEffect(() => {
-    document.title = t('layout.pageTitle.matches');
+    document.title = pageTitle(t('layout.pageTitle.matches'));
   }, [t]);
 
   // Initialize Socket.io connection (mount-only)
   useEffect(() => {
     // Connect to same origin - works in both dev (proxied) and production (Caddy)
-    const newSocket = io();
+    const newSocket = scopedSocket();
 
     newSocket.on('connect', () => {
       console.log('Socket.io connected');
@@ -142,7 +180,13 @@ export default function Matches() {
         }
 
         const match = data as Match & {
-          liveStats?: { team1Score?: number; team2Score?: number; team1SeriesScore?: number; team2SeriesScore?: number };
+          liveStats?: {
+            team1Score?: number;
+            team2Score?: number;
+            team1SeriesScore?: number;
+            team2SeriesScore?: number;
+            status?: string;
+          };
         };
 
         const matchIdOrSlugEquals = (m: Match) =>
@@ -169,14 +213,19 @@ export default function Matches() {
 
           const liveStats = updates.liveStats;
           if (liveStats && next.status !== 'completed') {
-            // For in‑progress matches, use current map rounds from liveStats so
-            // match cards show 8‑5 / 13‑7 etc. instead of staying at 0‑0 until
-            // the map completes. Completed matches keep their persisted series score.
+            // For in-progress matches the headline score is the current map's
+            // rounds, and the map score field follows it. Between maps the live
+            // stats still hold the finished map's rounds, so warmup counts as
+            // no score on the new map. Completed matches keep their persisted
+            // series score.
+            const inWarmup = liveStats.status === 'warmup';
             if (typeof liveStats.team1Score === 'number') {
-              next.team1Score = liveStats.team1Score;
+              next.team1MapScore = inWarmup ? 0 : liveStats.team1Score;
+              next.team1Score = next.team1MapScore;
             }
             if (typeof liveStats.team2Score === 'number') {
-              next.team2Score = liveStats.team2Score;
+              next.team2MapScore = inWarmup ? 0 : liveStats.team2Score;
+              next.team2Score = next.team2MapScore;
             }
           }
           return next;
@@ -186,7 +235,7 @@ export default function Matches() {
           Boolean(
             // Bracket / enriched matches with DB-backed team rows
             ((m as Match).team1 || (m as Match).config?.team1) &&
-              ((m as Match).team2 || (m as Match).config?.team2)
+            ((m as Match).team2 || (m as Match).config?.team2)
           );
 
         const upsertMatch = (list: Match[], updatedMatch: typeof match) => {
@@ -205,8 +254,7 @@ export default function Matches() {
           return [...list, applyLiveScoreOverlay(updatedMatch as Match, updatedMatch)];
         };
 
-        const removeMatch = (list: Match[]) =>
-          list.filter((m) => !matchIdOrSlugEquals(m));
+        const removeMatch = (list: Match[]) => list.filter((m) => !matchIdOrSlugEquals(m));
 
         if (match.status === 'pending' || match.status === 'ready') {
           setUpcomingMatches((prev) => upsertMatch(prev, match));
@@ -243,199 +291,25 @@ export default function Matches() {
       fetchMatches();
     });
 
+    // Events sent while the socket was down are gone; refetch on reconnect.
+    const offReconnect = onSocketReconnect(newSocket, () => void fetchMatches());
+
     return () => {
+      offReconnect();
       newSocket.disconnect();
     };
   }, [fetchMatches]);
-
-  // Poll allocation status periodically so we can show per-server cooldown timers
-  // and per-match allocation estimates (mount-only).
-  useEffect(() => {
-    const loadAllocationStatus = async () => {
-      try {
-        const availability = await api.get<ServerAvailabilityResponse>('/api/tournament/server-availability');
-
-        if (availability.success) {
-          setServerAllocationStatus(availability);
-          setAllocationCountdown({
-            gracePeriodSeconds: availability.gracePeriodSeconds ?? 300,
-            nextAllocationInSeconds:
-              typeof availability.nextAllocationInSeconds === 'number'
-                ? availability.nextAllocationInSeconds
-                : null,
-          });
-        }
-      } catch (err) {
-        console.error('Failed to load allocation status for Matches page:', err);
-      }
-    };
-
-    void loadAllocationStatus();
-    const interval = setInterval(() => {
-      void loadAllocationStatus();
-    }, 5000); // Poll more frequently (5s) for better countdown accuracy
-    return () => clearInterval(interval);
-  }, []);
-
-  // Local per‑second tick for countdown on this page
-  useEffect(() => {
-    if (
-      allocationCountdown.nextAllocationInSeconds === null ||
-      allocationCountdown.nextAllocationInSeconds <= 0
-    ) {
-      return;
-    }
-
-    const timer = setInterval(
-      () =>
-        setAllocationCountdown((prev) => ({
-          ...prev,
-          nextAllocationInSeconds:
-            prev.nextAllocationInSeconds !== null && prev.nextAllocationInSeconds > 0
-              ? prev.nextAllocationInSeconds - 1
-              : 0,
-        })),
-      1000
-    );
-
-    return () => clearInterval(timer);
-  }, [allocationCountdown.nextAllocationInSeconds]);
-
-  const renderAllocationBanner = () => {
-    if (allocationCountdown.nextAllocationInSeconds === null) {
-      return null;
-    }
-
-    const nextIn = allocationCountdown.nextAllocationInSeconds;
-    if (nextIn <= 0) {
-      return null;
-    }
-
-    return (
-      <Box mb={2}>
-        <Alert severity="info">
-          <Typography variant="body2">
-            {t('servers.allocation.nextPass', { seconds: nextIn })}
-          </Typography>
-        </Alert>
-      </Box>
-    );
-  };
-
-  // Calculate allocation ETA for each match based on server cooldowns
-  // Returns: 0 = allocating now, positive number = cooldown seconds, -1 = waiting for busy servers
-  const getMatchAllocationETA = (matchIndex: number): number | null => {
-    if (!serverAllocationStatus) return null;
-
-    const { servers } = serverAllocationStatus;
-    const availableServers = servers.filter((s) => s.allocatable).length;
-    
-    // If we have enough available servers, no wait time
-    if (matchIndex < availableServers) {
-      return 0;
-    }
-
-    // Get all servers in grace window (cooling down after match completion)
-    const coolingServers = servers
-      .filter((s) => s.inGraceWindow && s.secondsUntilReady !== null)
-      .sort((a, b) => (a.secondsUntilReady || 0) - (b.secondsUntilReady || 0));
-
-    // Calculate which cooling server this match will get
-    const coolingServerIndex = matchIndex - availableServers;
-    if (coolingServerIndex < coolingServers.length) {
-      return coolingServers[coolingServerIndex].secondsUntilReady || null;
-    }
-
-    // Check if there are busy servers (with active matches, not cooling)
-    const busyServers = servers.filter((s) => s.online && !s.allocatable && !s.inGraceWindow);
-    
-    // If servers are busy with live matches, return -1 to indicate "waiting"
-    // Only show countdown when servers are actually cooling down
-    if (busyServers.length > 0 && coolingServers.length === 0) {
-      return -1; // Special value: waiting for busy servers
-    }
-
-    // No servers available and none cooling - return null
-    return null;
-  };
-
-  // Update match ETAs when server status or matches change
-  useEffect(() => {
-    if (!serverAllocationStatus) return;
-
-    const newETAs = new Map<number, number>();
-    upcomingMatches.forEach((match, index) => {
-      if (!match.serverId) {
-        const eta = getMatchAllocationETA(index);
-        if (eta !== null) {
-          newETAs.set(match.id, eta);
-        }
-      }
-    });
-    setMatchETAs(newETAs);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverAllocationStatus, upcomingMatches]);
-
-  // Local countdown timer for match ETAs
-  useEffect(() => {
-    if (matchETAs.size === 0) return;
-
-    const timer = setInterval(() => {
-      setMatchETAs((prev) => {
-        const next = new Map(prev);
-        let hasChanges = false;
-        
-        next.forEach((value, key) => {
-          if (value > 0) {
-            next.set(key, value - 1);
-            hasChanges = true;
-          }
-        });
-        
-        return hasChanges ? next : prev;
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [matchETAs]);
 
   useEffect(() => {
     fetchMatches();
   }, [fetchMatches]);
 
-  // Legacy delete handler kept for reference; match deletion is currently wired
-  // through the MatchDetailsModal, which calls its own delete endpoint and then
-  // emits socket updates. We keep this here in case we reintroduce list-level
-  // delete actions in the future.
-  // const handleDeleteMatch = async (match: Match) => {
-  //   try {
-  //     await api.delete(`/api/matches/${match.slug}`);
-  //     showSuccess(`Match deleted: ${match.slug}`);
-  //     void fetchMatches();
-  //   } catch (err) {
-  //     const message =
-  //       err instanceof Error ? err.message : 'Failed to delete match. Please try again.';
-  //     showError(message);
-  //     console.error('Failed to delete match', err);
-  //   }
-  // };
-
-  // Calculate global match number based on all matches
-  const getGlobalMatchNumber = (match: Match, allMatches: Match[]): number => {
-    // Sort all matches by round, then by matchNumber
-    // For manual matches (round=0, match_number=0), use database ID to maintain consistent order
-    const sortedMatches = [...allMatches].sort((a, b) => {
-      if (a.round !== b.round) return a.round - b.round;
-      if (a.matchNumber !== b.matchNumber) return a.matchNumber - b.matchNumber;
-      // If round and match_number are the same (e.g., manual matches), sort by ID
-      return a.id - b.id;
-    });
-
-    return sortedMatches.findIndex((m) => m.id === match.id) + 1;
-  };
-
   // Get all matches for numbering context
   const allMatches = [...upcomingMatches, ...liveMatches, ...matchHistory];
+
+  useEffect(() => {
+    if (linkedSlug) navigate(manageMatchPath(linkedSlug, scopeId), { replace: true });
+  }, [linkedSlug, navigate, scopeId]);
 
   const toggleMatchSelected = (match: Match) => {
     if (!isManualMatchFlag(match)) {
@@ -461,21 +335,24 @@ export default function Matches() {
       const slugs = Array.from(selectedMatchSlugs);
       const count = slugs.length;
       await api.post('/api/matches/bulk-delete', { slugs });
-      showSuccess(`Deleted ${count} match${count === 1 ? '' : 'es'}`);
+      showSuccess(t('matchesPage.bulkDelete.deleted', { count }));
       setSelectedMatchSlugs(() => new Set());
       setSelectionMode(false);
       await fetchMatches();
     } catch (err) {
       console.error('Failed to delete matches', err);
-      showError('Failed to delete one or more matches');
+      showError(t('matchesPage.errors.bulkDelete'));
     }
   };
 
   if (loading) {
     return (
-      <Box>
-        <LinearProgress />
-      </Box>
+      <>
+        <PageHead title={t('layout.pageTitle.matches')} />
+        <Box>
+          <LinearProgress />
+        </Box>
+      </>
     );
   }
 
@@ -507,339 +384,184 @@ export default function Matches() {
 
   return (
     <Box data-testid="matches-page" sx={{ width: '100%', height: '100%' }}>
-      {renderAllocationBanner()}
-      {/* Manual match creation + allocation countdown */}
-      {hasMatches && (
-        <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
-          <Box display="flex" alignItems="center" gap={2}>
-            {allocationCountdown.nextAllocationInSeconds !== null &&
-              allocationCountdown.nextAllocationInSeconds > 0 && (
-                <Typography variant="body2" color="text.secondary">
-                  {t('matchesPage.allocation.nextServers', {
-                    seconds: Math.max(0, allocationCountdown.nextAllocationInSeconds),
-                  })}
-                </Typography>
-              )}
-          </Box>
-          <Box display="flex" alignItems="center" gap={1}>
-            <Button
-              variant={selectionMode ? 'contained' : 'outlined'}
-              color={selectionMode ? 'secondary' : 'inherit'}
-              size="small"
-              onClick={() => {
-                setSelectionMode((prev) => !prev);
-                if (selectionMode) {
-                  setSelectedMatchSlugs(() => new Set());
-                }
-              }}
-            >
-              {selectionMode
-                ? t('matchesPage.bulkSelect.done')
-                : t('matchesPage.bulkSelect.select')}
-            </Button>
-            {selectionMode && (
+      <PageHead
+        title={t('layout.pageTitle.matches')}
+        actions={
+          hasMatches ? (
+            <>
               <Button
-                variant="outlined"
-                color="inherit"
+                variant={selectionMode ? 'contained' : 'outlined'}
+                color={selectionMode ? 'secondary' : 'inherit'}
                 size="small"
-                disabled={
-                  [...upcomingMatches, ...liveMatches, ...matchHistory].filter((m) =>
-                    isManualMatchFlag(m)
-                  ).length === 0
-                }
                 onClick={() => {
-                  const manualMatches = [
-                    ...upcomingMatches,
-                    ...liveMatches,
-                    ...matchHistory,
-                  ].filter((m) => isManualMatchFlag(m) && m.slug);
-                  const allVisibleSelected =
-                    manualMatches.length > 0 &&
-                    manualMatches.every((m) => m.slug && selectedMatchSlugs.has(m.slug));
+                  setSelectionMode((prev) => !prev);
+                  if (selectionMode) {
+                    setSelectedMatchSlugs(() => new Set());
+                  }
+                }}
+              >
+                {selectionMode
+                  ? t('matchesPage.bulkSelect.done')
+                  : t('matchesPage.bulkSelect.select')}
+              </Button>
+              {selectionMode && (
+                <Button
+                  variant="outlined"
+                  color="inherit"
+                  size="small"
+                  disabled={
+                    [...upcomingMatches, ...liveMatches, ...matchHistory].filter((m) =>
+                      isManualMatchFlag(m)
+                    ).length === 0
+                  }
+                  onClick={() => {
+                    const manualMatches = [
+                      ...upcomingMatches,
+                      ...liveMatches,
+                      ...matchHistory,
+                    ].filter((m) => isManualMatchFlag(m) && m.slug);
+                    const allVisibleSelected =
+                      manualMatches.length > 0 &&
+                      manualMatches.every((m) => m.slug && selectedMatchSlugs.has(m.slug));
 
-                  setSelectedMatchSlugs((prev) => {
-                    const next = new Set(prev);
-                    if (allVisibleSelected) {
-                      manualMatches.forEach((m) => {
-                        if (m.slug) next.delete(m.slug);
-                      });
-                    } else {
-                      manualMatches.forEach((m) => {
-                        if (m.slug) next.add(m.slug);
-                      });
-                    }
-                    return next;
-                  });
-                }}
-              >
-                {(() => {
-                  const manualMatches = [
-                    ...upcomingMatches,
-                    ...liveMatches,
-                    ...matchHistory,
-                  ].filter((m) => isManualMatchFlag(m) && m.slug);
-                  const allVisibleSelected =
-                    manualMatches.length > 0 &&
-                    manualMatches.every((m) => m.slug && selectedMatchSlugs.has(m.slug));
-                  return allVisibleSelected
-                    ? t('matchesPage.bulkSelect.unselectAll')
-                    : t('matchesPage.bulkSelect.selectAll');
-                })()}
-              </Button>
-            )}
-            {selectionMode && (
-              <Button
-                variant="outlined"
-                color="error"
-                size="small"
-                disabled={selectedMatchSlugs.size === 0}
-                onClick={() => {
-                  if (selectedMatchSlugs.size === 0) return;
-                  setBulkDeleteConfirmOpen(true);
-                }}
-              >
-                {t('matchesPage.bulkSelect.deleteSelected')}
-              </Button>
-            )}
-            {!selectionMode && (
-              <Button variant="contained" size="small" onClick={() => setCreateMatchOpen(true)}>
-                {t('matchesPage.header.createMatch')}
-              </Button>
-            )}
-          </Box>
+                    setSelectedMatchSlugs((prev) => {
+                      const next = new Set(prev);
+                      if (allVisibleSelected) {
+                        manualMatches.forEach((m) => {
+                          if (m.slug) next.delete(m.slug);
+                        });
+                      } else {
+                        manualMatches.forEach((m) => {
+                          if (m.slug) next.add(m.slug);
+                        });
+                      }
+                      return next;
+                    });
+                  }}
+                >
+                  {(() => {
+                    const manualMatches = [
+                      ...upcomingMatches,
+                      ...liveMatches,
+                      ...matchHistory,
+                    ].filter((m) => isManualMatchFlag(m) && m.slug);
+                    const allVisibleSelected =
+                      manualMatches.length > 0 &&
+                      manualMatches.every((m) => m.slug && selectedMatchSlugs.has(m.slug));
+                    return allVisibleSelected
+                      ? t('matchesPage.bulkSelect.unselectAll')
+                      : t('matchesPage.bulkSelect.selectAll');
+                  })()}
+                </Button>
+              )}
+              {selectionMode && (
+                <Button
+                  variant="outlined"
+                  color="error"
+                  size="small"
+                  disabled={selectedMatchSlugs.size === 0}
+                  onClick={() => {
+                    if (selectedMatchSlugs.size === 0) return;
+                    setBulkDeleteConfirmOpen(true);
+                  }}
+                >
+                  {t('matchesPage.bulkSelect.deleteSelected')}
+                </Button>
+              )}
+              {!selectionMode && StandaloneMatchDialog && (
+                <Button variant="contained" size="small" onClick={() => setCreateMatchOpen(true)}>
+                  {t('matchesPage.header.createMatch')}
+                </Button>
+              )}
+            </>
+          ) : null
+        }
+      />
+      {QueueBanner && (
+        <QueueBanner
+          availability={serverAllocationStatus}
+          nextInSeconds={nextAllocationInSeconds}
+        />
+      )}
+      {/* The allocation countdown, under the head */}
+      {hasMatches && QueueCountdown && (
+        <Box display="flex" alignItems="center" gap={2} mb={3}>
+          <QueueCountdown
+            availability={serverAllocationStatus}
+            nextInSeconds={nextAllocationInSeconds}
+          />
         </Box>
       )}
 
       {/* Server Allocation Status Widget */}
-      {hasMatches && serverAllocationStatus && serverAllocationStatus.servers.length > 0 && (
-        <ServerAllocationWidget
-          servers={serverAllocationStatus.servers}
-          gracePeriodSeconds={serverAllocationStatus.gracePeriodSeconds}
-          requiredServerCount={serverAllocationStatus.requiredServerCount}
-        />
-      )}
-
-      {/* Status Legend */}
-      {hasMatches && (
-        <Box mb={3}>
-          <StatusLegend />
-        </Box>
+      {/* The module asks for its own resources, and shows nothing without any. */}
+      {ServerAllocationWidget && hasMatches && (
+        <ServerAllocationWidget tournamentId={tournamentId} />
       )}
 
       {!hasMatches && (
         <Box>
           <EmptyState
             data-testid="matches-empty-state"
-            icon={SportsEsportsIcon}
+            icon={GameControllerIcon}
             title={t('matchesPage.empty.title')}
             description={t('matchesPage.empty.description')}
             actionLabel={t('tournament.common.createTournament')}
-            actionIcon={AddIcon}
-            onAction={() => navigate('/tournament')}
+            actionIcon={PlusIcon}
+            onAction={() => navigate('/manage/tournament')}
           />
-          <Box display="flex" justifyContent="center" mt={2}>
-            <Button variant="outlined" onClick={() => setCreateMatchOpen(true)}>
-              {t('matchesPage.empty.createManual')}
-            </Button>
-          </Box>
+          {StandaloneMatchDialog && (
+            <Box display="flex" justifyContent="center" mt={2}>
+              <Button variant="outlined" onClick={() => setCreateMatchOpen(true)}>
+                {t('matchesPage.empty.createManual')}
+              </Button>
+            </Box>
+          )}
         </Box>
       )}
 
       {hasMatches && (
-        <Stack spacing={4} data-testid="matches-list">
-          {/* Live Matches Section */}
-          {liveMatches.length > 0 && (
-            <Box>
-              <Box display="flex" alignItems="center" gap={1} mb={2}>
-                <Box
-                  sx={{
-                    width: 12,
-                    height: 12,
-                    borderRadius: '50%',
-                    bgcolor: 'error.main',
-                    animation: 'pulse 2s ease-in-out infinite',
-                    '@keyframes pulse': {
-                      '0%, 100%': { opacity: 1 },
-                      '50%': { opacity: 0.3 },
-                    },
-                  }}
-                />
-                <Typography variant="h6" fontWeight={600}>
-                  {t('matchesPage.sections.live', { count: liveMatches.length })}
-                </Typography>
-              </Box>
-              <Grid container spacing={2}>
-                {liveMatches.map((match) => {
-                  const event = liveEvents.get(match.slug);
-                  const matchNumber = getGlobalMatchNumber(match, allMatches);
-                  return (
-                    <Grid size={{ xs: 12, sm: 6, md: 6, lg: 6 }} key={match.id}>
-                      <Box>
-                        <MatchCard
-                          match={match}
-                          matchNumber={matchNumber}
-                          variant="live"
-                          selectable={selectionMode && isManualMatchFlag(match)}
-                          selected={selectedMatchSlugs.has(match.slug)}
-                          onClick={() => {
-                            if (selectionMode && isManualMatchFlag(match)) {
-                              toggleMatchSelected(match);
-                            } else {
-                              setSelectedMatch(match);
-                            }
-                          }}
-                        />
-                        {event && event.event && (
-                          <Box mt={1} p={1} bgcolor="action.hover" borderRadius={1}>
-                            <Typography variant="caption" color="text.secondary">
-                              Latest: {event.event.replace(/_/g, ' ')}
-                            </Typography>
-                          </Box>
-                        )}
-                      </Box>
-                    </Grid>
-                  );
-                })}
-              </Grid>
-            </Box>
-          )}
-
-          {/* Upcoming Matches Section */}
-          {upcomingMatches.length > 0 && (
-            <Box>
-              <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-                <Typography variant="h6" fontWeight={600}>
-                  {t('matchesPage.sections.upcoming', { count: upcomingMatches.length })}
-                </Typography>
-                {serverAllocationStatus && serverAllocationStatus.requiredServerCount > 0 && (
-                  <Chip 
-                    label={`${serverAllocationStatus.requiredServerCount} in queue`}
-                    color="primary"
-                    size="small"
-                    sx={{ fontWeight: 600 }}
-                  />
-                )}
-              </Box>
-              <Grid container spacing={2}>
-                {upcomingMatches.map((match) => {
-                  const matchNumber = getGlobalMatchNumber(match, allMatches);
-                  const isManualMatch = isManualMatchFlag(match);
-                  // Don't show "Manual match" text - the pill is more explanatory
-                  const manualRoundLabel = undefined;
-                  const tournamentStartedForCard = isManualMatch
-                    ? undefined
-                    : tournamentStatus === 'in_progress';
-                  
-                  // Use queue position from backend (calculated globally across all matches)
-                  const queuePosition = match.queuePosition;
-                  
-                  // Get allocation ETA from local countdown state
-                  const allocationETA = !match.serverId ? (matchETAs.get(match.id) ?? null) : null;
-                  
-                  // Check if there are servers available right now
-                  const hasAvailableServers = serverAllocationStatus
-                    ? serverAllocationStatus.availableServerCount > 0
-                    : false;
-                  
-                  return (
-                    <Grid size={{ xs: 12, sm: 6, md: 6, lg: 6 }} key={match.id}>
-                      <MatchCard
-                        match={match}
-                        matchNumber={matchNumber}
-                        roundLabel={manualRoundLabel}
-                        variant="default"
-                        vetoCompleted={match.vetoCompleted}
-                        tournamentStarted={tournamentStartedForCard}
-                        selectable={selectionMode && isManualMatchFlag(match)}
-                        selected={selectedMatchSlugs.has(match.slug)}
-                        queuePosition={queuePosition}
-                        allocationETA={allocationETA}
-                        hasAvailableServers={hasAvailableServers}
-                        onClick={() => {
-                          if (selectionMode && isManualMatchFlag(match)) {
-                            toggleMatchSelected(match);
-                          } else {
-                            setSelectedMatch(match);
-                          }
-                        }}
-                      />
-                    </Grid>
-                  );
-                })}
-              </Grid>
-            </Box>
-          )}
-
-          {/* Match History Section */}
-          {matchHistory.length > 0 && (
-            <Box>
-              <Typography variant="h6" fontWeight={600} mb={2}>
-                {t('matchesPage.sections.history', { count: matchHistory.length })}
-              </Typography>
-              <Grid container spacing={2}>
-                {matchHistory.map((match) => {
-                  const matchNumber = getGlobalMatchNumber(match, allMatches);
-                  return (
-                    <Grid size={{ xs: 12, sm: 6, md: 6, lg: 6 }} key={match.id}>
-                      <Box>
-                        <MatchCard
-                          match={match}
-                          matchNumber={matchNumber}
-                          variant="completed"
-                          selectable={selectionMode && isManualMatchFlag(match)}
-                          selected={selectedMatchSlugs.has(match.slug)}
-                          onClick={() => {
-                            if (selectionMode && isManualMatchFlag(match)) {
-                              toggleMatchSelected(match);
-                            } else {
-                              setSelectedMatch(match);
-                            }
-                          }}
-                        />
-                      </Box>
-                    </Grid>
-                  );
-                })}
-              </Grid>
-            </Box>
-          )}
-        </Stack>
-      )}
-
-      {/* Match Details Modal */}
-      {selectedMatch && (
-        <MatchDetailsModal
-          match={selectedMatch}
-          matchNumber={getGlobalMatchNumber(selectedMatch, allMatches)}
-          roundLabel={getRoundLabel(selectedMatch.round)}
-          onClose={() => setSelectedMatch(null)}
-          onDeleted={(slug) => {
-            setSelectedMatch(null);
-            setUpcomingMatches((prev) => prev.filter((m) => m.slug !== slug));
-            setLiveMatches((prev) => prev.filter((m) => m.slug !== slug));
-            setMatchHistory((prev) => prev.filter((m) => m.slug !== slug));
+        <MatchesTable
+          live={liveMatches}
+          upcoming={upcomingMatches}
+          history={matchHistory}
+          numberOf={(match) => getGlobalMatchNumber(match, allMatches)}
+          latestEvent={(match) => {
+            const event = liveEvents.get(match.slug);
+            return event?.event ? event.event.replace(/_/g, ' ') : null;
           }}
+          onOpen={selectMatch}
+          selection={
+            selectionMode
+              ? {
+                  can: (match) => isManualMatchFlag(match),
+                  has: (match) => selectedMatchSlugs.has(match.slug),
+                  toggle: toggleMatchSelected,
+                }
+              : null
+          }
         />
       )}
 
-      {/* Create manual match modal */}
-      <CreateManualMatchModal
-        open={createMatchOpen}
-        onClose={() => setCreateMatchOpen(false)}
-        onCreated={async (slug) => {
-          setCreateMatchOpen(false);
-          showSuccess(t('matchesPage.create.success', { slug }));
+      {/* Create a standalone match: the module's dialog */}
+      {StandaloneMatchDialog && (
+        <StandaloneMatchDialog
+          open={createMatchOpen}
+          onClose={() => setCreateMatchOpen(false)}
+          onCreated={async (slug) => {
+            setCreateMatchOpen(false);
+            showSuccess(t('matchesPage.create.success', { slug }));
 
-          void fetchMatches();
-        }}
-      />
+            void fetchMatches();
+          }}
+        />
+      )}
 
       <ConfirmDialog
         open={selectionMode && bulkDeleteConfirmOpen}
         title={t('matchesPage.bulkDelete.title')}
         message={t('matchesPage.bulkDelete.message', {
           count: selectedMatchSlugs.size,
-          suffix: selectedMatchSlugs.size === 1 ? '' : 'es',
         })}
         confirmColor="error"
         onConfirm={async () => {

@@ -1,58 +1,96 @@
 // IMPORTANT: Load environment variables FIRST, before any other imports
 // This ensures all modules can access env vars during initialization
+import { startModuleUpdateNotices } from './services/platform/moduleUpdates';
+import { socialService } from './services/socialService';
+import { startTournamentNotices } from './services/tournamentNotices';
+import { startAdminNoticeSweep } from './services/adminNoticeSweep';
+import { backfillPlayedGames } from './services/gameReadiness';
+import { startHoldTimer } from './services/matchHolds';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import os from 'os';
 dotenv.config({ path: path.join(process.cwd(), '.env') });
+import { licenseExpiredMiddleware } from './middleware/licenseExpired';
+import { blockedViewerMiddleware } from './services/playerModeration';
+import { COOKIE_NAME as PLAYER_COOKIE_NAME } from './utils/signedPlayerCookie';
+import { getRealViewerSteamId } from './utils/viewerIdentity';
 
-import express, { Request, Response, NextFunction } from 'express';
+// Migrate any demos/logs left behind under the pre-fix (wrong) DATA_DIR
+// before any other module reads or writes under the real one at import time
+// (e.g. the event logger and the demos route both create their directory as
+// soon as they're imported below).
+import { migrateLegacyDataDir } from './config/migrateLegacyDataDir';
+migrateLegacyDataDir();
+
+// Move uploaded map images off the container image and onto the mounted
+// volume. Must also run before the map upload route is imported below: that
+// module creates MAP_IMAGES_DIR at import time, and /map-images is served
+// straight off the directory.
+import { migrateLegacyMapImages } from './config/migrateLegacyMapImages';
+migrateLegacyMapImages();
+
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
+import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import swaggerUi from 'swagger-ui-express';
 import { db } from './config/database';
-import { swaggerSpec } from './config/swagger';
+import { seedBundledPacks } from './services/gamePackService';
+import { applyLicenseEnvironment } from './services/license/consent';
+import { PUBLIC_DIR, MAP_IMAGES_DIR, SWAGGER_UI_DIR } from './config/publicPaths';
+import { DATA_DIR } from './config/dataDir';
+import { getOpenApiSpec } from './config/swagger';
 import { log, logger, LOG_HTTP_REQUESTS, LOG_DB_VERBOSE, LOG_DB_VALUES } from './utils/logger';
 import { cleanupOldLogs } from './utils/eventLogger';
-import { initializeSocket } from './services/socketService';
-import { serverService } from './services/serverService';
-import { rconService } from './services/rconService';
-import { settingsService } from './services/settingsService';
-import { serverInitializationService } from './services/serverInitializationService';
-import serverRoutes from './routes/servers';
-import serverStatusRoutes from './routes/serverStatus';
-import serverBootstrapRoutes from './routes/serverBootstrap';
-import teamRoutes from './routes/teams';
-import rconRoutes from './routes/rcon';
-import matchRoutes from './routes/matches';
-import eventRoutes from './routes/events';
-import steamRoutes from './routes/steam';
-import tournamentRoutes from './routes/tournament';
-import demoRoutes from './routes/demos';
-import teamMatchRoutes from './routes/teamMatch';
-import teamStatsRoutes from './routes/teamStats';
-import logsRoutes from './routes/logs';
-import vetoRoutes from './routes/veto';
-import settingsRoutes from './routes/settings';
-import mapsRoutes from './routes/maps';
-import mapPoolsRoutes from './routes/mapPools';
-import recoveryRoutes from './routes/recovery';
-import generationRoutes from './routes/generation';
-import templatesRoutes from './routes/templates';
-import manualMatchTemplatesRoutes from './routes/manualMatchTemplates';
-import playersRoutes from './routes/players';
-import eloTemplatesRoutes from './routes/eloTemplates';
-import testRoutes from './routes/test';
-import authRoutes from './routes/auth';
-import matchzyRoutes from './routes/matchzy';
-import { initMatchZyVersionService } from './services/matchzyVersionService';
+import { getIO, initializeSocket, type HandshakeMiddleware } from './services/socketService';
+import { matchmakingService } from './services/matchmaking/matchmakingService';
+import { registerShutdown } from './utils/restart';
+import { routeTable } from './routes/routeTable';
+import { listIntegrations } from './integrations/registry';
+import { diskModuleRoutes, scanDiskModules } from './modules/loader';
+import shareRoutes from './routes/share';
+import {
+  autoInstallCs2ForExistingData,
+  autoUpdateModulesFromSnapshot,
+  finishPendingUpdates,
+  restoreInterruptedSwaps,
+  sweepStaging,
+} from './modules/catalogService';
+import { installHostBridge } from './modules/hostBridge';
+import { environmentTrustedKeys } from './modules/trustedKeys';
 import { recoverActiveMatches } from './services/matchRecoveryService';
-import { matchAllocationService } from './services/matchAllocationService';
-import { healthMonitoringService } from './services/healthMonitoringService';
+import { enrichBuiltinGames } from './services/gameEnrichmentService';
+import { refreshGameIcons } from './services/gameIconService';
+import { scheduler } from './core/scheduler';
+import { steamService } from './services/steamService';
+import { getServiceTokens } from './utils/serviceTokens';
+import { allowUnauthenticatedEvents } from './middleware/serverAuth';
 import packageJson from '../package.json';
-import { configurePassportAuth, passport } from './config/passport';
+import { redactDiscordIdsInPath } from './utils/discordId';
+import {
+  configurePassportAuth,
+  getBackendBaseUrl,
+  passport,
+  reloadPassportAuth,
+} from './config/passport';
+import { adminAccessSettings } from './services/adminAccessSettings';
+import { localAdminService } from './services/localAdminService';
+import { authProviderSettingsService } from './services/authProviderSettingsService';
 import session from 'express-session';
 import connectPgSimple from 'connect-pg-simple';
 import { isIP } from 'net';
+import { DATABASE_NAME, DatabaseRenameRefused } from './config/databaseRename';
+import { TRUST_PROXY_HOPS } from './config/trustProxy';
+import { COMPAT_MAX_BYTES } from './utils/compatPayload';
+import { reportCompatConfig } from './services/compatService';
+import { startCompatFeed, stopCompatFeed } from './services/compatFeedService';
+import { startLicenseCheckin, stopLicenseCheckin } from './services/license/checkinService';
+import { startWebhooks, stopWebhooks } from './services/webhooks';
+import {
+  refreshCurrentTournamentId,
+  startCurrentTournamentRefresh,
+} from './services/currentTournament';
 
 const app = express();
 const httpServer = createServer(app);
@@ -63,16 +101,32 @@ configurePassportAuth();
 
 // Trust first proxy when behind Cloudflare Tunnel, nginx, Caddy, etc.
 // Required so X-Forwarded-Proto / Host are respected for cookies and redirects.
-app.set('trust proxy', 1);
+app.set('trust proxy', TRUST_PROXY_HOPS);
 
 // Middleware
 app.use(cors());
+// The Ready Up CI's compatibility reports get a small limit of their own,
+// parsed first so the 50MB parser below skips them (body-parser parses a
+// request once). A larger body is refused with 413 before it is read.
+app.use('/api/compat/events', express.json({ limit: COMPAT_MAX_BYTES }));
+app.use('/api/compat/events', (err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  const type = (err as { type?: string } | null)?.type;
+  if (type === 'entity.too.large') {
+    return res
+      .status(413)
+      .json({ success: false, error: 'payload_too_large', limitBytes: COMPAT_MAX_BYTES });
+  }
+  if (type === 'entity.parse.failed') {
+    return res.status(400).json({ success: false, error: 'invalid_json' });
+  }
+  return next(err);
+});
 // Increase body size limit to 50MB for image uploads (base64 encoded images can be large)
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Session + Passport
-const sessionSecret = process.env.SESSION_SECRET || 'matchzy-dev-session-secret';
+const sessionSecret = process.env.SESSION_SECRET || 'auto-tournament-dev-session-secret';
 const PgSession = connectPgSimple(session);
 
 // Reuse the same connection string logic as the main DatabaseManager so the
@@ -83,7 +137,7 @@ const sessionDbConnectionString =
   process.env.DATABASE_URL ||
   `postgresql://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'postgres'}@${
     process.env.DB_HOST || '127.0.0.1'
-  }:${process.env.DB_PORT || '5432'}/${process.env.DB_NAME || 'matchzy_tournament'}`;
+  }:${process.env.DB_PORT || '5432'}/${process.env.DB_NAME || DATABASE_NAME}`;
 
 // Determine if we should use secure cookies (HTTPS only)
 // Check FRONTEND_BASE_URL to see if we're using HTTPS
@@ -98,7 +152,9 @@ const useSecureCookies =
 let sessionCookieDomain: string | undefined;
 try {
   if (frontendBaseUrl) {
-    const u = new URL(frontendBaseUrl.startsWith('http') ? frontendBaseUrl : `https://${frontendBaseUrl}`);
+    const u = new URL(
+      frontendBaseUrl.startsWith('http') ? frontendBaseUrl : `https://${frontendBaseUrl}`
+    );
     const host = u.hostname.toLowerCase();
     // Only set an explicit cookie domain for real DNS names.
     // Setting Domain= on an IP can cause cookies to be dropped or behave unexpectedly.
@@ -110,7 +166,12 @@ try {
   // Invalid URL, skip domain
 }
 
-const sessionCookie: { sameSite: 'lax' | 'strict' | 'none'; secure: boolean; httpOnly: boolean; domain?: string } = {
+const sessionCookie: {
+  sameSite: 'lax' | 'strict' | 'none';
+  secure: boolean;
+  httpOnly: boolean;
+  domain?: string;
+} = {
   sameSite: 'lax',
   secure: useSecureCookies,
   httpOnly: true, // Prevent JavaScript access to cookie (security best practice)
@@ -119,24 +180,56 @@ if (sessionCookieDomain) {
   sessionCookie.domain = sessionCookieDomain;
 }
 
-app.use(
-  session({
-    // Persist sessions in PostgreSQL so admin logins survive API restarts.
-    // Note: Session table is created by our database schema, so we don't need
-    // connect-pg-simple to create it (which would require table.sql file).
-    store: new PgSession({
-      conString: sessionDbConnectionString,
-      tableName: 'session',
-      createTableIfMissing: false, // Table is created by our schema
-    }),
-    secret: sessionSecret,
-    resave: false,
-    saveUninitialized: false,
-    cookie: sessionCookie,
-  })
+// Persist sessions in PostgreSQL so admin logins survive API restarts.
+// Note: Session table is created by our database schema, so we don't need
+// connect-pg-simple to create it (which would require table.sql file).
+const sessionStore = new PgSession({
+  conString: sessionDbConnectionString,
+  tableName: 'session',
+  createTableIfMissing: false, // Table is created by our schema
+});
+// The session cookie's own name: express-session's default `connect.sid` is
+// shared with every other Express app, and one on a parent domain (e.g.
+// another site on *.example.com with Domain=example.com) is sent along too.
+// The browser sends the older cookie first and express-session reads the
+// first, so a fresh install behind such a domain never saw its own session
+// (setup signed the new admin in, the next request was signed out).
+const SESSION_COOKIE_NAME = 'at.sid';
+const sessionMiddleware = session({
+  name: SESSION_COOKIE_NAME,
+  store: sessionStore,
+  secret: sessionSecret,
+  resave: false,
+  saveUninitialized: false,
+  cookie: sessionCookie,
+});
+// Opened by IP address (a fresh install before its domain points here, e.g.
+// http://10.0.0.5:3069/setup): a cookie for FRONTEND_BASE_URL's domain, or a
+// Secure one over plain http, is dropped by the browser, so setup signed the
+// new admin out at once. Such requests get a cookie for the address they
+// came on, Secure only over https.
+const addressSessionMiddleware = session({
+  name: SESSION_COOKIE_NAME,
+  store: sessionStore,
+  secret: sessionSecret,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { sameSite: 'lax', secure: 'auto', httpOnly: true },
+});
+const passportInitialize = passport.initialize();
+const passportSession = passport.session();
+app.use((req, res, next) =>
+  (isIP(req.hostname) !== 0 ? addressSessionMiddleware : sessionMiddleware)(req, res, next)
 );
-app.use(passport.initialize());
-app.use(passport.session());
+app.use(passportInitialize);
+app.use(passportSession);
+// A banned or deleted player is signed out on their next request.
+app.use(blockedViewerMiddleware(PLAYER_COOKIE_NAME, getRealViewerSteamId));
+// An unpaid license past its grace period stops the platform (middleware/licenseExpired.ts).
+app.use((req, res, next) => void licenseExpiredMiddleware(req, res, next));
+
+/** Paths the client polls on a timer; see the request logger below. */
+const POLLED_ENDPOINTS = new Set(['/api/auth/me']);
 
 // Request logging middleware
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -150,7 +243,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     }
 
     const duration = Date.now() - start;
-    const { method, path } = req;
+    const { method } = req;
+    // Discord IDs in lookup URLs are private; log them abbreviated.
+    const path = redactDiscordIdsInPath(req.path);
     const { statusCode } = res;
 
     // Skip logging 304 (Not Modified) responses to reduce noise
@@ -163,11 +258,18 @@ app.use((req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
+    // Endpoints the client polls constantly. Successful calls to them say
+    // nothing and drown the log, so they only get a debug line; anything that
+    // actually failed still logs at warn/error below.
+    const isPolledEndpoint = POLLED_ENDPOINTS.has(path);
+
     // Log with appropriate level based on status code
     if (statusCode >= 500) {
       log.error(`${method} ${path}`, undefined, { statusCode, duration });
     } else if (statusCode >= 400) {
       log.warn(`${method} ${path}`, { statusCode, duration });
+    } else if (isPolledEndpoint) {
+      log.debug(`[HTTP] ${method} ${path} -> ${statusCode}`, { statusCode, duration });
     } else {
       log.request(method, path, statusCode);
     }
@@ -177,22 +279,36 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // Swagger Documentation
-// swagger-ui-express types don't perfectly match Express middleware types
+//
+// The static assets first, from the copy the image ships (see
+// `SWAGGER_UI_DIR`). `swagger-ui-express` would serve these itself out of
+// `node_modules/swagger-ui-dist`, which the release image does not have —
+// the backend is a single esbuild bundle. Without this the page loads and
+// its stylesheet and script come back as the SPA's index.html, which renders
+// as nothing at all.
+//
+// Running from source the directory is absent, this is a no-op, and
+// `swaggerUi.serve` below answers exactly as it always did.
+if (fs.existsSync(SWAGGER_UI_DIR)) {
+  app.use('/api-docs', express.static(SWAGGER_UI_DIR, { fallthrough: true }));
+}
+
+// swagger-ui-express is typed against its own nested copy of @types/express.
+/* eslint-disable no-restricted-syntax -- the same handlers under two copies of Express's types */
 app.use(
   '/api-docs',
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ...(swaggerUi.serve as any),
-  swaggerUi.setup(swaggerSpec, {
+  ...(swaggerUi.serve as unknown as RequestHandler[]),
+  swaggerUi.setup(getOpenApiSpec(), {
     customCss: '.swagger-ui .topbar { display: none }',
-    customSiteTitle: 'MatchZy API Docs',
-  }) as // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  any
+    customSiteTitle: 'Auto Tournament API',
+  }) as unknown as RequestHandler
 );
+/* eslint-enable no-restricted-syntax */
 
 // Swagger JSON
 app.get('/api-docs.json', (_req: Request, res: Response) => {
   res.setHeader('Content-Type', 'application/json');
-  res.send(swaggerSpec);
+  res.send(getOpenApiSpec());
 });
 
 /**
@@ -209,7 +325,7 @@ app.get('/api-docs.json', (_req: Request, res: Response) => {
  */
 app.get('/', (_req: Request, res: Response) => {
   res.json({
-    message: 'MatchZy Auto Tournament API',
+    message: 'Auto Tournament API',
     version: packageJson.version,
     status: 'running',
     documentation: {
@@ -261,7 +377,8 @@ app.get('/', (_req: Request, res: Response) => {
         note: 'Match management - webhooks auto-configured on load',
         list: 'GET /api/matches (auth required)',
         get: 'GET /api/matches/:slug (auth required)',
-        getConfig: 'GET /api/matches/:slug.json (public - for MatchZy)',
+        getConfig:
+          'GET /api/matches/:slug.json (X-Auto-Tournament-Token or admin auth required - for MatchZy Enhanced)',
         create: 'POST /api/matches (auth required)',
         load: 'POST /api/matches/:slug/load (auth required, webhooks auto-configured)',
         loadNoWebhook: 'POST /api/matches/:slug/load?skipWebhook=true (skip webhook setup)',
@@ -269,8 +386,8 @@ app.get('/', (_req: Request, res: Response) => {
         delete: 'DELETE /api/matches/:slug (auth required)',
       },
       events: {
-        note: 'MatchZy event webhooks - receive game events',
-        webhook: 'POST /api/events (server token required)',
+        note: 'MatchZy Enhanced event webhooks - receive game events',
+        webhook: 'POST /api/events (X-Auto-Tournament-Token required)',
         getEvents: 'GET /api/events/:matchSlug (auth required)',
       },
       settings: {
@@ -308,6 +425,11 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
+    // Seconds this process has been running. A drop means the API restarted,
+    // which is the difference between "survived an error" and "crashed and
+    // came back" — indistinguishable from the outside otherwise, since the
+    // container restarts in a couple of seconds.
+    uptime: Math.floor(process.uptime()),
   });
 });
 
@@ -324,74 +446,50 @@ app.get('/health', (_req: Request, res: Response) => {
  *         description: Fleet snapshot
  */
 app.get('/api/health/fleet', async (_req: Request, res: Response) => {
-  const now = Math.floor(Date.now() / 1000);
-  const servers = await serverService.getAllServers(true);
-
-  const enabled = servers.filter((s) => s.enabled === 1 && s.host !== '0.0.0.0');
-  const outdated = enabled.filter((s) => typeof s.cs2_required_version === 'number');
-  const stale = enabled.filter((s) => !s.cs2_update_checked_at || now - s.cs2_update_checked_at >= 30 * 60);
-  const neverChecked = enabled.filter((s) => !s.cs2_update_checked_at);
+  // Each game integration adds its own block (CS2: `cs2Fleet` and `servers`).
+  const contributions: object = {};
+  for (const integration of listIntegrations()) {
+    if (integration.healthContributions) {
+      Object.assign(contributions, await integration.healthContributions());
+    }
+  }
 
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    cs2Fleet: {
-      enabled: enabled.length,
-      outdated: outdated.length,
-      stale: stale.length,
-      neverChecked: neverChecked.length,
-    },
-    servers: enabled.map((s) => ({
-      id: s.id,
-      name: s.name,
-      status: s.status ?? null,
-      lastSeen: s.last_seen ?? null,
-      cs2BuildId: s.cs2_build_id ?? null,
-      cs2RequiredVersion: s.cs2_required_version ?? null,
-      cs2UpdatePhase: s.cs2_update_phase ?? null,
-      cs2UpdateRequiredAt: s.cs2_update_required_at ?? null,
-      cs2UpdateCheckedAt: s.cs2_update_checked_at ?? null,
-      cs2VersionFetchedAt: s.cs2_version_fetched_at ?? null,
-    })),
+    ...contributions,
   });
 });
 
-// API Routes
-app.use('/api/servers', serverBootstrapRoutes);
-app.use('/api/servers', serverRoutes);
-app.use('/api/servers', serverStatusRoutes); // Mount status routes under /api/servers
-app.use('/api/teams', teamRoutes);
-app.use('/api/rcon', rconRoutes);
-app.use('/api/matches', matchRoutes);
-app.use('/api/events', eventRoutes);
-app.use('/api/steam', steamRoutes);
-app.use('/api/tournament', tournamentRoutes);
-app.use('/api/demos', demoRoutes);
-app.use('/api/logs', logsRoutes);
-app.use('/api/team', teamMatchRoutes); // Public team match data
-app.use('/api/team', teamStatsRoutes); // Public team stats/history
-app.use('/api/veto', vetoRoutes); // Map veto system
-app.use('/api/settings', settingsRoutes);
-app.use('/api/maps', mapsRoutes);
-app.use('/api/map-pools', mapPoolsRoutes);
-app.use('/api/templates', templatesRoutes); // Tournament templates
-app.use('/api/manual-match-templates', manualMatchTemplatesRoutes); // Manual match templates
-app.use('/api/recovery', recoveryRoutes); // Match recovery endpoints
-app.use('/api/players', playersRoutes); // Player management
-app.use('/api/elo-templates', eloTemplatesRoutes); // ELO calculation templates
-app.use('/api/generation', generationRoutes); // Shared name/code generators (e.g. team names)
-app.use('/api/test', testRoutes); // Test utilities (log markers, etc.)
-app.use('/api/auth', authRoutes); // Authentication (Steam, Keycloak, Discord)
-app.use('/api/matchzy', matchzyRoutes); // MatchZy Enhanced version info
+// API Routes.
+//
+// The mount table lives in routes/routeTable.ts so that the reference
+// generator can read it without starting a server. Order is significant —
+// see the note there.
+for (const { prefix, router } of routeTable) {
+  app.use(prefix, router);
+}
+
+// Legacy routes of code modules loaded from DATA_DIR/modules. They are added
+// to this router when the modules load, after the database is up, so it has to
+// be in place before the SPA and the 404 handler below.
+app.use(diskModuleRoutes);
+
+// Link previews: /og/<kind>/<key>.png cards, and the shareable pages' HTML
+// with their own Open Graph tags (Caddy sends those paths here).
+app.use(shareRoutes);
 
 // Serve frontend at /app (built client lives under api/public)
-const publicPath = path.join(__dirname, '..', 'public');
-app.use('/app', express.static(publicPath));
+app.use('/app', express.static(PUBLIC_DIR));
 
-// Serve map images statically
-app.use('/map-images', express.static(path.join(publicPath, 'map-images')));
+// Serve map images statically. MAP_IMAGES_DIR comes from config/publicPaths,
+// the single place both this static setup and the upload route
+// (integrations/cs2/maps/routes.ts) resolve it from -- see that module for
+// why, and for why it lives under DATA_DIR (the mounted volume) rather than
+// under PUBLIC_DIR (build output, wiped by every update).
+app.use('/map-images', express.static(MAP_IMAGES_DIR));
 app.get('/app/*', (_req: Request, res: Response) => {
-  res.sendFile(path.join(publicPath, 'index.html'));
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
 // 404 handler
@@ -404,23 +502,150 @@ app.use((_req: Request, res: Response) => {
 
 // Start server
 // Initialize Socket.io
-initializeSocket(httpServer);
+// The socket handshake gets the same session and Passport user as a request,
+// so `admin:subscribe` can check admin rights like `requireAuth` does.
+initializeSocket(httpServer, {
+  handshakeMiddleware: [
+    // Express middleware runs on the handshake request as it is; only the types differ.
+    // eslint-disable-next-line no-restricted-syntax -- express RequestHandler vs socket.io handshake types
+    sessionMiddleware as unknown as HandshakeMiddleware,
+    // eslint-disable-next-line no-restricted-syntax -- as above
+    passportInitialize as unknown as HandshakeMiddleware,
+    // eslint-disable-next-line no-restricted-syntax -- as above
+    passportSession as unknown as HandshakeMiddleware,
+  ],
+});
 
 // Cleanup old event logs (keep last 30 days)
 cleanupOldLogs(30);
 
+// A rejected promise with no catch is fatal in Node by default, so a single
+// stray background task can take the whole tournament server down mid-match.
+// This was not hypothetical: a background settings read rejected with
+// `relation "app_settings" does not exist` and killed the process, after
+// which Caddy served 502 for every request.
+//
+// A rejection is not evidence that the process state is corrupt, so log it
+// loudly and keep serving.
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  log.error(`[FATAL-GUARD] Unhandled promise rejection: ${err.message}`);
+  if (err.stack) log.error(err.stack);
+});
+
+// An uncaught exception is different: it unwound the stack somewhere
+// arbitrary, so continuing risks acting on corrupt state. Log it and let the
+// container restart us.
+process.on('uncaughtException', (err) => {
+  log.error(`[FATAL] Uncaught exception, shutting down: ${err.message}`);
+  if (err.stack) log.error(err.stack);
+  process.exit(1);
+});
+
 // Initialize database and start server
-(async () => {
+void (async () => {
   try {
     // Initialize database first (including schema)
     await db.init();
     log.success('Database initialized successfully');
 
+    // Music an earlier beta downloaded by itself, gone (bring your own now).
+    void import('./services/highlights/music')
+      .then((m) => m.removeDownloadedCatalogue())
+      .catch(() => undefined);
+
+    // Which tournament is featured (services/currentTournament.ts), kept fresh.
+    await refreshCurrentTournamentId();
+    startCurrentTournamentRefresh();
+
+    // Sign-in providers saved on Settings -> Sign-in. The strategies were
+    // registered from the environment alone at import; redo them now that
+    // the saved settings can be read.
+    try {
+      await authProviderSettingsService.load();
+      // Provider env vars are copied into empty fields once; from then on
+      // the database (Settings -> Sign-in) is the source of truth.
+      await authProviderSettingsService.importFromEnvironment();
+      reloadPassportAuth();
+    } catch (error) {
+      log.warn('[SIGN-IN] Could not load the saved sign-in settings', { error });
+    }
+
+    // Admin Steam IDs / emails (imported once from ADMIN_STEAM_IDS /
+    // ADMIN_EMAILS), applied before deciding whether this install still
+    // needs its first admin. Never throws.
+    await adminAccessSettings.importFromEnvironmentAndSeed();
+    // No admin yet: log a one-time setup code for /setup. Never throws.
+    await localAdminService.announceSetupCodeIfNeeded(
+      process.env.FRONTEND_BASE_URL?.trim() || getBackendBaseUrl()
+    );
+
+    // Code modules an operator put in DATA_DIR/modules: each enabled,
+    // compatible one is loaded and registered next to the built-ins. After the
+    // database, which holds which ones are enabled; before the packs and the
+    // integrations' start(), which read the registry. Never throws: a broken
+    // module is recorded as broken, and the platform boots without it.
+    // Catalog installs the last run did not finish are swept first; updates
+    // that waited for this restart are kept if they loaded and rolled back
+    // if they did not (DESIGN-modules §10.7).
+    await sweepStaging();
+    await restoreInterruptedSwaps();
+    // Extra signing keys from the environment trust code the platform does
+    // not vouch for. Said at every boot, by id, so it is never a surprise.
+    const envKeys = environmentTrustedKeys();
+    if (envKeys.keys.length > 0) {
+      log.warn(
+        `[MODULES] MODULE_TRUSTED_KEYS: code modules signed by ${envKeys.keys.length} key(s) this platform does not ship are trusted too: ` +
+          envKeys.keys.map((key) => key.keyId).join(', ')
+      );
+    }
+    if (envKeys.malformed > 0) {
+      log.warn(
+        `[MODULES] MODULE_TRUSTED_KEYS: ${envKeys.malformed} entry(ies) are not base64 Ed25519 public keys and were ignored`
+      );
+    }
+    // Code modules' server halves reach core through this (hostBridge.ts).
+    installHostBridge();
+    // An install with CS2 data (a 2.x upgrade) gets CS2 from the image's
+    // offline snapshot before the scan loads it, so its tournaments keep
+    // working now that CS2 is a catalog module. Logged; never throws.
+    await autoInstallCs2ForExistingData();
+    // A newer image carries newer module releases: modules installed from
+    // the snapshot or the catalog move to the snapshot's newest one within
+    // their major version, before the scan loads them. Logged; never throws.
+    // MODULE_AUTO_UPDATE=false turns it off.
+    await autoUpdateModulesFromSnapshot();
+    await scanDiskModules();
+    await finishPendingUpdates();
+
+    // The games this instance can run: packs the image ships are kept up to
+    // date where installed (none is installed on its own; PREINSTALL_PACKS
+    // can ask for some), then everything in game_packs is loaded into the
+    // cache the catalogue reads. The catalogue call is synchronous, so the
+    // packs cannot come from a query at that point. See seedBundledPacks.
+    await seedBundledPacks();
+
+    // AT_ACCEPT_LICENSE / LICENSE_KEY: a non-interactive install accepts the
+    // license terms and saves its key here. Logged; never throws, never
+    // blocks the boot (services/license/consent.ts).
+    await applyLicenseEnvironment();
+
     // Now start the server after database is ready
     // Bind to all interfaces (IPv4 & IPv6) so both 127.0.0.1 and ::1 work with dev proxies.
     const server = httpServer.listen(Number(PORT), () => {
+      // Admins hear about module and pack updates, and ones that did not take.
+      startModuleUpdateNotices();
+      // The demo worker inside the image (services/builtinWorker.ts).
+      // Start times: reminders before, and the automatic start (tournamentSchedule.ts).
+      void import('./services/matchTimes').then(({ startMatchTimes }) => startMatchTimes());
+      void import('./services/tournamentSchedule').then(({ startTournamentSchedule }) =>
+        startTournamentSchedule(Number(PORT))
+      );
+      void import('./services/builtinWorker').then(({ startBuiltinWorker }) =>
+        startBuiltinWorker(Number(PORT))
+      );
       log.server('='.repeat(60));
-      log.server('MatchZy Auto Tournament API');
+      log.server('Auto Tournament API');
       log.server('='.repeat(60));
       log.server(`Server running on port ${PORT}`);
       log.server(`Listening on: all interfaces (IPv4 & IPv6)`);
@@ -460,53 +685,119 @@ cleanupOldLogs(30);
       log.server(`  Health:     ${protocol}://localhost:${PORT}/health`);
       log.server('');
       log.server(`WebSocket: Enabled`);
-      log.server(`Event logs: api/data/logs/events/ (30 day retention)`);
+      log.server(`Event logs: ${path.join(DATA_DIR, 'logs', 'events')} (30 day retention)`);
       log.server('='.repeat(60));
 
-      // Bootstrap webhooks, recover matches, fetch MatchZy version (now database is ready)
-      Promise.all([
-        bootstrapServerWebhooks().catch((error) => {
-          log.warn('Failed to auto-configure server webhooks on startup', { error });
-        }),
+      // API tokens made in Settings, next to the env ones (services/apiTokenService).
+      void import('./services/apiTokenService')
+        .then(({ apiTokenService }) => apiTokenService.load())
+        .then(() => reportServiceTokens())
+        .catch((error) =>
+          log.warn('[Startup] Could not load the API tokens made in Settings', { error })
+        );
+      reportEventAuth();
+      reportCompatConfig();
+      // Ready Up compatibility, pulled from COMPAT_FEED_URL every 5 minutes
+      // (a no-op without it). Never throws; failures keep the last good run.
+      startCompatFeed();
+      // Integrator webhooks: the persisted delivery queue and the match
+      // watcher (services/webhooks). Idle while no endpoint is switched on.
+      startWebhooks();
+      // The daily license check-in: only with a license key saved, in the
+      // background, never blocking anything (services/license/checkin.ts).
+      startLicenseCheckin();
+      // Friends see each other come and go; tournament check-ins reach the bell.
+      socialService.start();
+      startTournamentNotices();
+      startAdminNoticeSweep();
+      // Players with played matches and no games get those matches' game.
+      backfillPlayedGames()
+        .then((n) => n > 0 && log.info(`Added the played game to ${n} player(s)`))
+        .catch((error) => log.warn('Could not add played games', { error }));
+      // The admins' Steam warning follows the key (the `steam-health` topic).
+      steamService.startHealthWatch();
+      // Admins' holds and bracket pauses that end by themselves (services/matchHolds.ts).
+      startHoldTimer();
+      // Matchmaking's 2-second loop (services/matchmaking). Cancels lobbies a restart left open.
+      matchmakingService.start().catch((error) => {
+        log.warn('Failed to start matchmaking', { error });
+      });
+
+      // Recover matches and start the game integrations (CS2: bootstrap server
+      // webhooks, fetch the MatchZy Enhanced version, start health monitoring) now the
+      // database is ready.
+      void Promise.all([
+        ...listIntegrations().map((integration) =>
+          (integration.start?.() ?? Promise.resolve()).catch((error) => {
+            log.warn(`Failed to start the ${integration.id} integration`, { error });
+          })
+        ),
         recoverActiveMatches().catch((error) => {
           log.warn('Failed to recover active matches on startup', { error });
         }),
+        reportSteamApiKeyStatus().catch((error) => {
+          log.warn('Failed to check the Steam Web API key on startup', { error });
+        }),
+        // Best-effort, never blocks: gives built-in games (installed modules
+        // + the popular list) a real image/genres from Wikidata. See
+        // gameEnrichmentService for the once-per-7-days-per-game throttling
+        // and the CI/test opt-out.
+        enrichBuiltinGames()
+          // Then, without holding up startup, app icons for games no module
+          // or pack draws (Steam client icons; background, rate-limited, see
+          // gameIconService).
+          .then(() => refreshGameIcons())
+          .catch((error) => {
+            log.warn('Failed to enrich built-in games on startup', { error });
+          }),
       ]).then(() => {
         log.success('[Startup] All startup tasks completed');
-        
-        // Fetch latest MatchZy Enhanced version (fire-and-forget, cached for 1 hour)
-        initMatchZyVersionService();
-        
-        // Start health monitoring for server tracking
-        // Checks every minute to mark inactive servers as offline
-        healthMonitoringService.start();
       });
     });
 
     // Graceful shutdown handlers
-    process.on('SIGINT', () => {
-      log.warn('Received SIGINT, shutting down gracefully...');
-      matchAllocationService.stopAllPolling();
-      healthMonitoringService.stop();
-      server.close(() => {
-        db.close();
-        log.server('Server closed');
-        process.exit(0);
-      });
-    });
+    const stopIntegrations = () => {
+      for (const integration of listIntegrations()) {
+        integration.stop?.().catch((error) => {
+          log.warn(`Failed to stop the ${integration.id} integration`, { error });
+        });
+      }
+    };
 
-    process.on('SIGTERM', () => {
-      log.warn('Received SIGTERM, shutting down gracefully...');
-      matchAllocationService.stopAllPolling();
-      healthMonitoringService.stop();
+    let shuttingDown = false;
+    const shutDown = (why: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      log.warn(`${why}, shutting down gracefully...`);
+      scheduler.stopAllPolling();
+      stopCompatFeed();
+      stopWebhooks();
+      stopLicenseCheckin();
+      stopIntegrations();
+      void import('./services/builtinWorker').then(({ stopBuiltinWorker }) => stopBuiltinWorker());
+      // Live sockets and idle keep-alive connections would hold the close.
+      getIO().disconnectSockets(true);
       server.close(() => {
         db.close();
         log.server('Server closed');
         process.exit(0);
       });
-    });
+      server.closeIdleConnections();
+      // Never hang: a stuck connection must not keep the old process alive.
+      setTimeout(() => process.exit(0), 10_000).unref();
+    };
+
+    process.on('SIGINT', () => shutDown('Received SIGINT'));
+    process.on('SIGTERM', () => shutDown('Received SIGTERM'));
+    // "Restart now" on the Modules page: exit, and Docker's restart policy
+    // starts the new process (utils/restart.ts).
+    registerShutdown((reason) => shutDown(`Restart: ${reason}`));
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
+    if (error instanceof DatabaseRenameRefused) {
+      log.error(`[PostgreSQL] Not starting: ${error.message}`);
+      process.exit(1);
+    }
     log.error('Failed to initialize database', err);
 
     const msg = typeof err?.message === 'string' ? err.message : '';
@@ -535,108 +826,97 @@ cleanupOldLogs(30);
   }
 })();
 
-async function bootstrapServerWebhooks(): Promise<void> {
-  const serverToken = process.env.SERVER_TOKEN;
-  if (!serverToken) {
-    log.warn('SERVER_TOKEN is not set. Skipping automatic webhook bootstrap.');
+/**
+ * Report the state of the Steam Web API key once, at startup.
+ *
+ * The health check already classifies a missing key, a rejected key and an
+ * unreachable Steam, but nothing ran it until something happened to need
+ * Steam — so an operator who started the container with a bad key saw a clean
+ * log and found out much later, if at all. That is the reported problem: a
+ * whole debugging session lost to a fake key, when one line at boot would have
+ * ended it.
+ *
+ * Never fatal. Steam is optional, and Steam being down is not a reason to
+ * refuse to start; the point is to say so plainly.
+ */
+async function reportSteamApiKeyStatus(): Promise<void> {
+  const health = await steamService.checkSteamWebApiHealth({ force: true });
+
+  if (health.ok) {
+    log.success('[Startup] Steam Web API key is valid');
     return;
   }
 
-  // Resolve webhook base URL from settings.
-  // Priority: 1) DB, 2) API_BASE_URL, 3) FRONTEND_BASE_URL, 4) http://localhost:{PORT}
-  const apiPort = parseInt(process.env.PORT || '3000', 10);
-  const localhostDefault = `http://localhost:${apiPort}`;
-  let baseUrl = await settingsService.getWebhookUrl();
-
-  const fromApi = process.env.API_BASE_URL?.trim();
-  const fromFrontend = process.env.FRONTEND_BASE_URL?.trim();
-
-  // If DB has localhost:PORT but FRONTEND_BASE_URL is set, treat as "wrong default" and fix it.
-  if (
-    baseUrl &&
-    (baseUrl === localhostDefault || baseUrl === 'http://localhost:3000') &&
-    fromFrontend &&
-    !fromApi
-  ) {
-    try {
-      await settingsService.setSetting('webhook_url', fromFrontend);
-      baseUrl = await settingsService.getWebhookUrl();
-      log.success(`Webhook URL updated from localhost default to FRONTEND_BASE_URL: ${baseUrl}`);
-    } catch (e) {
-      log.warn('Failed to update webhook URL from FRONTEND_BASE_URL', { error: e });
-    }
-  }
-
-  if (!baseUrl) {
-    const fallback = fromApi || fromFrontend || localhostDefault;
-    const source = fromApi ? 'API_BASE_URL' : fromFrontend ? 'FRONTEND_BASE_URL' : 'auto-detect (PORT)';
-    try {
-      await settingsService.setSetting('webhook_url', fallback);
-      baseUrl = await settingsService.getWebhookUrl();
-      log.success(`Webhook URL initialized from ${source}: ${baseUrl}`);
-      if (source === 'auto-detect (PORT)') {
-        log.warn(
-          'Webhook URL was not configured; auto-detected from PORT. ' +
-            'Set API_BASE_URL or FRONTEND_BASE_URL in .env, or update in Settings, if your API is elsewhere.'
-        );
-      }
-    } catch (error) {
+  switch (health.errorType) {
+    case 'not_configured':
       log.warn(
-        'Failed to set webhook URL; skipping automatic webhook bootstrap. ' +
-          'Set API_BASE_URL or FRONTEND_BASE_URL in .env or configure in Settings.',
-        { error }
+        '[Startup] No Steam Web API key. Steam features (avatars, name lookups, ' +
+          'Steam sign-in) are disabled. Get a key at https://steamcommunity.com/dev/apikey ' +
+          'and enter it on Settings -> Sign-in, or set STEAM_API_KEY.'
       );
-      return;
-    }
+      break;
+    case 'invalid_key':
+      log.error(
+        '[Startup] STEAM_API_KEY was rejected by Steam' +
+          (health.statusCode ? ` (HTTP ${health.statusCode})` : '') +
+          '. The key is set but not valid, so Steam features will fail. ' +
+          'Check it at https://steamcommunity.com/dev/apikey.'
+      );
+      break;
+    case 'unreachable':
+      log.warn(
+        `[Startup] Could not reach the Steam Web API to verify STEAM_API_KEY (${health.error}). ` +
+          'This may be temporary; the key will be re-checked when it is next used.'
+      );
+      break;
+    default:
+      log.warn(`[Startup] STEAM_API_KEY could not be verified: ${health.error ?? 'unknown error'}`);
+  }
+}
+
+/**
+ * Say what machine access is configured, at boot.
+ *
+ * A service token that was rejected at parse time (too short, duplicated)
+ * otherwise fails silently: nothing complains until the integration's first
+ * call comes back 401, by which point the person debugging it is looking at
+ * the bot rather than at the env var they typo'd.
+ */
+function reportServiceTokens(): void {
+  const { tokens, problems } = getServiceTokens();
+
+  for (const problem of problems) {
+    log.warn(`[Startup] ${problem}`);
   }
 
-  const enabledServers = await serverService.getAllServers(true);
-  if (enabledServers.length === 0) {
-    log.info('No enabled servers found for webhook bootstrap.');
+  if (tokens.length === 0) {
+    log.info(
+      '[Startup] No API tokens configured. Set API_TOKENS (full admin), ' +
+        'API_TOKENS_READONLY (GET only) or API_TOKENS_INTEGRATOR (integrations API only) to let bots and scripts call the admin ' +
+        'API without a browser session. See docs/API.md.'
+    );
     return;
   }
 
-  log.info(`[STARTUP] Checking ${enabledServers.length} enabled server(s)...`);
+  const described = tokens.map((t) => `${t.label} (${t.scope}, ${t.fingerprint})`).join(', ');
+  log.success(`[Startup] ${tokens.length} API token(s) active: ${described}`);
+}
 
-  // Process all servers concurrently for faster startup
-  await Promise.allSettled(
-    enabledServers.map(async (serverInfo) => {
-      try {
-        // Quick RCON ping to check if server is reachable
-        const statusResult = await rconService.sendCommand(serverInfo.id, 'status');
-        if (!statusResult.success) {
-          log.warn(`[STARTUP] ${serverInfo.id}: Unreachable (${statusResult.error})`);
-          return;
-        }
+/**
+ * Say when game event ingest is running without authentication.
+ *
+ * ALLOW_UNAUTHENTICATED_EVENTS is a migration shim for servers configured
+ * before the webhook token was enforced. Left on, it means anyone who can
+ * reach this API can forge match events, so it should be loud every boot
+ * rather than something an operator sets once and forgets.
+ */
+function reportEventAuth(): void {
+  if (!allowUnauthenticatedEvents()) return;
 
-        const needsInit = !serverInfo.persistentConfigSent;
-        const needsRetry = !!serverInfo.persistentConfigSent && !serverInfo.lastSeen;
-
-        if (needsInit || needsRetry) {
-          // Server needs (re)configuration
-          await serverInitializationService.initializeServer(serverInfo.id, baseUrl, {
-            force: needsRetry,
-          });
-          log.success(
-            `[STARTUP] ${serverInfo.id}: ${needsInit ? 'Configured' : 'Retry sent'} – waiting for MatchZy events`
-          );
-        } else {
-          // Server is already configured and has sent events - just log status
-          const timeSinceLastSeen = serverInfo.lastSeen
-            ? Math.floor(Date.now() / 1000) - serverInfo.lastSeen
-            : null;
-          
-          if (timeSinceLastSeen !== null && timeSinceLastSeen < 300) {
-            log.info(`[STARTUP] ${serverInfo.id}: Online (last event ${timeSinceLastSeen}s ago)`);
-          } else {
-            log.info(`[STARTUP] ${serverInfo.id}: Configured but inactive (${timeSinceLastSeen ? `${timeSinceLastSeen}s` : 'never'} since last event)`);
-          }
-        }
-      } catch (error) {
-        log.warn(`[STARTUP] ${serverInfo.id}: Check failed`, { error });
-      }
-    })
+  log.warn(
+    '[Startup] ALLOW_UNAUTHENTICATED_EVENTS is set: game events with no ' +
+      'X-Auto-Tournament-Token are accepted. Anyone who can reach this API can forge match ' +
+      'events. Reconnect your servers so they re-fetch their webhook config, then ' +
+      'unset this.'
   );
-
-  log.success(`[STARTUP] Server initialization complete`);
 }

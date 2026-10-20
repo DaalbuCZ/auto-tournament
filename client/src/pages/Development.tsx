@@ -1,3 +1,4 @@
+import { pageTitle } from '../utils/pageTitle';
 import React, { useState } from 'react';
 import {
   Card,
@@ -20,19 +21,20 @@ import {
   TextField,
 } from '@mui/material';
 import {
-  Group as GroupIcon,
-  Storage as StorageIcon,
-  Delete as DeleteIcon,
-  ExpandMore as ExpandMoreIcon,
-  DeleteForever as DeleteForeverIcon,
-  Warning as WarningIcon,
-  Person as PersonIcon,
-} from '@mui/icons-material';
+  CaretDownIcon,
+  HardDrivesIcon,
+  TrashIcon,
+  UserIcon,
+  UsersIcon,
+  WarningIcon,
+} from '@phosphor-icons/react';
 import { api } from '../utils/api';
 import { useSnackbar } from '../contexts/SnackbarContext';
 import { generateTeamName } from '../generation/teamName';
 import { generatePlayerProfile } from '../generation/playerProfile';
+import { generateDiscordId } from '../generation/discordId';
 import { useTranslation } from 'react-i18next';
+import { PageHead } from '../components/common/ui';
 
 const Development: React.FC = () => {
   const [loading, setLoading] = useState(false);
@@ -46,7 +48,7 @@ const Development: React.FC = () => {
   const { t } = useTranslation();
 
   // Set dynamic page title
-  document.title = t('layout.pageTitle.devTools');
+  document.title = pageTitle(t('layout.pageTitle.devTools'));
 
   const handleCreateTestTeams = async (count: number) => {
     setLoading(true);
@@ -56,7 +58,8 @@ const Development: React.FC = () => {
         id: string;
         name: string;
         tag: string;
-        players: Array<{ steamId: string; name: string; avatar?: string }>;
+        discordRoleId: string;
+        players: Array<{ steamId: string; name: string; avatar?: string; discordId: string }>;
       }> = [];
 
       const slugify = (value: string) =>
@@ -82,6 +85,9 @@ const Development: React.FC = () => {
               .replace(/[^\p{L}\p{N}]/gu, '')
               .substring(0, 3)
               .toUpperCase() || 'TST',
+          // The Discord role a real roster would be tied to, so anything
+          // mapping teams to roles has something to map.
+          discordRoleId: generateDiscordId(),
           players: Array.from({ length: 5 }, (_, playerIndex) => {
             const globalIndex = i * 5 + playerIndex;
             const uniquePart = String(baseTimestamp + globalIndex)
@@ -94,6 +100,9 @@ const Development: React.FC = () => {
             return {
               steamId,
               name: profile.fullName,
+              // Rosters are imported from signup sheets that carry these, and
+              // a bot looking a player up by Discord ID needs them to exist.
+              discordId: generateDiscordId(),
             };
           }),
         });
@@ -207,6 +216,7 @@ const Development: React.FC = () => {
       const players: Array<{
         id: string; // Steam ID
         name: string;
+        discordId: string;
       }> = [];
 
       // Generate unique Steam IDs
@@ -230,6 +240,10 @@ const Development: React.FC = () => {
         players.push({
           id: steamId,
           name,
+          // So `GET /api/players/by-discord-id/:id` has something to find on
+          // a fresh instance. Imports only ever fill a blank, so this never
+          // overwrites an ID somebody set by hand.
+          discordId: generateDiscordId(),
         });
       }
 
@@ -250,10 +264,9 @@ const Development: React.FC = () => {
           );
         } else {
           showSuccess(
-            t('devToolsPage.testPlayers.success', {
-              created,
-              updated,
-            })
+            updated > 0
+              ? t('devToolsPage.testPlayers.successWithUpdated', { created, updated })
+              : t('devToolsPage.testPlayers.success', { created })
           );
         }
       } else {
@@ -398,6 +411,7 @@ const Development: React.FC = () => {
 
   return (
     <Box sx={{ width: '100%', height: '100%' }}>
+      <PageHead title={t('layout.pageTitle.devTools')} />
       <Alert severity="warning" sx={{ mb: 3 }}>
         {t('devToolsPage.alert')}
       </Alert>
@@ -415,7 +429,7 @@ const Development: React.FC = () => {
           <Card>
             <CardContent>
               <Box display="flex" alignItems="center" gap={1} mb={2}>
-                <GroupIcon color="primary" />
+                <Box component={UsersIcon} sx={{ color: 'primary.main' }} />
                 <Typography variant="h6" fontWeight={600}>
                   {t('devToolsPage.testTeams.title')}
                 </Typography>
@@ -509,7 +523,7 @@ const Development: React.FC = () => {
           <Card>
             <CardContent>
               <Box display="flex" alignItems="center" gap={1} mb={2}>
-                <PersonIcon color="primary" />
+                <Box component={UserIcon} sx={{ color: 'primary.main' }} />
                 <Typography variant="h6" fontWeight={600}>
                   {t('devToolsPage.testPlayers.title')}
                 </Typography>
@@ -605,7 +619,7 @@ const Development: React.FC = () => {
           <Card>
             <CardContent>
               <Box display="flex" alignItems="center" gap={1} mb={2}>
-                <StorageIcon color="primary" />
+                <Box component={HardDrivesIcon} sx={{ color: 'primary.main' }} />
                 <Typography variant="h6" fontWeight={600}>
                   {t('devToolsPage.testServers.title')}
                 </Typography>
@@ -701,7 +715,7 @@ const Development: React.FC = () => {
           <Card sx={{ borderColor: 'error.main', borderWidth: 2, borderStyle: 'solid' }}>
             <CardContent>
               <Box display="flex" alignItems="center" gap={1} mb={2}>
-                <WarningIcon color="error" />
+                <Box component={WarningIcon} sx={{ color: 'error.main' }} />
                 <Typography variant="h6" fontWeight={600} color="error">
                   {t('devToolsPage.dangerZone.title')}
                 </Typography>
@@ -710,9 +724,9 @@ const Development: React.FC = () => {
 
               {/* Delete Test Data */}
               <Accordion>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <AccordionSummary expandIcon={<CaretDownIcon />}>
                   <Box display="flex" alignItems="center" gap={1}>
-                    <DeleteIcon />
+                    <TrashIcon />
                     <Typography fontWeight={600}>
                       {t('devToolsPage.deleteTestData.title')}
                     </Typography>
@@ -727,7 +741,7 @@ const Development: React.FC = () => {
                     color="error"
                     onClick={handleDeleteAllTestData}
                     disabled={loading || wiping}
-                    startIcon={<DeleteIcon />}
+                    startIcon={<TrashIcon />}
                   >
                     {loading ? (
                       <CircularProgress size={24} />
@@ -740,9 +754,9 @@ const Development: React.FC = () => {
 
               {/* Wipe Specific Tables */}
               <Accordion>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <AccordionSummary expandIcon={<CaretDownIcon />}>
                   <Box display="flex" alignItems="center" gap={1}>
-                    <StorageIcon />
+                    <HardDrivesIcon />
                     <Typography fontWeight={600}>
                       {t('devToolsPage.wipeTable.title')}
                     </Typography>
@@ -994,9 +1008,9 @@ const Development: React.FC = () => {
 
               {/* Wipe Entire Database */}
               <Accordion>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                <AccordionSummary expandIcon={<CaretDownIcon />}>
                   <Box display="flex" alignItems="center" gap={1}>
-                    <DeleteForeverIcon />
+                    <TrashIcon />
                     <Typography fontWeight={600}>
                       {t('devToolsPage.wipeDatabase.title')}
                     </Typography>
@@ -1037,7 +1051,7 @@ const Development: React.FC = () => {
                     color="error"
                     onClick={() => setConfirmWipeOpen(true)}
                     disabled={loading || wiping}
-                    startIcon={<DeleteForeverIcon />}
+                    startIcon={<TrashIcon />}
                     fullWidth
                   >
                     {wiping ? (
@@ -1061,7 +1075,7 @@ const Development: React.FC = () => {
         fullWidth
       >
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-          <WarningIcon color="error" />
+          <Box component={WarningIcon} sx={{ color: 'error.main' }} />
           {t('devToolsPage.wipeDatabase.dialog.title')}
         </DialogTitle>
         <DialogContent>
@@ -1091,7 +1105,7 @@ const Development: React.FC = () => {
             disabled={wiping}
             variant="contained"
             color="error"
-            startIcon={<DeleteForeverIcon />}
+            startIcon={<TrashIcon />}
             autoFocus
           >
             {wiping

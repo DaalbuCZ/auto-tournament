@@ -9,12 +9,24 @@ export interface Player {
   name: string;
   avatar?: string;
   elo?: number; // Optional ELO rating (defaults to 1500 Skill Rating if not specified)
+  /**
+   * Discord user ID (17–20 digit string), looked up from the player record by the
+   * admin team endpoints. Contact data only; never part of the stored roster.
+   */
+  discordId?: string | null;
+  /**
+   * The member's role in the team (`team_members`), on the public team
+   * endpoint's roster. Absent when the player has no account row yet.
+   */
+  role?: 'owner' | 'captain' | 'member';
 }
 
 export interface Team {
   id: string;
   name: string;
   tag?: string;
+  /** The team's uploaded crest, when it has one. */
+  logoUrl?: string | null;
   discordRoleId?: string;
   players?: Player[];
   createdAt?: number;
@@ -44,6 +56,8 @@ export interface TeamMatchVetoSummary {
 
 export interface TeamMatchInfo {
   slug: string;
+  /** Game integration that owns it (API `game`, 'cs2' today). */
+  game?: string;
   round: number;
   matchNumber: number;
   status: 'pending' | 'ready' | 'loaded' | 'live' | 'completed';
@@ -78,30 +92,45 @@ export interface TeamMatchInfo {
   mapResults: MatchMapResult[];
   matchFormat: string;
   loadedAt?: number;
+  /** Held until then (unix s): the break before its veto, or an admin's hold. */
+  heldUntil?: number | null;
+  /**
+   * NOTE: this mirrors `MatchConfig` in match.types.ts rather than reusing it,
+   * and the two have already drifted — `cvars` was missing here while callers
+   * read it. Worth collapsing into the shared type.
+   */
   config?: {
     // Core player / team counts
     players_per_team?: number;
+    /** The match has no map veto (the tournament draws its maps). */
+    vetoDisabled?: boolean;
     expected_players_total?: number;
     expected_players_team1?: number;
     expected_players_team2?: number;
+    /** Bots take the empty seats (cs2 fillTeamsWithBots): nobody else is waited for. */
+    bot_fill?: boolean;
     // Series / map configuration
     num_maps?: number;
     maplist?: string[];
-    // Overtime / regulation configuration (mirrors MatchZy match JSON)
+    // Overtime / regulation configuration (mirrors MatchZy Enhanced match JSON)
     maxRounds?: number;
     overtimeMode?: 'enabled' | 'disabled';
     overtimeSegments?: number;
+    /** MatchZy Enhanced convars carried through from the generated match JSON. */
+    cvars?: {
+      [key: string]: string | number;
+    };
     team1?: {
       id?: string;
       name: string;
       tag?: string;
-      players?: Array<{ steamid: string; name: string }>;
+      players?: Array<{ steamid: string; name: string; avatar?: string }>;
     };
     team2?: {
       id?: string;
       name: string;
       tag?: string;
-      players?: Array<{ steamid: string; name: string }>;
+      players?: Array<{ steamid: string; name: string; avatar?: string }>;
     };
   };
   veto?: TeamMatchVetoSummary | null;
@@ -125,6 +154,8 @@ export interface MatchConnectionStatus {
 }
 
 export interface MatchLiveStats {
+  /** Seconds behind the players, when this viewer sees it as GOTV does (CS2). */
+  delaySeconds?: number;
   matchSlug: string;
   team1Score: number;
   team2Score: number;
@@ -175,10 +206,14 @@ export interface TeamMatchHistory {
   slug: string;
   round: number;
   matchNumber: number;
+  /** Chronological number, as on the matches page. */
+  globalMatchNumber?: number;
+  bracket?: string | null;
   opponent: Team | null;
   won: boolean;
   teamScore: number;
   opponentScore: number;
   completedAt: number;
+  /** The maps the series was played on, in order (empty when unknown). */
+  maps?: string[];
 }
-

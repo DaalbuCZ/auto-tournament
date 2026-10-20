@@ -17,21 +17,24 @@ import {
 } from '@mui/material';
 import { PlayerName } from '../player/PlayerName';
 import {
-  Close as CloseIcon,
-  CheckCircle as CheckCircleIcon,
-  Info as InfoIcon,
-  ExpandMore as ExpandMoreIcon,
-  ExpandLess as ExpandLessIcon,
-  OpenInNew as OpenInNewIcon,
-} from '@mui/icons-material';
-import Link from '@mui/material/Link';
+  CaretDownIcon,
+  CaretUpIcon,
+  CheckCircleIcon,
+  InfoIcon,
+  XIcon,
+} from '@phosphor-icons/react';
 import { useSnackbar } from '../../contexts/SnackbarContext';
 import { useTranslation } from 'react-i18next';
+import { NoDiscordChip } from '../player/NoDiscordChip';
+import { isValidDiscordId, normalizeDiscordId } from '../../utils/discordId';
+import { ExternalLink } from '../common/ExternalLink';
+import type { Untrusted } from '../../utils/untrusted';
 
 interface Player {
   name: string;
   steamId: string;
   elo?: number; // Optional ELO rating (defaults to 1500 Skill Rating if not specified)
+  discordId?: string; // Optional Discord user ID (17–20 digit string)
 }
 
 interface ImportTeam {
@@ -54,11 +57,14 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
   const [validationError, setValidationError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const [expandedTeams, setExpandedTeams] = useState<Set<number>>(new Set());
+  // Non-blocking problems found while parsing (e.g. an invalid Discord ID that was dropped).
+  const [importWarnings, setImportWarnings] = useState<string[]>([]);
 
   const handleClose = () => {
     setJsonInput('');
     setParsedTeams(null);
     setValidationError(null);
+    setImportWarnings([]);
     setExpandedTeams(new Set());
     onClose();
   };
@@ -101,9 +107,49 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
     return null;
   };
 
+  /**
+   * A bad Discord ID must not block the import: the player is still valid without
+   * one. Drop it from that player (mutates the parsed object) and explain why.
+   */
+  const sanitizeDiscordIds = (teams: ImportTeam[]): string[] => {
+    const warnings: string[] = [];
+    for (const team of teams) {
+      for (const player of team.players) {
+        if (!('discordId' in player)) continue;
+        const raw: Untrusted = (player as { discordId?: Untrusted }).discordId;
+        const normalized = normalizeDiscordId(raw);
+
+        if (isValidDiscordId(normalized)) {
+          player.discordId = normalized;
+          continue;
+        }
+
+        delete player.discordId;
+        if (raw === null || raw === undefined || (typeof raw === 'string' && !normalized)) {
+          // Blank / null: treat as "no Discord ID", nothing to warn about.
+          continue;
+        }
+        warnings.push(
+          typeof raw === 'number'
+            ? t('teamImportModal.warnings.discordIdNumber', {
+                team: team.name,
+                player: player.name,
+              })
+            : t('teamImportModal.warnings.discordIdInvalid', {
+                team: team.name,
+                player: player.name,
+                value: String(raw),
+              })
+        );
+      }
+    }
+    return warnings;
+  };
+
   const handlePreview = () => {
     setValidationError(null);
     setParsedTeams(null);
+    setImportWarnings([]);
 
     try {
       const parsed = JSON.parse(jsonInput);
@@ -127,6 +173,7 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
         }
       }
 
+      setImportWarnings(sanitizeDiscordIds(parsed));
       setParsedTeams(parsed);
     } catch (err) {
       setValidationError(
@@ -145,13 +192,16 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
       await onImport(parsedTeams);
       handleClose();
     } catch (err) {
-      showError(
-        err instanceof Error ? err.message : t('teamImportModal.errors.importFailed')
-      );
+      showError(err instanceof Error ? err.message : t('teamImportModal.errors.importFailed'));
     } finally {
       setImporting(false);
     }
   };
+
+  const missingDiscordTotal = (parsedTeams ?? []).reduce(
+    (sum, team) => sum + team.players.filter((p) => !p.discordId).length,
+    0
+  );
 
   const toggleTeamExpanded = (index: number) => {
     const newExpanded = new Set(expandedTeams);
@@ -171,7 +221,7 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
             {t('teamImportModal.title')}
           </Typography>
           <IconButton onClick={handleClose} size="small">
-            <CloseIcon />
+            <XIcon />
           </IconButton>
         </Box>
       </DialogTitle>
@@ -187,10 +237,8 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
               {t('teamImportModal.info.format')}
             </Typography>
             <Typography variant="caption" component="div" sx={{ mt: 1 }}>
-              <Link
-                href="https://docs.sivert.io/docs/mat/user/teams#bulk-import-json"
-                target="_blank"
-                rel="noopener noreferrer"
+              <ExternalLink
+                href="https://docs.autotournament.gg/guides/teams-and-players#import-teams"
                 sx={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -200,8 +248,7 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
                 }}
               >
                 {t('teamImportModal.info.link')}
-                <OpenInNewIcon sx={{ fontSize: '0.875rem' }} />
-              </Link>
+              </ExternalLink>
             </Typography>
           </Alert>
 
@@ -212,11 +259,12 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
             rows={12}
             value={jsonInput}
             onChange={(e) => setJsonInput(e.target.value)}
-            placeholder={`[\n  {\n    "name": "Team Name",\n    "tag": "TN",\n    "players": [\n      {\n        "name": "Player 1",\n        "steamId": "76561198123456789"\n      }\n    ]\n  }\n]`}
+            placeholder={`[\n  {\n    "name": "Team Name",\n    "tag": "TN",\n    "players": [\n      {\n        "name": "Player 1",\n        "steamId": "76561198123456789",\n        "discordId": "123456789012345678"\n      },\n      {\n        "name": "Player 2",\n        "steamId": "76561198123456790"\n      }\n    ]\n  }\n]`}
             fullWidth
             disabled={importing}
             error={!!validationError}
             helperText={validationError}
+            slotProps={{ htmlInput: { 'data-testid': 'team-import-json-input' } }}
             sx={{
               '& .MuiInputBase-input': {
                 fontFamily: 'monospace',
@@ -231,82 +279,139 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
               <Alert severity="success" icon={<CheckCircleIcon />} sx={{ mb: 2 }}>
                 <Typography variant="body2">
                   {t('teamImportModal.preview.summary', {
-                    teamCount: parsedTeams.length,
-                    playerCount: parsedTeams.reduce((sum, t) => sum + t.players.length, 0),
+                    teams: t('teamImportModal.preview.teamsCount', { count: parsedTeams.length }),
+                    players: t('teamImportModal.preview.playersChip', {
+                      count: parsedTeams.reduce((sum, team) => sum + team.players.length, 0),
+                    }),
                   })}
                 </Typography>
+                {missingDiscordTotal > 0 && (
+                  <Typography variant="body2" data-testid="team-import-missing-discord-total">
+                    {t('teamImportModal.preview.missingDiscordTotal', {
+                      count: missingDiscordTotal,
+                    })}
+                  </Typography>
+                )}
               </Alert>
+
+              {importWarnings.length > 0 && (
+                <Alert severity="warning" sx={{ mb: 2 }} data-testid="team-import-warnings">
+                  <Typography variant="body2" gutterBottom>
+                    {t('teamImportModal.warnings.title')}
+                  </Typography>
+                  <Box component="ul" sx={{ m: 0, pl: 2 }}>
+                    {importWarnings.map((warning, wIndex) => (
+                      <Typography component="li" variant="caption" key={wIndex}>
+                        {warning}
+                      </Typography>
+                    ))}
+                  </Box>
+                </Alert>
+              )}
 
               <Typography variant="subtitle2" fontWeight={600} mb={1}>
                 {t('teamImportModal.preview.title')}
               </Typography>
 
               <Stack spacing={1}>
-                {parsedTeams.map((team, index) => (
-                  <Paper key={index} variant="outlined" sx={{ overflow: 'hidden' }}>
-                    <Box
-                      display="flex"
-                      alignItems="center"
-                      justifyContent="space-between"
-                      p={2}
-                      sx={{
-                        cursor: 'pointer',
-                        '&:hover': { bgcolor: 'action.hover' },
-                      }}
-                      onClick={() => toggleTeamExpanded(index)}
-                    >
-                      <Box display="flex" alignItems="center" gap={1}>
-                        <Typography variant="body1" fontWeight={600}>
-                          {team.name}
-                        </Typography>
-                        {team.tag && <Chip label={team.tag} size="small" />}
-                        <Chip
-                          label={t('teamImportModal.preview.playersChip', {
-                            count: team.players.length,
-                          })}
-                          size="small"
-                          variant="outlined"
-                        />
+                {parsedTeams.map((team, index) => {
+                  const missingDiscord = team.players.filter((p) => !p.discordId).length;
+                  return (
+                    <Paper key={index} variant="outlined" sx={{ overflow: 'hidden' }}>
+                      <Box
+                        display="flex"
+                        alignItems="center"
+                        justifyContent="space-between"
+                        p={2}
+                        sx={{
+                          cursor: 'pointer',
+                          '&:hover': { bgcolor: 'action.hover' },
+                        }}
+                        onClick={() => toggleTeamExpanded(index)}
+                        data-testid={`team-import-preview-team-${index}`}
+                      >
+                        <Box display="flex" alignItems="center" gap={1}>
+                          <Typography variant="body1" fontWeight={600}>
+                            {team.name}
+                          </Typography>
+                          {team.tag && <Chip label={team.tag} size="small" />}
+                          <Chip
+                            label={t('teamImportModal.preview.playersChip', {
+                              count: team.players.length,
+                            })}
+                            size="small"
+                            variant="outlined"
+                          />
+                          {missingDiscord > 0 && (
+                            <Chip
+                              label={t('teamImportModal.preview.missingDiscordChip', {
+                                count: missingDiscord,
+                              })}
+                              size="small"
+                              variant="outlined"
+                              color="warning"
+                              data-testid={`team-import-missing-discord-${index}`}
+                            />
+                          )}
+                        </Box>
+                        <IconButton size="small">
+                          {expandedTeams.has(index) ? <CaretUpIcon /> : <CaretDownIcon />}
+                        </IconButton>
                       </Box>
-                      <IconButton size="small">
-                        {expandedTeams.has(index) ? <ExpandLessIcon /> : <ExpandMoreIcon />}
-                      </IconButton>
-                    </Box>
 
-                    <Collapse in={expandedTeams.has(index)}>
-                      <Box px={2} pb={2} bgcolor="action.hover">
-                        <Stack spacing={0.5}>
-                          {team.players.map((player, pIndex) => (
-                            <Box
-                              key={pIndex}
-                              display="flex"
-                              alignItems="center"
-                              justifyContent="space-between"
-                              py={0.5}
-                              gap={1}
-                            >
-                              <Box>
-                                <PlayerName name={player.name} variant="body2" />
-                                {player.elo !== undefined && (
-                                  <Typography variant="caption" color="text.secondary">
-                                    ELO: {player.elo}
-                                  </Typography>
-                                )}
-                              </Box>
-                              <Typography
-                                variant="caption"
-                                fontFamily="monospace"
-                                color="text.secondary"
+                      <Collapse in={expandedTeams.has(index)}>
+                        <Box px={2} pb={2} bgcolor="action.hover">
+                          <Stack spacing={0.5}>
+                            {team.players.map((player, pIndex) => (
+                              <Box
+                                key={pIndex}
+                                display="flex"
+                                alignItems="center"
+                                justifyContent="space-between"
+                                py={0.5}
+                                gap={1}
                               >
-                                {player.steamId}
-                              </Typography>
-                            </Box>
-                          ))}
-                        </Stack>
-                      </Box>
-                    </Collapse>
-                  </Paper>
-                ))}
+                                <Box>
+                                  <PlayerName name={player.name} variant="body2" />
+                                  {player.elo !== undefined && (
+                                    <Typography variant="caption" color="text.secondary">
+                                      ELO: {player.elo}
+                                    </Typography>
+                                  )}
+                                </Box>
+                                <Box textAlign="right">
+                                  <Typography
+                                    variant="caption"
+                                    fontFamily="monospace"
+                                    color="text.secondary"
+                                    display="block"
+                                  >
+                                    {player.steamId}
+                                  </Typography>
+                                  {player.discordId ? (
+                                    <Typography
+                                      variant="caption"
+                                      fontFamily="monospace"
+                                      color="text.secondary"
+                                      display="block"
+                                      data-testid={`team-import-player-discord-${player.steamId}`}
+                                    >
+                                      {t('discordId.display', { id: player.discordId })}
+                                    </Typography>
+                                  ) : (
+                                    <NoDiscordChip
+                                      testId={`team-import-player-no-discord-${player.steamId}`}
+                                    />
+                                  )}
+                                </Box>
+                              </Box>
+                            ))}
+                          </Stack>
+                        </Box>
+                      </Collapse>
+                    </Paper>
+                  );
+                })}
               </Stack>
             </Box>
           )}
@@ -325,6 +430,7 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
             }}
             variant="contained"
             disabled={importing}
+            data-testid="team-import-preview-button"
             sx={{
               ml: 'auto',
               ...(!jsonInput.trim() && {
@@ -344,6 +450,7 @@ export const TeamImportModal: React.FC<TeamImportModalProps> = ({ open, onClose,
             variant="contained"
             disabled={importing}
             sx={{ ml: 'auto' }}
+            data-testid="team-import-submit-button"
           >
             {importing
               ? t('teamImportModal.actions.importing')

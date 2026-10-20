@@ -9,16 +9,39 @@
  * which keeps dev/prod log files focused on actions instead of every SQL call.
  */
 
-import { Pool } from 'pg';
+import type { Untrusted } from '../utils/untrusted';
+import { Pool, type PoolClient } from 'pg';
 import { log, LOG_DB_VERBOSE, LOG_DB_VALUES } from '../utils/logger';
-import { getSchemaSQL, getDefaultMapsSQL, getDefaultMapPoolsSQL } from './database.schema';
+import { safeLogJson, redactParamsForLog, redactInsertValuesForLog } from '../utils/dbLogRedaction';
+import { getSchemaSQL, getSchemaColumns } from './database.schema';
+import { runSchemaMigrations } from './schemaMigrations';
+import { markModuleMigrationsFailed, runModuleMigrations } from './moduleMigrations';
+import { addCs2ForeignKeys, CS2_MODULE_ID, handOverCs2Tables } from './cs2TableHandover';
+import { DATABASE_NAME, renameLegacyDatabase } from './databaseRename';
+import { setCurrentTournamentId } from '../utils/tournamentRow';
 
 const MAX_DB_VALUES_SAMPLE = 5;
 
 /**
+ * A value pg sends as a query parameter: scalars, dates, buffers, arrays for
+ * `= ANY($1)`, and objects pg writes as JSON (jsonb columns).
+ */
+export type SqlValue =
+  | string
+  | number
+  | bigint
+  | boolean
+  | null
+  | undefined
+  | Date
+  | Buffer
+  | readonly SqlValue[]
+  | { readonly [key: string]: SqlValue };
+
+/**
  * Helper to convert ? placeholders to PostgreSQL placeholders ($1, $2, etc.)
  */
-function convertPlaceholders(sql: string, params: unknown[]): { sql: string; params: unknown[] } {
+function convertPlaceholders(sql: string, params: SqlValue[]): { sql: string; params: SqlValue[] } {
   if (sql.includes('?')) {
     let paramIndex = 1;
     const convertedSql = sql.replace(/\?/g, () => `$${paramIndex++}`);
@@ -31,7 +54,8 @@ function convertPlaceholders(sql: string, params: unknown[]): { sql: string; par
  * Database class for PostgreSQL
  */
 class DatabaseManager {
-  private postgresPool?: Pool;
+  private pool?: Pool;
+  private connectionString: string;
   private initialized = false;
 
   constructor() {
@@ -42,16 +66,47 @@ class DatabaseManager {
         // Default to explicit IPv4 loopback instead of "localhost" so we don't
         // accidentally hit ::1 (IPv6) on hosts where Docker only binds 127.0.0.1.
         process.env.DB_HOST || '127.0.0.1'
-      }:${process.env.DB_PORT || '5432'}/${process.env.DB_NAME || 'matchzy_tournament'}`;
+      }:${process.env.DB_PORT || '5432'}/${process.env.DB_NAME || DATABASE_NAME}`;
+    this.connectionString = connString;
 
-    this.postgresPool = new Pool({
-      connectionString: connString,
-      max: 20,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
-    });
+    // The pool is created lazily (see `postgresPool`) so importing this module
+    // never opens a connection or reaches for the network.
+  }
 
-    log.database(`[PostgreSQL] Database pool created: ${connString.replace(/:[^:@]+@/, ':****@')}`);
+  /**
+   * Lazily-created connection pool. Throws when AT_NO_DB=1 (set by tooling such
+   * as `yarn docs:api` that imports route modules but must never touch a
+   * database).
+   */
+  private get postgresPool(): Pool {
+    if (process.env.AT_NO_DB === '1') {
+      throw new Error('Database access is disabled (AT_NO_DB=1)');
+    }
+    if (!this.pool) {
+      // Local test tooling sets AT_REQUIRE_EXPLICIT_DB=1 so a missing config
+      // fails loudly instead of silently connecting to whatever listens on
+      // 127.0.0.1:5432. Production defaults are unchanged.
+      if (
+        process.env.AT_REQUIRE_EXPLICIT_DB === '1' &&
+        !process.env.DATABASE_URL &&
+        !process.env.DB_HOST
+      ) {
+        throw new Error(
+          'No database configured: set DATABASE_URL (or DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME) explicitly. ' +
+            'Tests and scripts do not default to 127.0.0.1:5432.'
+        );
+      }
+      this.pool = new Pool({
+        connectionString: this.connectionString,
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 2000,
+      });
+      log.database(
+        `[PostgreSQL] Database pool created: ${this.connectionString.replace(/:[^:@]+@/, ':****@')}`
+      );
+    }
+    return this.pool;
   }
 
   /**
@@ -65,6 +120,11 @@ class DatabaseManager {
     if (!this.postgresPool) {
       throw new Error('PostgreSQL pool not initialized');
     }
+
+    // An install upgraded from 2.x still has its database under the 2.x name.
+    // Rename it before anything connects (see databaseRename.ts). Throws
+    // DatabaseRenameRefused when the platform must not start.
+    await renameLegacyDatabase(this.connectionString, { connectionTimeoutMillis: 5000 });
 
     // Test connection
     const client = await this.postgresPool.connect();
@@ -103,7 +163,27 @@ class DatabaseManager {
         .map((s) => s.trim().replace(/\n\s*\n/g, '\n')) // Normalize whitespace
         .filter((s) => s.length > 0 && s.length > 10); // Filter out empty or very short strings
 
+      // gen_random_uuid() (players.uid) is built in from Postgres 13.
+      try {
+        const { rows } = await client.query<{ server_version_num: string }>(
+          'SHOW server_version_num'
+        );
+        const version = Number(rows[0]?.server_version_num);
+        if (Number.isFinite(version) && version < 130000) {
+          log.error(
+            `[PostgreSQL] Postgres ${version} is older than 13, which this version needs (gen_random_uuid). Upgrade Postgres.`
+          );
+        }
+      } catch (err) {
+        log.warn(`[PostgreSQL] Could not read the server version: ${(err as Error).message}`);
+      }
+
       log.database(`[PostgreSQL] Executing ${statements.length} schema statements`);
+      // An index on a column that an upgraded database does not have yet fails
+      // here with "column does not exist": the column is only added by the
+      // migrations below. Those indexes are retried once the columns exist,
+      // rather than being logged as a schema error and silently never created.
+      const deferredIndexes: string[] = [];
       for (let i = 0; i < statements.length; i++) {
         const statement = statements[i];
         try {
@@ -115,7 +195,9 @@ class DatabaseManager {
           }
         } catch (err) {
           const error = err as Error & { code?: string };
-          if (error.code === '42P07' || error.message.includes('already exists')) {
+          if (error.code === '42703' && /^CREATE\s+(UNIQUE\s+)?INDEX\b/i.test(statement)) {
+            deferredIndexes.push(statement);
+          } else if (error.code === '42P07' || error.message.includes('already exists')) {
             log.database(
               `[PostgreSQL] Statement ${i + 1}/${statements.length} skipped (already exists)`
             );
@@ -131,44 +213,9 @@ class DatabaseManager {
         }
       }
 
-      // Migrations
-      const migrations = [
-        { table: 'matches', column: 'demo_file_path', type: 'TEXT' },
-        { table: 'matches', column: 'veto_state', type: 'TEXT' },
-        { table: 'matches', column: 'current_map', type: 'TEXT' },
-        { table: 'matches', column: 'map_number', type: 'INTEGER DEFAULT 0' },
-        { table: 'map_pools', column: 'enabled', type: 'INTEGER NOT NULL DEFAULT 1' },
-        { table: 'match_map_results', column: 'demo_file_path', type: 'TEXT' },
-        { table: 'tournament_templates', column: 'team_ids', type: 'TEXT' },
-        { table: 'tournament', column: 'map_sequence', type: 'TEXT' },
-        { table: 'tournament', column: 'team_size', type: 'INTEGER DEFAULT 5' },
-        { table: 'tournament', column: 'max_rounds', type: 'INTEGER DEFAULT 24' },
-        { table: 'tournament', column: 'overtime_mode', type: "TEXT DEFAULT 'enabled'" },
-        { table: 'tournament', column: 'elo_template_id', type: 'TEXT' },
-        { table: 'player_rating_history', column: 'base_elo_after', type: 'INTEGER' },
-        { table: 'player_rating_history', column: 'stat_adjustment', type: 'INTEGER' },
-        { table: 'player_rating_history', column: 'template_id', type: 'TEXT' },
-        { table: 'player_match_stats', column: 'flash_assists', type: 'INTEGER' },
-        { table: 'player_match_stats', column: 'utility_damage', type: 'INTEGER' },
-        { table: 'player_match_stats', column: 'kast', type: 'REAL' },
-        { table: 'player_match_stats', column: 'mvps', type: 'INTEGER' },
-        { table: 'player_match_stats', column: 'score', type: 'INTEGER' },
-        { table: 'player_match_stats', column: 'rounds_played', type: 'INTEGER' },
-        { table: 'players', column: 'is_admin', type: 'INTEGER NOT NULL DEFAULT 0' },
-        { table: 'servers', column: 'cs2_required_version', type: 'INTEGER' },
-        { table: 'servers', column: 'cs2_update_phase', type: 'TEXT' },
-        { table: 'servers', column: 'cs2_update_required_at', type: 'INTEGER' },
-        { table: 'servers', column: 'cs2_update_checked_at', type: 'INTEGER' },
-        { table: 'servers', column: 'cs2_build_id', type: 'INTEGER' },
-        { table: 'servers', column: 'cs2_version_string', type: 'TEXT' },
-        { table: 'servers', column: 'cs2_version_fetched_at', type: 'INTEGER' },
-        { table: 'servers', column: 'matchzy_db_ok', type: 'INTEGER' },
-        { table: 'servers', column: 'matchzy_db_type', type: 'TEXT' },
-        { table: 'servers', column: 'matchzy_db_error', type: 'TEXT' },
-        { table: 'servers', column: 'matchzy_db_last_ok_at', type: 'INTEGER' },
-        { table: 'servers', column: 'matchzy_db_last_seen_at', type: 'INTEGER' },
-        { table: 'servers', column: 'server_can_reach_api_at', type: 'INTEGER' },
-      ];
+      // Column migrations, derived from the schema itself so the two cannot drift.
+      // See getSchemaColumns() for why this is not a hand-maintained list.
+      const migrations = getSchemaColumns();
 
       // Check if tournament_templates table exists, create if not
       try {
@@ -187,13 +234,10 @@ class DatabaseManager {
               description TEXT,
               type TEXT NOT NULL,
               format TEXT NOT NULL,
-              map_pool_id INTEGER,
-              maps TEXT,
               team_ids TEXT,
               settings TEXT NOT NULL,
               created_at INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
-              updated_at INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
-              FOREIGN KEY (map_pool_id) REFERENCES map_pools(id) ON DELETE SET NULL
+              updated_at INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
             );
             CREATE INDEX idx_tournament_templates_name ON tournament_templates(name);
             CREATE INDEX idx_tournament_templates_type ON tournament_templates(type);
@@ -207,95 +251,230 @@ class DatabaseManager {
         }
       }
 
+      // One lookup for the whole database rather than one per column.
+      const existingColumns = new Set<string>();
+      const existingTables = new Set<string>();
+      try {
+        const { rows } = await client.query<{ table_name: string; column_name: string }>(
+          `SELECT table_name, column_name
+           FROM information_schema.columns
+           WHERE table_schema = current_schema()`
+        );
+        for (const row of rows) {
+          existingTables.add(row.table_name);
+          existingColumns.add(`${row.table_name}.${row.column_name}`);
+        }
+      } catch (err) {
+        log.error(
+          `[PostgreSQL] Could not read existing columns, skipping migrations: ${
+            (err as Error).message
+          }`
+        );
+      }
+
+      let added = 0;
       for (const migration of migrations) {
+        // A table that does not exist yet was just created from the schema with
+        // all its columns, or genuinely is not ours to touch.
+        if (!existingTables.has(migration.table)) continue;
+        if (existingColumns.has(`${migration.table}.${migration.column}`)) continue;
+
         try {
-          const checkResult = await client.query(
-            `
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = $1 AND column_name = $2
-          `,
-            [migration.table, migration.column]
+          await client.query(
+            `ALTER TABLE ${migration.table} ADD COLUMN ${migration.column} ${migration.type}`
           );
-
-          if (checkResult.rows.length === 0) {
-            await client.query(
-              `ALTER TABLE ${migration.table} ADD COLUMN ${migration.column} ${migration.type}`
-            );
-          }
-        } catch {
-          // Ignore errors
-        }
-      }
-
-      // Insert default maps (only if maps table is empty - first initialization or after wipe)
-      // This prevents fetching from GitHub on every server restart/reload
-      // But ensures maps are regenerated when database is wiped
-      try {
-        // The maps table should exist at this point (created by schema SQL above)
-        // But handle the case where it might not exist yet
-        let mapsCount = 0;
-        try {
-          const mapsCheck = await client.query('SELECT COUNT(*) as count FROM maps');
-          mapsCount = parseInt(mapsCheck.rows[0]?.count || '0', 10);
+          added++;
+          log.success(
+            `[PostgreSQL] Added missing column ${migration.table}.${migration.column} (${migration.type})`
+          );
         } catch (err) {
-          const error = err as Error;
-          // If table doesn't exist, that's unexpected but we'll skip map insertion
-          if (error.message.includes('does not exist')) {
-            log.warn('[PostgreSQL] Maps table does not exist, skipping map insertion');
-            return;
-          }
-          throw err; // Re-throw other errors
-        }
-
-        if (mapsCount === 0) {
-          // Maps table is empty - this is first initialization or after database wipe
-          // Fetch fresh maps from GitHub repository: https://github.com/sivert-io/cs2-server-manager/tree/master/map_thumbnails
-          // Falls back to hardcoded maps if GitHub fetch fails (e.g., rate limiting)
-          log.database(
-            '[PostgreSQL] Maps table is empty, fetching and inserting default maps from GitHub...'
-          );
-          try {
-            const defaultMapsSQL = await getDefaultMapsSQL();
-            await client.query(defaultMapsSQL);
-            log.success('[PostgreSQL] Default maps inserted (from GitHub repository or fallback)');
-          } catch (fetchError) {
-            const error = fetchError as Error;
-            log.error(`[PostgreSQL] Failed to initialize maps: ${error.message}`);
-            // Don't throw - fallback maps should have been used, but if that also failed, log and continue
-            // The application can still function without maps (they can be added manually or synced later)
-            log.warn(
-              '[PostgreSQL] Continuing without default maps. Maps can be added manually or synced via /api/maps/sync'
-            );
-          }
-        } else {
-          // Maps already exist - skip fetching from wiki (saves time and API calls)
-          log.database(
-            `[PostgreSQL] Maps table already has ${mapsCount} maps, skipping map insertion`
+          // Keep going: one column we cannot add should not stop the rest, but it
+          // must be visible - a silently skipped migration is how an upgraded
+          // instance ends up querying a column that is not there.
+          log.error(
+            `[PostgreSQL] Failed to add ${migration.table}.${migration.column}: ${
+              (err as Error).message
+            }`
           );
         }
-      } catch (err) {
-        const error = err as Error;
-        // If it's a map fetch error, we already logged it above, just re-throw
-        if (error.message.includes('GitHub') || error.message.includes('maps')) {
-          throw err;
-        }
-        log.warn(`[PostgreSQL] Failed to insert default maps: ${error.message}`);
-        // Don't throw for other errors - continue
+      }
+      if (added > 0) {
+        log.success(`[PostgreSQL] Applied ${added} column migration(s)`);
       }
 
-      // Insert default map pools
+      // Rating history used to cascade away with its match, so deleting a
+      // tournament left ratings with no history behind them. It now survives
+      // as an orphan (match_slug NULL); upgrade the old NOT NULL + CASCADE key.
       try {
-        const defaultMapPoolsSQL = await getDefaultMapPoolsSQL(client);
-        await client.query(defaultMapPoolsSQL);
-        log.database('[PostgreSQL] Default map pools inserted');
+        const { rows } = await client.query<{ conname: string }>(
+          `SELECT c.conname
+             FROM pg_constraint c
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+            WHERE c.conrelid = to_regclass('player_rating_history')
+              AND c.contype = 'f' AND c.confdeltype = 'c' AND a.attname = 'match_slug'`
+        );
+        for (const { conname } of rows) {
+          await client.query('BEGIN');
+          try {
+            await client.query(
+              'ALTER TABLE player_rating_history ALTER COLUMN match_slug DROP NOT NULL'
+            );
+            await client.query(`ALTER TABLE player_rating_history DROP CONSTRAINT "${conname}"`);
+            await client.query(
+              `ALTER TABLE player_rating_history ADD CONSTRAINT "${conname}"
+                 FOREIGN KEY (match_slug) REFERENCES matches(slug) ON DELETE SET NULL`
+            );
+            await client.query(
+              `UPDATE player_rating_history prh
+                  SET match_label = COALESCE(prh.match_label, t1.name || ' vs ' || t2.name, m.slug),
+                      tournament_name = COALESCE(prh.tournament_name, t.name)
+                 FROM matches m
+                 LEFT JOIN tournament t ON t.id = m.tournament_id
+                 LEFT JOIN teams t1 ON t1.id = m.team1_id
+                 LEFT JOIN teams t2 ON t2.id = m.team2_id
+                WHERE m.slug = prh.match_slug`
+            );
+            await client.query('COMMIT');
+            log.success('[PostgreSQL] Rating history now survives match deletion');
+          } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+          }
+        }
       } catch (err) {
-        const error = err as Error;
-        log.warn(`[PostgreSQL] Failed to insert default map pools: ${error.message}`);
-        // Don't throw - continue
+        log.error(
+          `[PostgreSQL] Failed to migrate rating history foreign key: ${(err as Error).message}`
+        );
+      }
+
+      for (const statement of deferredIndexes) {
+        try {
+          await client.query(statement);
+        } catch (err) {
+          log.error(
+            `[PostgreSQL] Failed to create index after column migrations: ${(err as Error).message}`
+          );
+          log.error(`[PostgreSQL] Failed statement: ${statement.substring(0, 200)}`);
+        }
+      }
+
+      // Foreign keys onto players(uid). Not declared inline: on an upgraded
+      // instance players.uid only exists after the column migrations and its
+      // unique index (deferred above), so the CREATE TABLE would fail.
+      const uidForeignKeys: Array<{ table: string; column: string }> = [
+        { table: 'player_games', column: 'player_uid' },
+        // 3.0 phase D: team membership and reported custom stats.
+        { table: 'team_members', column: 'account_uid' },
+        { table: 'team_join_requests', column: 'account_uid' },
+        { table: 'team_invites', column: 'account_uid' },
+        { table: 'match_stat_values', column: 'player_uid' },
+      ];
+      for (const { table, column } of uidForeignKeys) {
+        const constraint = `${table}_${column}_fkey`;
+        try {
+          const { rows } = await client.query(
+            `SELECT 1 FROM pg_constraint
+              WHERE conrelid = to_regclass($1) AND conname = $2`,
+            [table, constraint]
+          );
+          if (rows.length === 0) {
+            await client.query(
+              `ALTER TABLE ${table} ADD CONSTRAINT ${constraint}
+                 FOREIGN KEY (${column}) REFERENCES players(uid) ON DELETE CASCADE`
+            );
+          }
+        } catch (err) {
+          log.error(
+            `[PostgreSQL] Failed to add ${table}.${column} foreign key: ${(err as Error).message}`
+          );
+        }
+      }
+
+      // Hand-written migrations (backfills), each once per database: see
+      // schemaMigrations.ts. After the column migrations and indexes above,
+      // which they may rely on.
+      await runSchemaMigrations(client);
+
+      // Each module's own migrations (GameIntegration.migrations), after
+      // core's schema and before anything uses it. This function also runs
+      // after both wipe paths (resetDatabase), so a wiped database gets them
+      // again. A module whose migrations fail is marked failed and the rest
+      // carry on; see moduleMigrations.ts.
+      const { listIntegrations } = await import('../integrations/registry');
+      const installed = listIntegrations();
+      const installedModuleIds = installed.map((integration) => integration.id);
+      const failedModules = new Set<string>();
+
+      // CS2's 2.x tables (servers, maps, map_pools) become cs2_servers,
+      // cs2_maps and cs2_map_pools, and CS2's first migration is recorded, before
+      // CS2's migrations run. Renamed in place, never copied; a no-op once done
+      // and on a fresh database. See cs2TableHandover.ts. If it did not
+      // happen, CS2's migrations must not run: they would create empty cs2_*
+      // tables beside the host's data.
+      const cs2 = installed.find((integration) => integration.id === CS2_MODULE_ID);
+      const handover = await handOverCs2Tables(client, cs2);
+      if (handover.pending.length > 0) {
+        failedModules.add(CS2_MODULE_ID);
+        if (cs2) {
+          markModuleMigrationsFailed(
+            CS2_MODULE_ID,
+            `its 2.x tables (${handover.pending.join(', ')}) were not renamed to cs2_*` +
+              (handover.error ? `: ${handover.error}` : '')
+          );
+        }
+      }
+
+      for (const integration of installed) {
+        if (failedModules.has(integration.id)) continue;
+        const state = await runModuleMigrations(integration, { client, installedModuleIds });
+        if (state.status === 'failed') failedModules.add(integration.id);
+      }
+
+      // Core columns that reference CS2's tables: matches.server_id and the
+      // standalone match templates' map_pool_id. The keys cannot be declared
+      // in core's CREATE TABLE any more, because on a fresh database CS2's
+      // tables are created after core's. An upgraded database kept its keys
+      // through the rename (Postgres tracks the referenced table, not its
+      // name), so this only adds them where they are missing: fresh databases
+      // and wipes. Skipped while the referenced table does not exist (no CS2).
+      // A tournament template's map pool is CS2's own settings object now
+      // (settings.cs2.mapPoolId), with no key. The CS2 module loaded from the
+      // catalog adds them again once its tables exist (modules/loader.ts).
+      await addCs2ForeignKeys(client);
+
+      // Which tournament is current (services/currentTournament.ts): the
+      // newest not archived, else the next id. After a wipe that is 1 again.
+      {
+        const open = await client.query<{ id: number }>(
+          'SELECT id FROM tournament WHERE archived_at IS NULL ORDER BY id DESC LIMIT 1'
+        );
+        const next = await client.query<{ next: number }>(
+          'SELECT COALESCE(MAX(id), 0) + 1 AS next FROM tournament'
+        );
+        setCurrentTournamentId(Number(open.rows[0]?.id ?? next.rows[0]?.next ?? 1));
+      }
+
+      // Integration default data (CS2: new maps from maps.json and the
+      // default map pools; it logs its own failures and does not throw). A
+      // rejection fails the schema initialisation. Not for a module whose
+      // tables did not migrate.
+      for (const integration of installed) {
+        if (failedModules.has(integration.id)) continue;
+        await integration.seed?.(client);
       }
 
       log.success('[PostgreSQL] Database schema initialized');
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Run `fn` with one pooled connection (for work that needs a transaction), then release it. */
+  async withClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    if (!this.postgresPool) throw new Error('Database not initialized');
+    const client = await this.postgresPool.connect();
+    try {
+      return await fn(client);
     } finally {
       client.release();
     }
@@ -317,6 +496,21 @@ class DatabaseManager {
     try {
       log.warn('[PostgreSQL] Resetting database - dropping and recreating public schema');
 
+      // What is installed in DATA_DIR/modules is not data: the files stay
+      // through a wipe, so the switches and install records describing them
+      // (module_enabled:, module_install:, module_removed:) stay too.
+      // Otherwise a wipe would switch off CS2 while its code is on disk and
+      // loaded. Its tables are recreated below with everyone's.
+      let moduleSettings: Array<{ key: string; value: string | null }> = [];
+      try {
+        const kept = await client.query<{ key: string; value: string | null }>(
+          "SELECT key, value FROM app_settings WHERE starts_with(key, 'module_')"
+        );
+        moduleSettings = kept.rows;
+      } catch {
+        // No app_settings yet: nothing to keep.
+      }
+
       // Drop and recreate the public schema. This removes ALL user tables, views, sequences, etc.
       // This is more robust than maintaining a hard-coded list of tables.
       try {
@@ -335,10 +529,19 @@ class DatabaseManager {
       this.initialized = false;
 
       // Reinitialize schema (this will create tables and insert default data)
-      // Maps will be regenerated from GitHub since maps table is now empty
+      // Maps will be regenerated from GitHub since cs2_maps is now empty
       log.database('[PostgreSQL] Reinitializing schema and regenerating maps from GitHub...');
       await this.initializeSchemaAsync();
       this.initialized = true;
+
+      for (const { key, value } of moduleSettings) {
+        await client.query(
+          `INSERT INTO app_settings (key, value, updated_at)
+           VALUES ($1, $2, EXTRACT(EPOCH FROM NOW())::INTEGER)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+          [key, value]
+        );
+      }
 
       log.success('[PostgreSQL] Database reset completed successfully');
     } finally {
@@ -346,17 +549,11 @@ class DatabaseManager {
     }
   }
 
-  private safeJson(value: unknown): string {
-    try {
-      return JSON.stringify(value, (k, v) => {
-        const key = k.toLowerCase?.() ?? '';
-        if (/(password|secret|token|key)/.test(key)) return '***';
-        if (typeof v === 'string' && v.length > 500) return v.slice(0, 500) + '…';
-        return v;
-      });
-    } catch {
-      return String(value);
-    }
+  // Redaction lives in utils/dbLogRedaction so it can be unit-tested: secrets
+  // and Discord IDs (private contact data, some of it children's) must not
+  // reach the verbose DB logs.
+  private safeJson(value: Untrusted): string {
+    return safeLogJson(value);
   }
 
   private logRunResult(
@@ -378,7 +575,7 @@ class DatabaseManager {
     }
   }
 
-  async getAllAsync<T>(table: string, where?: string, params?: unknown[]): Promise<T[]> {
+  async getAllAsync<T>(table: string, where?: string, params?: SqlValue[]): Promise<T[]> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     let query = `SELECT * FROM ${table}`;
     if (where) {
@@ -387,7 +584,10 @@ class DatabaseManager {
       params = converted.params;
     }
     if (LOG_DB_VERBOSE) {
-      log.database(`[DB] GETALL ${table} where=${where ?? 'none'} params=${this.safeJson(params ?? [])}`);
+      const loggedParams = redactParamsForLog(where ?? '', params) ?? [];
+      log.database(
+        `[DB] GETALL ${table} where=${where ?? 'none'} params=${this.safeJson(loggedParams)}`
+      );
     }
     const result = await this.postgresPool.query(query, params);
     const rows = result.rows as T[];
@@ -401,12 +601,14 @@ class DatabaseManager {
     return rows;
   }
 
-  async getOneAsync<T>(table: string, where: string, params: unknown[]): Promise<T | undefined> {
+  async getOneAsync<T>(table: string, where: string, params: SqlValue[]): Promise<T | undefined> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     const converted = convertPlaceholders(where, params);
     const query = `SELECT * FROM ${table} WHERE ${converted.sql} LIMIT 1`;
     if (LOG_DB_VERBOSE) {
-      log.database(`[DB] GETONE ${table} where=${where} params=${this.safeJson(params)}`);
+      log.database(
+        `[DB] GETONE ${table} where=${where} params=${this.safeJson(redactParamsForLog(where, params))}`
+      );
     }
     const result = await this.postgresPool.query(query, converted.params);
     const row = (result.rows[0] as T) || undefined;
@@ -421,7 +623,7 @@ class DatabaseManager {
 
   async insertAsync(
     table: string,
-    data: Record<string, unknown>
+    data: Record<string, SqlValue>
   ): Promise<{ changes: number; lastInsertRowid: number | string }> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     const columns = Object.keys(data);
@@ -442,7 +644,9 @@ class DatabaseManager {
     try {
       if (LOG_DB_VERBOSE) {
         log.database(
-          `[DB] INSERT ${table} columns=[${columns.join(', ')}] values=${this.safeJson(values)}`
+          `[DB] INSERT ${table} columns=[${columns.join(', ')}] values=${this.safeJson(
+            redactInsertValuesForLog(columns, values)
+          )}`
         );
       }
       const result = await this.postgresPool.query(query, values);
@@ -459,9 +663,9 @@ class DatabaseManager {
 
   async updateAsync(
     table: string,
-    data: Record<string, unknown>,
+    data: Record<string, SqlValue>,
     where: string,
-    whereParams: unknown[]
+    whereParams: SqlValue[]
   ): Promise<{ changes: number }> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     const setClauses = Object.keys(data)
@@ -488,7 +692,11 @@ class DatabaseManager {
     }
   }
 
-  async deleteAsync(table: string, where: string, params: unknown[]): Promise<{ changes: number }> {
+  async deleteAsync(
+    table: string,
+    where: string,
+    params: SqlValue[]
+  ): Promise<{ changes: number }> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     const converted = convertPlaceholders(where, params);
     const query = `DELETE FROM ${table} WHERE ${converted.sql}`;
@@ -507,12 +715,14 @@ class DatabaseManager {
 
   async runAsync(
     sql: string,
-    params: unknown[] = []
+    params: SqlValue[] = []
   ): Promise<{ changes: number; lastInsertRowid?: number | string }> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     try {
       if (LOG_DB_VERBOSE) {
-        log.database(`[DB] RUN sql=${JSON.stringify(sql)} params=${this.safeJson(params)}`);
+        log.database(
+          `[DB] RUN sql=${JSON.stringify(sql)} params=${this.safeJson(redactParamsForLog(sql, params))}`
+        );
       }
       const converted = convertPlaceholders(sql, params);
       const result = await this.postgresPool.query(converted.sql, converted.params);
@@ -539,11 +749,13 @@ class DatabaseManager {
     }
   }
 
-  async queryAsync<T>(sql: string, params?: unknown[]): Promise<T[]> {
+  async queryAsync<T>(sql: string, params?: SqlValue[]): Promise<T[]> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     try {
       if (LOG_DB_VERBOSE) {
-        log.database(`[DB] QUERY sql=${JSON.stringify(sql)} params=${this.safeJson(params)}`);
+        log.database(
+          `[DB] QUERY sql=${JSON.stringify(sql)} params=${this.safeJson(redactParamsForLog(sql, params))}`
+        );
       }
       const converted = params ? convertPlaceholders(sql, params) : { sql, params: [] };
       const result = await this.postgresPool.query(converted.sql, converted.params);
@@ -562,12 +774,14 @@ class DatabaseManager {
     }
   }
 
-  async queryOneAsync<T>(sql: string, params?: unknown[]): Promise<T | undefined> {
+  async queryOneAsync<T>(sql: string, params?: SqlValue[]): Promise<T | undefined> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     try {
       if (LOG_DB_VERBOSE) {
         log.database(
-          `[DB] QUERY ONE sql=${JSON.stringify(sql)} params=${this.safeJson(params)}`
+          `[DB] QUERY ONE sql=${JSON.stringify(sql)} params=${this.safeJson(
+            redactParamsForLog(sql, params)
+          )}`
         );
       }
       const converted = params ? convertPlaceholders(sql, params) : { sql, params: [] };
@@ -655,8 +869,10 @@ class DatabaseManager {
   }
 
   close(): void {
-    if (this.postgresPool) {
-      this.postgresPool.end().catch((err) => {
+    if (this.pool) {
+      const pool = this.pool;
+      this.pool = undefined;
+      pool.end().catch((err) => {
         log.error('Failed to close PostgreSQL pool', err as Error);
       });
       log.database('[PostgreSQL] Database pool closed');

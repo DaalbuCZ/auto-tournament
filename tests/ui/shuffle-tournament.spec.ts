@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { ensureSignedIn } from '../helpers/auth';
+import { ensureSignedIn, signInViaRequest, getAuthHeader } from '../helpers/auth';
 import {
   setupShuffleTournament,
   createShuffleTournament,
@@ -20,63 +20,123 @@ import { createTestPlayers, type Player } from '../helpers/players';
  */
 
 test.describe.serial('Shuffle Tournament UI', () => {
-  test.beforeEach(async ({ page }) => {
+  test.beforeEach(async ({ page, request }) => {
     await ensureSignedIn(page);
+    await signInViaRequest(request);
+    // The creation flow only opens when no tournament exists. Other specs
+    // leave one behind, so clear it rather than depending on file order.
+    await request.delete('/api/tournament', { headers: getAuthHeader() });
   });
 
   test(
-    'should display shuffle tournament creation form',
+    'should offer shuffle as a tournament type and explain its map sequence',
     {
       tag: ['@ui', '@shuffle', '@tournament'],
     },
     async ({ page }) => {
-      await page.goto('/tournament');
-
-      // Wait for tournament creation form to load
+      await page.goto('/manage/tournament');
       await page.waitForLoadState('networkidle');
-      await page.waitForTimeout(1000);
 
-      // Check for tournament type selector
+      // With no tournament, /tournament opens the setup flow on its Game step.
+      const nextButton = page.getByTestId('tournament-next-button');
+      await expect(page.getByTestId('tournament-setup-step-game')).toHaveAttribute(
+        'aria-current',
+        'step'
+      );
+      await nextButton.click();
+
+      // Basics — name.
+      const nameInput = page.getByTestId('tournament-name-input');
+      await expect(nameInput).toBeVisible({ timeout: 15000 });
+      await nameInput.fill(`Shuffle UI Test ${Date.now()}`);
+      await nextButton.click();
+
+      // Format. Shuffle must be on offer, and choosing it shows its own settings.
       const typeSelector = page.getByTestId('tournament-type-selector');
-      const selectorVisible = await typeSelector.isVisible().catch(() => false);
-      
-      if (!selectorVisible) {
-        // Tournament form may not be visible or UI changed - skip test
-        test.skip();
-        return;
-      }
-      
-      await typeSelector.click();
-      await page.waitForTimeout(500);
-      
-      // Try to select shuffle option
-      const shuffleOption = page.getByTestId('tournament-type-option-shuffle');
-      const optionVisible = await shuffleOption.isVisible().catch(() => false);
-      if (optionVisible) {
-        await shuffleOption.click();
-      }
+      await expect(typeSelector).toBeVisible({ timeout: 15000 });
+      await page.getByTestId('tournament-type-option-shuffle').click();
+      await expect(page.getByTestId('tournament-type-option-shuffle')).toHaveAttribute(
+        'aria-pressed',
+        'true'
+      );
+      await expect(page.getByTestId('shuffle-team-size-field')).toBeVisible();
+      await nextButton.click();
 
-      // Verify shuffle-specific fields appear
-      await expect(page.getByTestId('shuffle-map-sequence-field')).toBeVisible();
-      await expect(page.getByTestId('shuffle-round-limit-field')).toBeVisible();
-      await expect(page.getByTestId('shuffle-overtime-field')).toBeVisible();
+      // Teams and sign-up. Shuffle has solo sign-up, which opens once the
+      // tournament exists.
+      await expect(page.getByTestId('shuffle-signup-after-create')).toBeVisible();
+      await nextButton.click();
+
+      // Schedule: when matches start (at set times, or as soon as ready).
+      await expect(page.getByTestId('setup-schedule')).toBeVisible();
+      await nextButton.click();
+
+      // Maps and veto. Shuffle plays the pool in sequence instead of running a
+      // veto, and the map step says so. That notice is the shuffle-specific
+      // behaviour worth pinning down here.
+      await expect(page.getByTestId('shuffle-map-sequence-field')).toBeVisible({ timeout: 15000 });
+      await expect(page.getByTestId('tournament-map-pool-select')).toBeVisible();
     }
   );
 
   // Consolidated tournament UI test - verifies tournament page loads
-  test.skip(
+  test(
     'should display tournament page',
     {
       tag: ['@ui', '@shuffle', '@tournament'],
     },
     async ({ page }) => {
-      await page.goto('/tournament');
-      await page.waitForLoadState('networkidle');
-      
-      // Verify tournament page loaded
-      await expect(page.getByTestId('tournament-page')).toBeVisible({ timeout: 5000 });
-      expect(page.url()).toContain('/tournament');
+      await page.goto('/manage/tournament');
+
+      // Verify tournament page loaded (not networkidle: the live socket keeps polling)
+      await expect(page.getByTestId('tournament-page')).toBeVisible({ timeout: 15000 });
+      expect(page.url()).toContain('/manage/tournament');
+    }
+  );
+
+  test(
+    'a started shuffle tournament: players on the home card, no veto, Round 1, its match opens',
+    { tag: ['@ui', '@shuffle', '@regression'] },
+    async ({ page, request }) => {
+      const errors: string[] = [];
+      page.on('pageerror', (e) => errors.push(String(e)));
+      const setup = await setupShuffleTournament(request, {
+        playerCount: 10,
+        serverCount: 0,
+        startTournament: true,
+        prefix: `shuffle-ui-${Date.now()}`,
+      });
+      expect(setup, 'shuffle setup should succeed').toBeTruthy();
+
+      // Admin home: a shuffle tournament enters players, not teams.
+      await page.goto('/manage');
+      await expect(page.getByTestId('admin-home-tournaments')).toContainText('10 players', {
+        timeout: 15000,
+      });
+
+      // Manage: no veto in a shuffle tournament, and its round is "Round 1", not "Finals".
+      await page.goto('/manage');
+      const strip = page.getByTestId('manage-status-strip');
+      await expect(strip).toContainText('Round 1', { timeout: 15000 });
+      await expect(strip).not.toContainText('IN VETO');
+      await expect(strip).not.toContainText('Finals');
+
+      // Bracket list: opening the match opens its match room (it used to blank the page).
+      // /manage/bracket redirects to the tournament's own bracket (a shuffle
+      // tournament always shows the list). A click while that redirect re-renders
+      // the list was lost, so wait for it, then click until the match room opens.
+      await page.goto('/manage/bracket');
+      await expect(page).toHaveURL(/\/manage\/tournaments\/\d+\/bracket/, { timeout: 15000 });
+      const first = page.getByRole('listitem').filter({ hasText: '#1 · Map 1' }).first();
+      await expect(first).toBeVisible({ timeout: 15000 });
+      await expect(async () => {
+        await first.click();
+        await expect(page).toHaveURL(/\/manage\/tournaments\/\d+\/matches\/[^/]+$/, {
+          timeout: 3000,
+        });
+      }).toPass({ timeout: 20000 });
+      await expect(page.getByTestId('manage-match-page')).toBeVisible({ timeout: 10000 });
+      expect(errors).toEqual([]);
     }
   );
 });
-

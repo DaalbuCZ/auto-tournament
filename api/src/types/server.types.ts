@@ -9,12 +9,22 @@ export interface Server {
   port: number;
   password: string;
   enabled: number; // PostgreSQL stores boolean as 0/1 in INTEGER column
-  matchzy_config?: string | null; // JSON blob with per-server MatchZy ConVar overrides
+  /** 0 = practice/community server: never given tournament matches. */
+  tournament_use?: number | null;
+  /** 1 = the platform's virtual skins go to this server (fleet servers). */
+  skins?: number | null;
+  at_config?: string | null; // JSON blob with per-server MatchZy Enhanced ConVar overrides
   persistent_config_sent?: number | null; // Unix timestamp when persistent config was last sent
   plugin_version?: string | null; // MatchZy Enhanced version (e.g., "1.3.6")
   hostname?: string | null; // CS2 server hostname (from hostname convar)
   last_seen?: number | null; // Unix timestamp of last event received (heartbeat)
   status?: string | null; // 'online', 'offline', 'unknown'
+  /** How the platform drives it: 'rcon' (MatchZy Enhanced over RCON) or 'fleet' (Ready Up over the fleet link). */
+  transport?: string | null;
+  /** 'fleet' servers: the cs2_fleet_servers row behind it. */
+  fleet_server_id?: string | null;
+  /** 'fleet' servers: 1 = an admin set host / port; hellos do not change them (fleet/link.ts). */
+  host_override?: number | null;
   /** If set, the server has reported a CS2 update is required (Steam required_version). */
   cs2_required_version?: number | null;
   /** Best-effort: phase of the update signal ('available'|'shutdown'). */
@@ -29,16 +39,6 @@ export interface Server {
   cs2_version_string?: string | null;
   /** Unix timestamp when version/build was last fetched via RCON. */
   cs2_version_fetched_at?: number | null;
-  /** Best-effort: MatchZy plugin DB reachable (1/0). */
-  matchzy_db_ok?: number | null;
-  /** Best-effort: 'sqlite' | 'mysql'. */
-  matchzy_db_type?: string | null;
-  /** Best-effort: last DB error message (if any). */
-  matchzy_db_error?: string | null;
-  /** Unix timestamp when DB was last reported OK. */
-  matchzy_db_last_ok_at?: number | null;
-  /** Unix timestamp when DB health was last reported. */
-  matchzy_db_last_seen_at?: number | null;
   /** Unix timestamp when server last successfully sent any event to /api/events. */
   server_can_reach_api_at?: number | null;
   created_at: number;
@@ -52,7 +52,9 @@ export interface CreateServerInput {
   port: number;
   password: string;
   enabled?: boolean; // Optional, defaults to true
-  matchzyConfig?: MatchzyServerConfigInput;
+  tournamentUse?: boolean; // Optional, defaults to true
+  skins?: boolean; // Optional, defaults to false
+  atConfig?: AtServerConfigInput;
 }
 
 export interface UpdateServerInput {
@@ -61,7 +63,9 @@ export interface UpdateServerInput {
   port?: number;
   password?: string;
   enabled?: boolean;
-  matchzyConfig?: MatchzyServerConfigInput | null;
+  tournamentUse?: boolean;
+  skins?: boolean;
+  atConfig?: AtServerConfigInput | null;
 }
 
 export interface BatchUpdateInput {
@@ -76,7 +80,13 @@ export interface ServerResponse {
   port: number;
   password: string;
   enabled: boolean;
-  matchzyConfig: MatchzyServerConfig | null;
+  /** False: a practice/community server that tournament matches never go to. */
+  tournamentUse: boolean;
+  /** The platform's virtual skins go to this server. */
+  skins: boolean;
+  /** Fleet servers: it runs with a Valve game server token, so skins stay off. Null when unknown. */
+  steamToken?: boolean | null;
+  atConfig: AtServerConfig | null;
   created_at: number;
   updated_at: number;
   // Server tracking fields (from MatchZy Enhanced server_configured event)
@@ -84,7 +94,7 @@ export interface ServerResponse {
   hostname?: string | null; // CS2 server hostname (from hostname convar)
   lastSeen?: number | null; // Unix timestamp of last event received (heartbeat)
   status?: string | null; // 'online', 'offline', 'unknown'
-  /** Unix timestamp when we last sent persistent config via RCON. Set before MatchZy sends events. */
+  /** Unix timestamp when we last sent persistent config via RCON. Set before MatchZy Enhanced sends events. */
   persistentConfigSent?: number | null;
   /** If set, the server has reported a CS2 update is required (Steam required_version). */
   cs2RequiredVersion?: number | null;
@@ -100,27 +110,29 @@ export interface ServerResponse {
   cs2VersionString?: string | null;
   /** Unix timestamp when version/build was last fetched via RCON. */
   cs2VersionFetchedAt?: number | null;
-  /** Best-effort: MatchZy plugin DB reachable. */
-  matchzyDbOk?: boolean | null;
-  /** Best-effort: 'sqlite' | 'mysql'. */
-  matchzyDbType?: string | null;
-  /** Best-effort: last DB error message (if any). */
-  matchzyDbError?: string | null;
-  /** Unix timestamp when DB was last reported OK. */
-  matchzyDbLastOkAt?: number | null;
-  /** Unix timestamp when DB health was last reported. */
-  matchzyDbLastSeenAt?: number | null;
   /** Unix timestamp when server last successfully sent any event to /api/events. */
   serverCanReachApiAt?: number | null;
+  /**
+   * How the platform drives the server: 'rcon' (MatchZy Enhanced over
+   * RCON, every server before the fleet link) or 'fleet' (a Ready Up server on
+   * the fleet link, see integrations/cs2/driver.ts).
+   */
+  transport?: ServerTransport;
+  /** 'fleet' servers: the Ready Up fleet server (`/api/fleet/servers`) behind this row. */
+  fleetServerId?: string | null;
+  /** 'fleet' servers: host / port were set by an admin, not from the server's hello. */
+  hostOverride?: boolean;
 }
 
+export type ServerTransport = 'rcon' | 'fleet';
+
 /**
- * Per-server MatchZy configuration (backend representation)
+ * Per-server MatchZy Enhanced configuration (backend representation)
  * This is intentionally a small, opinionated subset of all possible ConVars.
  * Note: Chat prefixes and knife round defaults are configured at the global/tournament/match level,
  * not per-server. Only server-specific operational settings are included here.
  */
-export interface MatchzyServerConfig {
+export interface AtServerConfig {
   // Common operational toggles (all optional; null/undefined = do not touch)
   minimumReadyRequired?: number | null;
   pauseAfterRestore?: boolean | null;
@@ -137,6 +149,9 @@ export interface MatchzyServerConfig {
    */
   autostartMode?: 0 | 1 | 2 | null;
 
+  /** `''` leaves the server's own hostname alone. */
+  hostnameFormat?: string | null;
+
   // Demo / logging settings
   demoPath?: string | null;
   demoNameFormat?: string | null;
@@ -144,10 +159,10 @@ export interface MatchzyServerConfig {
 }
 
 /**
- * Shape accepted from API clients (frontend) – same as MatchzyServerConfig for now.
+ * Shape accepted from API clients (frontend) – same as AtServerConfig for now.
  * Defined separately in case we want stricter validation later.
  */
-export type MatchzyServerConfigInput = MatchzyServerConfig;
+export type AtServerConfigInput = AtServerConfig;
 
 export interface BatchOperationResult {
   success: boolean;

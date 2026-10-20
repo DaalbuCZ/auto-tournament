@@ -1,36 +1,54 @@
+import { logoUrl } from './teamSelfService';
+import type { Untrusted } from '../utils/untrusted';
 /**
  * Shuffle Tournament Service
  * Handles shuffle tournament creation, round generation, and automatic progression
  */
 
+import { RATING_ELO, getGameRatings, ratingGame, ratingJoin } from './gameRatings';
 import { db } from '../config/database';
 import { log } from '../utils/logger';
+import { emitTournamentUpdate } from './socketService';
+import { settingsService } from './settingsService';
 import { balanceTeams, type BalancedTeam } from './teamBalancingService';
 import { playerService, type PlayerRecord } from './playerService';
-import { teamService } from './teamService';
-import { generateMatchConfig } from './matchConfigBuilder';
+import { teamMembers } from './teamMembers';
+import { buildMatchConfigFor, serializeMatchConfig } from '../utils/matchIntegration';
 import { generateUniqueTeamName } from '../generation/teamName';
-import type { TournamentResponse, TournamentType } from '../types/tournament.types';
-import type { DbMatchRow, DbTeamRow } from '../types/database.types';
+import type { TournamentResponse } from '../types/tournament.types';
+import type { DbMatchRow, DbTeamRow, DbTournamentRow } from '../types/database.types';
+import { tournamentRowToResponse } from '../utils/tournamentRow';
+import { withModuleSettings } from '../utils/moduleTournamentSettings';
+import { DEFAULT_GAME } from '../integrations/types';
+import { getIntegration } from '../integrations/registry';
+import { getSwissStandingEntries } from './swissProgressionService';
+import { getRoundRobinStandingEntries } from './roundRobinStandingsService';
 import type { Player } from '../types/team.types';
+import { shuffleTeamId, shuffleTeamLike, tournamentSlugPrefix } from '../utils/matchSlug';
 
+/**
+ * POST /api/tournament/shuffle. The map sequence and round rules belong to
+ * the game module: a request sends them as the module's object in `settings`
+ * (CS2: `settings.cs2`), or at the top level as 2.x clients do. The core
+ * passes both to the module and never reads them.
+ */
 export interface ShuffleTournamentConfig {
   name: string;
-  mapSequence: string[]; // Maps in order (number of maps = number of rounds)
+  /** 2.x: maps in order (number of maps = number of rounds). */
+  mapSequence?: string[];
   teamSize: number; // Number of players per team, default: 5
+  /** 2.x: mp_maxrounds (the module defaults it to 24). */
+  maxRounds?: number;
+  /** 2.x: 'enabled' | 'disabled'. */
+  overtimeMode?: 'enabled' | 'disabled';
   /**
-   * Shuffle tournaments always use an explicit max-rounds limit.
-   * This directly maps to MatchZy's mp_maxrounds.
-   */
-  maxRounds: number; // Required, default: 24 (validated below)
-  overtimeMode: 'enabled' | 'disabled';
-  /**
-   * Optional: max number of overtime segments (maps) allowed before match ends in a draw.
-   * Mapped to MatchZy's overtime limit cvar. If undefined or 0, MatchZy default (unlimited)
-   * behavior is used.
+   * 2.x: max number of overtime segments before the match ends in a draw;
+   * undefined or 0 is the plugin's default (unlimited).
    */
   overtimeSegments?: number;
   eloTemplateId?: string; // ELO calculation template ID (optional, defaults to "Pure Win/Loss")
+  /** The game module's object, under its key (CS2: `cs2`). */
+  settings?: Record<string, Untrusted>;
 }
 
 export interface PlayerLeaderboardEntry {
@@ -44,6 +62,16 @@ export interface PlayerLeaderboardEntry {
   winRate: number;
   eloChange: number; // Change since tournament start
   averageAdr?: number; // Future: average ADR across matches
+  /** This tournament's totals (standard brackets; absent for shuffle). */
+  kills?: number;
+  deaths?: number;
+  assists?: number;
+  headshots?: number;
+  flashAssists?: number;
+  utilityDamage?: number;
+  roundsPlayed?: number;
+  /** The tournament team the player is on, from the team rosters. */
+  team?: { id: string; name: string; tag?: string | null } | null;
 }
 
 export interface TeamLeaderboardEntry {
@@ -54,6 +82,10 @@ export interface TeamLeaderboardEntry {
   matchLosses: number;
   matchCount: number;
   winRate: number;
+  /** Swiss and round robin: rank and round differential from the server standings (Buchholz: Swiss only). */
+  rank?: number;
+  buchholz?: number;
+  roundDiff?: number;
 }
 
 export interface RoundStatus {
@@ -69,77 +101,82 @@ export interface RoundStatus {
  * Create a shuffle tournament
  */
 export async function createShuffleTournament(
+  tournamentId: number,
   config: ShuffleTournamentConfig
 ): Promise<TournamentResponse> {
   const now = Math.floor(Date.now() / 1000);
 
-  // Validate config
-  if (!config.name || config.name.trim() === '') {
-    throw new Error(
-      'Tournament name is required. Please provide a name for your shuffle tournament.'
-    );
+  // The config is validated by the route (POST /api/tournament/shuffle): the
+  // name there, the map sequence and max rounds through the integration's
+  // `validateTournamentSettings`.
+
+  // Clean up any existing data for this tournament row, so it can be
+  // recreated multiple times (tests do) without PK conflicts.
+  await db.runAsync('DELETE FROM matches WHERE tournament_id = ?', [tournamentId]);
+  await db.runAsync('DELETE FROM shuffle_tournament_players WHERE tournament_id = ?', [
+    tournamentId,
+  ]);
+  await db.runAsync('DELETE FROM teams WHERE id LIKE ?', [shuffleTeamLike(tournamentId)]);
+  await db.runAsync('DELETE FROM tournament WHERE id = ?', [tournamentId]);
+
+  // The map sequence and round rules are the game module's (CS2:
+  // settings.cs2), built by it from the request: its object in `settings`,
+  // then the 2.x top-level fields. A 2.x sequence is also the map pool, and a
+  // shuffle tournament has never stored 0 overtime segments: 0 is the default.
+  const legacy: Record<string, Untrusted> = {};
+  if (config.mapSequence !== undefined) {
+    legacy.maps = config.mapSequence;
+    legacy.mapSequence = config.mapSequence;
   }
-
-  if (!config.mapSequence || config.mapSequence.length === 0) {
-    throw new Error(
-      'At least one map must be selected. ' +
-      'The number of maps you select determines the number of rounds in the tournament.'
-    );
+  if (config.maxRounds) legacy.maxRounds = config.maxRounds;
+  if (config.overtimeMode) legacy.overtimeMode = config.overtimeMode;
+  if (config.overtimeSegments !== undefined) {
+    legacy.overtimeSegments =
+      typeof config.overtimeSegments === 'number' && config.overtimeSegments > 0
+        ? config.overtimeSegments
+        : null;
   }
-
-  if (!config.maxRounds || config.maxRounds < 1) {
-    throw new Error(
-      'Invalid max rounds value. You must specify a maximum number of rounds (minimum: 1).'
-    );
-  }
-
-  // Clean up any existing shuffle tournament data (we only support a single shuffle tournament with id = 1)
-  // This ensures we can safely recreate the tournament multiple times in tests without PK conflicts.
-  await db.execAsync('DELETE FROM matches WHERE tournament_id = 1');
-  await db.execAsync('DELETE FROM shuffle_tournament_players WHERE tournament_id = 1');
-  await db.execAsync("DELETE FROM teams WHERE id LIKE 'shuffle-r%'");
-  await db.execAsync('DELETE FROM tournament WHERE id = 1');
-
-  // Create tournament
-  await db.insertAsync('tournament', {
-    id: 1,
-    name: config.name,
-    type: 'shuffle',
-    format: 'bo1', // Shuffle tournaments are always BO1
-    status: 'setup',
-    maps: JSON.stringify(config.mapSequence),
-    team_ids: JSON.stringify([]), // No fixed teams for shuffle tournaments
-    settings: JSON.stringify({
+  const settings = withModuleSettings(
+    DEFAULT_GAME,
+    {
       matchFormat: 'bo1',
       thirdPlaceMatch: false,
       autoAdvance: true,
       checkInRequired: false,
       seedingMethod: 'random',
-    }),
-    map_sequence: JSON.stringify(config.mapSequence),
+    },
+    { ...legacy, settings: config.settings },
+    undefined,
+    'tournament'
+  );
+
+  // Create tournament
+  await db.insertAsync('tournament', {
+    id: tournamentId,
+    name: config.name,
+    type: 'shuffle',
+    format: 'bo1', // Shuffle tournaments are always BO1
+    status: 'setup',
+    team_ids: JSON.stringify([]), // No fixed teams for shuffle tournaments
+    settings: JSON.stringify(settings),
     team_size: config.teamSize || 5,
-    max_rounds: config.maxRounds || 24,
-    overtime_mode: config.overtimeMode || 'enabled',
-    overtime_segments:
-      typeof config.overtimeSegments === 'number' && config.overtimeSegments > 0
-        ? config.overtimeSegments
-        : null,
     elo_template_id: config.eloTemplateId || null,
     created_at: now,
     updated_at: now,
   });
 
-  log.success(`Shuffle tournament created: ${config.name}`, {
-    rounds: config.mapSequence.length,
-    overtimeMode: config.overtimeMode,
-    overtimeSegments: config.overtimeSegments,
-  });
-
-  const tournament = await getShuffleTournament();
+  const tournament = await getShuffleTournament(tournamentId);
   if (!tournament) {
     throw new Error('Failed to create tournament');
   }
 
+  log.success(`Shuffle tournament created: ${config.name}`, {
+    rounds: (tournament.mapSequence || tournament.maps).length,
+    overtimeMode: tournament.overtimeMode,
+    overtimeSegments: tournament.overtimeSegments,
+  });
+
+  await (await import('./currentTournament')).refreshCurrentTournamentId();
   return tournament;
 }
 
@@ -147,19 +184,24 @@ export async function createShuffleTournament(
  * Register players to shuffle tournament
  * Players are automatically whitelisted for matches
  */
-export async function registerPlayers(playerIds: string[]): Promise<{
+export async function registerPlayers(
+  tournamentId: number,
+  playerIds: string[]
+): Promise<{
   registered: number;
   errors: Array<{ playerId: string; error: string }>;
 }> {
-  const tournament = await getShuffleTournament();
+  const tournament = await getShuffleTournament(tournamentId);
   if (!tournament) {
     throw new Error('No shuffle tournament found. Please create a shuffle tournament first.');
   }
 
-  if (tournament.status !== 'setup') {
+  // Each round draws from whoever is registered then, so a player can join a running
+  // shuffle and is in the next round's draw.
+  if (tournament.status !== 'setup' && tournament.status !== 'in_progress') {
     throw new Error(
       `Cannot register players. Tournament is in "${tournament.status}" status. ` +
-      'Players can only be registered when tournament is in "setup" status.'
+        'Players can only be registered before it starts or while it runs.'
     );
   }
 
@@ -183,8 +225,16 @@ export async function registerPlayers(playerIds: string[]): Promise<{
 
       // Register player (upsert - ignore if already registered)
       try {
+        const back = await db.runAsync(
+          'UPDATE shuffle_tournament_players SET left_at = NULL, left_reason = NULL WHERE tournament_id = ? AND player_id = ? AND left_at IS NOT NULL',
+          [tournamentId, playerId]
+        );
+        if (back.changes > 0) {
+          registered++;
+          continue;
+        }
         await db.insertAsync('shuffle_tournament_players', {
-          tournament_id: 1,
+          tournament_id: tournamentId,
           player_id: playerId,
           registered_at: Math.floor(Date.now() / 1000),
         });
@@ -213,42 +263,73 @@ export async function registerPlayers(playerIds: string[]): Promise<{
 /**
  * Get registered players for shuffle tournament
  */
-export async function getRegisteredPlayers(): Promise<PlayerRecord[]> {
+export async function getRegisteredPlayers(
+  tournamentId: number,
+  /** Only the players still in it (not left a running shuffle): the ones a round draws. */
+  options: { active?: boolean } = {}
+): Promise<PlayerRecord[]> {
   const playerIds = await db.queryAsync<{ player_id: string }>(
-    'SELECT player_id FROM shuffle_tournament_players WHERE tournament_id = 1 ORDER BY registered_at'
+    `SELECT player_id FROM shuffle_tournament_players WHERE tournament_id = ?${
+      options.active ? ' AND left_at IS NULL' : ''
+    } ORDER BY registered_at`,
+    [tournamentId]
   );
 
   if (playerIds.length === 0) {
     return [];
   }
 
-  return await playerService.getPlayersByIds(playerIds.map((p) => p.player_id));
+  // Their ratings in the tournament's game: balancing and the standings use them.
+  const ids = playerIds.map((p) => p.player_id);
+  const tournament = await db.queryOneAsync<{ game: string | null }>(
+    'SELECT game FROM tournament WHERE id = ?',
+    [tournamentId]
+  );
+  const ratings = await getGameRatings(ids, tournament?.game);
+  return (await playerService.getPlayersByIds(ids)).map((p) => {
+    const r = ratings.get(p.id);
+    return r
+      ? {
+          ...p,
+          current_elo: r.elo,
+          openskill_mu: r.mu,
+          openskill_sigma: r.sigma,
+          match_count: r.matchCount,
+        }
+      : p;
+  });
 }
 
 /**
  * Set registered players for shuffle tournament (replaces all existing registrations)
  * This allows selecting/deselecting players by providing the full list
  */
-export async function setRegisteredPlayers(playerIds: string[]): Promise<{
+export async function setRegisteredPlayers(
+  tournamentId: number,
+  playerIds: string[]
+): Promise<{
   registered: number;
   unregistered: number;
   errors: Array<{ playerId: string; error: string }>;
 }> {
-  const tournament = await getShuffleTournament();
+  const tournament = await getShuffleTournament(tournamentId);
   if (!tournament) {
     throw new Error('No shuffle tournament found. Please create a shuffle tournament first.');
   }
 
-  if (tournament.status !== 'setup') {
+  // A running shuffle: a removed player leaves (keeps their results, is not drawn again).
+  const running = tournament.status === 'in_progress';
+  if (tournament.status !== 'setup' && !running) {
     throw new Error(
       `Cannot modify player registrations. Tournament is in "${tournament.status}" status. ` +
-      'Players can only be modified when tournament is in "setup" status.'
+        'Players can only be modified before it starts or while it runs.'
     );
   }
 
   // Get currently registered players
   const currentPlayerIds = await db.queryAsync<{ player_id: string }>(
-    'SELECT player_id FROM shuffle_tournament_players WHERE tournament_id = 1'
+    'SELECT player_id FROM shuffle_tournament_players WHERE tournament_id = ? AND left_at IS NULL',
+    [tournamentId]
   );
   const currentIds = new Set(currentPlayerIds.map((p) => p.player_id));
 
@@ -264,8 +345,16 @@ export async function setRegisteredPlayers(playerIds: string[]): Promise<{
   // Remove players that are no longer in the list
   for (const playerId of toRemove) {
     try {
+      if (running) {
+        await db.runAsync(
+          'UPDATE shuffle_tournament_players SET left_at = ?, left_reason = ? WHERE tournament_id = ? AND player_id = ?',
+          [Math.floor(Date.now() / 1000), 'removed', tournamentId, playerId]
+        );
+        unregistered++;
+        continue;
+      }
       await db.deleteAsync('shuffle_tournament_players', 'tournament_id = ? AND player_id = ?', [
-        1,
+        tournamentId,
         playerId,
       ]);
       unregistered++;
@@ -286,12 +375,12 @@ export async function setRegisteredPlayers(playerIds: string[]): Promise<{
         continue;
       }
 
-      // Register player
-      await db.insertAsync('shuffle_tournament_players', {
-        tournament_id: 1,
-        player_id: playerId,
-        registered_at: now,
-      });
+      // Register player (or bring back one who left a running shuffle)
+      await db.runAsync(
+        `INSERT INTO shuffle_tournament_players (tournament_id, player_id, registered_at) VALUES (?, ?, ?)
+         ON CONFLICT (tournament_id, player_id) DO UPDATE SET left_at = NULL, left_reason = NULL`,
+        [tournamentId, playerId, now]
+      );
       registered++;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -307,14 +396,28 @@ export async function setRegisteredPlayers(playerIds: string[]): Promise<{
 }
 
 /**
+ * With bot fill, how many teams a round of `players` makes: an even count where
+ * at most one team is short (bots fill fewer than `teamSize` slots). `undefined`
+ * when that needs more bots: the round sits the fewest players out instead.
+ */
+export function botFillTeamCount(players: number, teamSize: number): number | undefined {
+  let teams = Math.ceil(players / teamSize);
+  if (teams % 2 === 1) teams += 1;
+  return teams * teamSize - players < teamSize ? teams : undefined;
+}
+
+/**
  * Generate matches for a round
  * Automatically balances teams and creates matches
  */
-export async function generateRoundMatches(roundNumber: number): Promise<{
+export async function generateRoundMatches(
+  tournamentId: number,
+  roundNumber: number
+): Promise<{
   matches: DbMatchRow[];
   teams: BalancedTeam[];
 }> {
-  const tournament = await getShuffleTournament();
+  const tournament = await getShuffleTournament(tournamentId);
   if (!tournament) {
     throw new Error('No shuffle tournament found');
   }
@@ -324,58 +427,90 @@ export async function generateRoundMatches(roundNumber: number): Promise<{
   if (roundNumber < 1 || roundNumber > mapSequence.length) {
     throw new Error(
       `Invalid round number: ${roundNumber}. ` +
-      `Tournament has ${mapSequence.length} round(s) (based on ${mapSequence.length} map(s) selected). ` +
-      `Valid round numbers: 1-${mapSequence.length}.`
+        `Tournament has ${mapSequence.length} round(s) (based on ${mapSequence.length} map(s) selected). ` +
+        `Valid round numbers: 1-${mapSequence.length}.`
     );
   }
 
   const map = mapSequence[roundNumber - 1];
   const teamSize = tournament.teamSize || 5;
 
-  // Get registered players
-  const players = await getRegisteredPlayers();
+  // Get registered players (not the ones who left)
+  const players = await getRegisteredPlayers(tournamentId, { active: true });
   const minPlayers = teamSize * 2; // Need at least 2 teams
   if (players.length < minPlayers) {
     throw new Error(
       `Not enough players registered: ${players.length}. ` +
-      `Shuffle tournaments require at least ${minPlayers} players for ${teamSize}v${teamSize} matches. ` +
-      `Please register ${minPlayers - players.length} more player(s) before generating matches.`
+        `Shuffle tournaments require at least ${minPlayers} players for ${teamSize}v${teamSize} matches. ` +
+        `Please register ${minPlayers - players.length} more player(s) before generating matches.`
     );
   }
 
-  // Handle odd number of players with rotation
-  // Track players who played in the previous round so we can rotate in players who sat out
-  let playersWhoPlayedLastRound: string[] = [];
-  if (roundNumber > 1) {
-    // Get players who played in the previous round
-    const previousRoundMatches = await db.queryAsync<DbMatchRow>(
-      'SELECT * FROM matches WHERE tournament_id = 1 AND round = ?',
-      [roundNumber - 1]
-    );
-
-    const playersWhoPlayed = new Set<string>();
-    for (const match of previousRoundMatches) {
-      const team1 = await teamService.getTeamById(match.team1_id || '');
-      const team2 = await teamService.getTeamById(match.team2_id || '');
-      if (team1) {
-        team1.players.forEach((p) => playersWhoPlayed.add(p.steamId));
-      }
-      if (team2) {
-        team2.players.forEach((p) => playersWhoPlayed.add(p.steamId));
-      }
+  // Pick who sits out before balancing so every team gets a match. With 15 players in 2v2,
+  // three sit out each round: the ones who have played the most so far, never the same
+  // people twice in a row while others are still owed a break.
+  const playedCount = new Map<string, number>();
+  const earlierTeams = await db.queryAsync<{ players: string }>(
+    'SELECT players FROM teams WHERE id LIKE ?',
+    [shuffleTeamLike(tournamentId)]
+  );
+  for (const team of earlierTeams) {
+    for (const p of JSON.parse(team.players || '[]') as Player[]) {
+      playedCount.set(p.steamId, (playedCount.get(p.steamId) ?? 0) + 1);
     }
-
-    // Players who played last round are candidates to sit this round if needed
-    const allPlayerIds = players.map((p) => p.id);
-    playersWhoPlayedLastRound = allPlayerIds.filter((id) => playersWhoPlayed.has(id));
+  }
+  // Bot fill: as much player-vs-player as possible. Bots only when one short team
+  // covers the gap (15 players in 2v2: one bot, nobody sits out); with more bots than
+  // that (9 players: three), the fewest players sit out instead.
+  const botFill =
+    getIntegration(tournament.game ?? DEFAULT_GAME).fillsShortTeams?.(tournament) ?? false;
+  const teamCount = botFill ? botFillTeamCount(players.length, teamSize) : undefined;
+  const sitCount = teamCount !== undefined ? 0 : players.length % (teamSize * 2);
+  const sitOut = new Set(
+    players
+      .map((p) => ({ id: p.id, played: playedCount.get(p.id) ?? 0, tiebreak: Math.random() }))
+      .sort((x, y) => y.played - x.played || x.tiebreak - y.tiebreak)
+      .slice(0, sitCount)
+      .map((p) => p.id)
+  );
+  if (sitOut.size > 0) {
+    log.info(`Round ${roundNumber}: ${sitOut.size} player(s) sit out`, { players: [...sitOut] });
   }
 
   // Balance teams
-  const playerIds = players.map((p) => p.id);
-  const balanceResult = await balanceTeams(playerIds, teamSize, true); // Use tournament team size, use optimization
+  const playerIds = players.map((p) => p.id).filter((id) => !sitOut.has(id));
+  const tournamentGame = (
+    await db.queryOneAsync<{ game: string | null }>('SELECT game FROM tournament WHERE id = ?', [
+      tournamentId,
+    ])
+  )?.game;
+  const balanceResult = await balanceTeams(playerIds, teamSize, true, tournamentGame, teamCount); // Use tournament team size, use optimization
 
   // Create temporary teams for this round
   const teams: BalancedTeam[] = balanceResult.teams;
+  const matches = await insertRoundMatches(tournament, tournamentId, roundNumber, map, teams, 1);
+
+  log.success(`Generated ${matches.length} matches for round ${roundNumber}`, {
+    map,
+    players: players.length,
+    teams: teams.length,
+  });
+
+  return { matches, teams };
+}
+
+/**
+ * Pair up `teams` (1 v 2, 3 v 4, ...) into this round's matches, numbered from
+ * `firstMatchNumber`: their teams, rosters and match rows, ready to allocate.
+ */
+async function insertRoundMatches(
+  tournament: TournamentResponse,
+  tournamentId: number,
+  roundNumber: number,
+  map: string,
+  teams: BalancedTeam[],
+  firstMatchNumber: number
+): Promise<DbMatchRow[]> {
   const createdTeams: Array<{ team1Id: string; team2Id: string }> = [];
 
   const now = Math.floor(Date.now() / 1000);
@@ -387,142 +522,22 @@ export async function generateRoundMatches(roundNumber: number): Promise<{
   // Build a set of team names that have already been used by previous shuffle
   // rounds so we never reuse a name within the same tournament.
   const existingShuffleTeams = await db.queryAsync<DbTeamRow>(
-    "SELECT id, name, tag FROM teams WHERE id LIKE 'shuffle-r%'"
+    'SELECT id, name, tag FROM teams WHERE id LIKE ?',
+    [shuffleTeamLike(tournamentId)]
   );
   const usedTeamNames = new Set<string>(existingShuffleTeams.map((t) => t.name));
 
   // Create matches for each team pair
-  for (let matchNum = 0; matchNum < teams.length / 2; matchNum++) {
-    const team1Index = matchNum * 2;
+  for (let pair = 0; pair < teams.length / 2; pair++) {
+    const matchNum = firstMatchNumber - 1 + pair;
+    const team1Index = pair * 2;
     const team2Index = team1Index + 1;
 
     if (team2Index >= teams.length) {
-      // Odd number of teams - handle rotation
-      const lastTeam = teams[team1Index];
-      const lastTeamPlayerIds = lastTeam.players.map((p) => p.id);
-
-      // Candidates to rotate in are players from the leftover team who did NOT play last round
-      // (i.e. they sat out previously and we want to prioritize getting them into matches)
-      let candidateIds = lastTeamPlayerIds.filter((id) => !playersWhoPlayedLastRound.includes(id));
-
-      if (candidateIds.length > 0 && roundNumber > 1) {
-        // Try to swap as many candidates as possible with players who played last round.
-        // This avoids the same players sitting out multiple rounds in a row when we have options.
-        let swappedAny = false;
-
-        for (const match of matches) {
-          if (candidateIds.length === 0) break;
-
-          const existingTeam1 = await teamService.getTeamById(match.team1_id || '');
-          const existingTeam2 = await teamService.getTeamById(match.team2_id || '');
-
-          for (const existingTeam of [existingTeam1, existingTeam2].filter(Boolean)) {
-            if (!existingTeam) continue;
-            if (candidateIds.length === 0) break;
-
-            for (const existingPlayer of existingTeam.players) {
-              if (candidateIds.length === 0) break;
-
-              // Only consider swapping out players who played last round
-              if (!playersWhoPlayedLastRound.includes(existingPlayer.steamId)) {
-                continue;
-              }
-
-              // Prefer the candidate with the fewest matches played overall (fair rotation)
-              let bestCandidateId: string | null = null;
-              let bestMatchCount = Number.POSITIVE_INFINITY;
-
-              for (const candidateId of candidateIds) {
-                const candidateRecord = players.find((p) => p.id === candidateId);
-                const matchCount = candidateRecord?.match_count ?? 0;
-                if (matchCount < bestMatchCount) {
-                  bestMatchCount = matchCount;
-                  bestCandidateId = candidateId;
-                }
-              }
-
-              if (!bestCandidateId) {
-                continue;
-              }
-
-              const candidateRecord = players.find((p) => p.id === bestCandidateId);
-              if (!candidateRecord) {
-                // Remove bad candidate and continue
-                candidateIds = candidateIds.filter((id) => id !== bestCandidateId);
-                continue;
-              }
-
-              // Swap: remove player who played last round, add player who sat out
-              const playerToRemove = existingPlayer.steamId;
-              const updatedPlayers = existingTeam.players
-                .filter((p) => p.steamId !== playerToRemove)
-                .concat([
-                  {
-                    steamId: candidateRecord.id,
-                    name: candidateRecord.name,
-                    avatar: candidateRecord.avatar_url,
-                  },
-                ]);
-
-              await db.updateAsync(
-                'teams',
-                { players: JSON.stringify(updatedPlayers), updated_at: now },
-                'id = ?',
-                [existingTeam.id]
-              );
-
-              // Update match config
-              if (!match.slug) continue;
-              const matchSlug = match.slug;
-              const updatedMatch = await db.queryOneAsync<DbMatchRow>(
-                'SELECT * FROM matches WHERE slug = ?',
-                [matchSlug]
-              );
-              if (updatedMatch && updatedMatch.config) {
-                const matchConfig = JSON.parse(updatedMatch.config);
-                if (existingTeam.id === match.team1_id) {
-                  matchConfig.team1.players = updatedPlayers.reduce((acc, p) => {
-                    acc[p.steamId] = p.name;
-                    return acc;
-                  }, {} as Record<string, string>);
-                } else {
-                  matchConfig.team2.players = updatedPlayers.reduce((acc, p) => {
-                    acc[p.steamId] = p.name;
-                    return acc;
-                  }, {} as Record<string, string>);
-                }
-                await db.updateAsync('matches', { config: JSON.stringify(matchConfig) }, 'id = ?', [
-                  updatedMatch.id,
-                ]);
-              }
-
-              log.info(
-                `Rotated player ${candidateRecord.name} into match ${matchSlug}, removed ${existingPlayer.name}`
-              );
-              swappedAny = true;
-
-              // Remove this candidate so we don't try to place them again
-              candidateIds = candidateIds.filter((id) => id !== bestCandidateId);
-            }
-          }
-        }
-
-        if (!swappedAny) {
-          // Couldn't swap, log warning
-          log.warn(
-            `Odd number of teams in round ${roundNumber}, could not rotate players. Last team (${lastTeam.players
-              .map((p) => p.name)
-              .join(', ')}) will sit out.`
-          );
-        }
-      } else {
-        // First round or no rotation needed - skip last team
-        log.info(
-          `Odd number of teams in round ${roundNumber}, skipping last team (${lastTeam.players
-            .map((p) => p.name)
-            .join(', ')})`
-        );
-      }
+      // Sit-outs are picked before balancing, so this only happens if balancing drops a team.
+      log.warn(
+        `Round ${roundNumber}: odd team count, ${teams[team1Index].players.length} player(s) sit out`
+      );
       break;
     }
 
@@ -530,8 +545,8 @@ export async function generateRoundMatches(roundNumber: number): Promise<{
     const team2 = teams[team2Index];
 
     // Create temporary teams
-    const team1Id = `shuffle-r${roundNumber}-m${matchNum + 1}-team1`;
-    const team2Id = `shuffle-r${roundNumber}-m${matchNum + 1}-team2`;
+    const team1Id = shuffleTeamId(tournamentId, roundNumber, matchNum + 1, 1);
+    const team2Id = shuffleTeamId(tournamentId, roundNumber, matchNum + 1, 2);
 
     // Pick two distinct, random, globally-unique team names for this match.
     const team1FriendlyName = generateUniqueTeamName(usedTeamNames);
@@ -569,30 +584,41 @@ export async function generateRoundMatches(roundNumber: number): Promise<{
       updated_at: now,
     });
 
+    // Mirror both rosters into team_members (3.0 phase D), as a team written
+    // through teamService would. Best effort; these teams cascade away with
+    // the round.
+    await teamMembers.syncFromRoster(
+      team1Id,
+      team1Players.map((p) => p.steamId)
+    );
+    await teamMembers.syncFromRoster(
+      team2Id,
+      team2Players.map((p) => p.steamId)
+    );
+
     createdTeams.push({ team1Id, team2Id });
 
-    // Generate match config
-    const matchSlug = `shuffle-r${roundNumber}-m${matchNum + 1}`;
-    const config = await generateMatchConfig(tournament, team1Id, team2Id, matchSlug);
-
-    // Update config for shuffle tournament specifics
-    config.skip_veto = true; // No veto for shuffle
-    config.maplist = [map]; // Single map for this round
-    config.map_sides = [Math.random() > 0.5 ? 'team1_ct' : 'team2_ct']; // Random side
+    // Build the match config through the game integration. For shuffle it is
+    // Bo1 on the round's map (map sequence), random side, no veto.
+    const matchSlug = `${tournamentSlugPrefix(tournamentId)}shuffle-r${roundNumber}-m${matchNum + 1}`;
+    const config = await buildMatchConfigFor(
+      { slug: matchSlug, round: roundNumber, team1Id, team2Id },
+      tournament
+    );
 
     // Create match
     // Shuffle tournaments skip veto, so matches are immediately ready for server allocation
     await db.insertAsync('matches', {
       slug: matchSlug,
-      tournament_id: 1,
+      tournament_id: tournamentId,
       round: roundNumber,
       match_number: matchNum + 1,
       team1_id: team1Id,
       team2_id: team2Id,
       winner_id: null,
       server_id: null,
-      config: JSON.stringify(config),
-      status: 'ready', // Changed from 'pending' to 'ready' since skip_veto = true
+      config: serializeMatchConfig(config),
+      status: 'ready', // No veto for a shuffle match
       next_match_id: null,
       current_map: map,
       map_number: 0,
@@ -607,23 +633,128 @@ export async function generateRoundMatches(roundNumber: number): Promise<{
       matches.push(match);
     }
   }
+  return matches;
+}
 
-  log.success(`Generated ${matches.length} matches for round ${roundNumber}`, {
+/** Minutes into a round after which the bench waits for the next round instead. */
+export const LATE_BENCH_SECONDS = 10 * 60;
+
+/**
+ * Too late in the round for an extra match from the bench: one of the round's matches has
+ * already finished, or the round started more than LATE_BENCH_SECONDS ago. The next round waits
+ * for every match of this one, so a full match made at 20:40 held round 3 until it ended, long
+ * after the rest of round 2 (NTLAN, 2026-10-16). Those players are drawn next round instead.
+ */
+export function benchTooLate(
+  round: { startedAt: number | null; finished: number },
+  now: number
+): boolean {
+  if (round.finished > 0) return true;
+  return round.startedAt !== null && now - round.startedAt > LATE_BENCH_SECONDS;
+}
+
+/**
+ * Players who joined a running shuffle (or sat this round out) play now when
+ * there are enough of them: the round gets extra matches from its bench
+ * instead of them waiting for the next round. With bot fill two players are
+ * enough (short teams get bots); otherwise it takes two full teams. Returns
+ * the new matches' slugs, already handed to allocation.
+ */
+export async function fillRoundFromBench(tournamentId: number): Promise<string[]> {
+  const tournament = await getShuffleTournament(tournamentId);
+  if (!tournament || tournament.status !== 'in_progress') return [];
+  const top = await db.queryOneAsync<{ round: number | null; open: number }>(
+    `SELECT MAX(round) AS round,
+            SUM(CASE WHEN status NOT IN ('completed', 'cancelled') THEN 1 ELSE 0 END)::INTEGER AS open
+       FROM matches WHERE tournament_id = ?`,
+    [tournamentId]
+  );
+  const roundNumber = top?.round ?? null;
+  // A round that has finished is about to be replaced by the next one, which draws everyone.
+  if (roundNumber === null || !top?.open) return [];
+  const progress = await db.queryOneAsync<{ started: number | null; finished: number | string }>(
+    `SELECT MIN(loaded_at) AS started,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS finished
+       FROM matches WHERE tournament_id = ? AND round = ?`,
+    [tournamentId, roundNumber]
+  );
+  if (
+    benchTooLate(
+      {
+        startedAt: progress?.started ? Number(progress.started) : null,
+        finished: Number(progress?.finished ?? 0),
+      },
+      Math.floor(Date.now() / 1000)
+    )
+  ) {
+    log.info(`Round ${roundNumber}: too late for a match from the bench; they play next round`);
+    return [];
+  }
+  const mapSequence = tournament.mapSequence || tournament.maps;
+  const map = mapSequence[roundNumber - 1];
+  if (!map) return [];
+  const teamSize = tournament.teamSize || 5;
+
+  const roundTeams = await db.queryAsync<{ players: string | null }>(
+    `SELECT t.players FROM matches m JOIN teams t ON t.id IN (m.team1_id, m.team2_id)
+      WHERE m.tournament_id = ? AND m.round = ?`,
+    [tournamentId, roundNumber]
+  );
+  const playing = new Set(
+    roundTeams.flatMap((t) => (JSON.parse(t.players || '[]') as Player[]).map((p) => p.steamId))
+  );
+  const bench = (await getRegisteredPlayers(tournamentId, { active: true })).filter(
+    (p) => !playing.has(p.id)
+  );
+
+  const botFill =
+    getIntegration(tournament.game ?? DEFAULT_GAME).fillsShortTeams?.(tournament) ?? false;
+  const teamCount =
+    (botFill ? botFillTeamCount(bench.length, teamSize) : undefined) ??
+    Math.floor(bench.length / (teamSize * 2)) * 2;
+  if (teamCount < 2) return [];
+  const take = bench.slice(0, Math.min(bench.length, teamCount * teamSize));
+
+  const existing = await db.queryOneAsync<{ n: number }>(
+    'SELECT COUNT(*)::INTEGER AS n FROM matches WHERE tournament_id = ? AND round = ?',
+    [tournamentId, roundNumber]
+  );
+  const { teams } = await balanceTeams(
+    take.map((p) => p.id),
+    teamSize,
+    true,
+    tournament.game,
+    teamCount
+  );
+  const matches = await insertRoundMatches(
+    tournament,
+    tournamentId,
+    roundNumber,
     map,
-    players: players.length,
-    teams: teams.length,
-  });
-
-  return { matches, teams };
+    teams,
+    Number(existing?.n ?? 0) + 1
+  );
+  const slugs = matches.map((m) => m.slug);
+  log.info(`Round ${roundNumber}: ${slugs.length} extra match(es) from the bench`, { slugs });
+  if (slugs.length > 0) {
+    const { scheduler } = await import('../core/scheduler');
+    void scheduler
+      .allocateSpecificMatches(tournamentId, slugs, process.env.FRONTEND_BASE_URL ?? '')
+      .catch((error) => log.error('Allocating bench matches failed', { error }));
+  }
+  return slugs;
 }
 
 /**
  * Check if a round is complete
  */
-export async function checkRoundCompletion(roundNumber: number): Promise<boolean> {
+export async function checkRoundCompletion(
+  tournamentId: number,
+  roundNumber: number
+): Promise<boolean> {
   const matches = await db.queryAsync<DbMatchRow>(
-    'SELECT * FROM matches WHERE tournament_id = 1 AND round = ?',
-    [roundNumber]
+    'SELECT * FROM matches WHERE tournament_id = ? AND round = ?',
+    [tournamentId, roundNumber]
   );
 
   if (matches.length === 0) {
@@ -631,8 +762,8 @@ export async function checkRoundCompletion(roundNumber: number): Promise<boolean
     return false; // No matches for this round
   }
 
-  // Check if all matches are completed
-  const allComplete = matches.every((m) => m.status === 'completed');
+  // Check if all matches are over (a match nobody came to is cancelled)
+  const allComplete = matches.every((m) => ['completed', 'cancelled'].includes(String(m.status)));
 
   if (!allComplete) {
     const completed = matches.filter((m) => m.status === 'completed').length;
@@ -646,18 +777,75 @@ export async function checkRoundCompletion(roundNumber: number): Promise<boolean
  * Advance to next round automatically
  * Called when current round is complete
  */
-export async function advanceToNextRound(): Promise<{
+/**
+ * The tournament's breaks between rounds (settings.roundBreaks): `minutes` after
+ * every round, and `after` a longer (or shorter) one after given rounds, e.g.
+ * { minutes: 0, after: { "3": 30 } } = three rounds back to back, 30 minutes,
+ * then the rest. Without it, the site's break between matches (default 5).
+ */
+export interface RoundBreaks {
+  minutes?: number;
+  after?: Record<string, number>;
+}
+
+/** Minutes of break after `round` (round 1 → before round 2). */
+export async function breakAfterRound(tournamentId: number, round: number): Promise<number> {
+  const row = await db.queryOneAsync<{ settings: string | null }>(
+    'SELECT settings FROM tournament WHERE id = ?',
+    [tournamentId]
+  );
+  let breaks: RoundBreaks | undefined;
+  try {
+    breaks = (JSON.parse(row?.settings ?? '{}') as { roundBreaks?: RoundBreaks }).roundBreaks;
+  } catch {
+    breaks = undefined;
+  }
+  const valid = (n: Untrusted) =>
+    typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 24 * 60 ? n : undefined;
+  const special = valid(breaks?.after?.[String(round)]);
+  if (special !== undefined) return special;
+  const every = valid(breaks?.minutes);
+  if (every !== undefined) return every;
+  const raw = await settingsService.getSetting('at_match_break_minutes');
+  const site = raw === null || raw === undefined || raw === '' ? 5 : Number(raw);
+  return Number.isFinite(site) && site > 0 ? site : 0;
+}
+
+/** Hold a new shuffle round's matches for the break after the round before it. */
+async function holdRoundForBreak(
+  tournamentId: number,
+  round: number,
+  matches: DbMatchRow[]
+): Promise<void> {
+  try {
+    const minutes = await breakAfterRound(tournamentId, round - 1);
+    if (minutes <= 0) return;
+    const until = Math.floor(Date.now() / 1000) + Math.round(minutes * 60);
+    const { holdForBreak } = await import('./matchHolds');
+    for (const m of matches) {
+      await holdForBreak(m.slug, until, `Break between rounds (${minutes} min)`);
+    }
+    log.info(`Shuffle round ${round}: break until ${new Date(until * 1000).toISOString()}`);
+  } catch (error) {
+    log.warn(`Shuffle round ${round}: could not hold for the break`, {
+      error: (error as Error).message,
+    });
+  }
+}
+
+export async function advanceToNextRound(tournamentId: number): Promise<{
   roundNumber: number;
   matches: DbMatchRow[];
 } | null> {
-  const tournament = await getShuffleTournament();
+  const tournament = await getShuffleTournament(tournamentId);
   if (!tournament) {
     throw new Error('No shuffle tournament found. Please create a shuffle tournament first.');
   }
 
   // Get current round (find highest round with matches)
   const currentRoundResult = await db.queryOneAsync<{ max_round: number }>(
-    'SELECT MAX(round) as max_round FROM matches WHERE tournament_id = 1'
+    'SELECT MAX(round) as max_round FROM matches WHERE tournament_id = ?',
+    [tournamentId]
   );
 
   const currentRound = currentRoundResult?.max_round || 0;
@@ -668,7 +856,7 @@ export async function advanceToNextRound(): Promise<{
 
   // Check if current round is complete
   if (currentRound > 0) {
-    const isComplete = await checkRoundCompletion(currentRound);
+    const isComplete = await checkRoundCompletion(tournamentId, currentRound);
     if (!isComplete) {
       log.debug(`Round ${currentRound} is not complete yet`);
       return null;
@@ -679,8 +867,15 @@ export async function advanceToNextRound(): Promise<{
   const mapSequence = tournament.mapSequence || tournament.maps;
   const nextRound = currentRound + 1;
 
+  // Too few players left for another round (no-shows dropped out): the
+  // tournament ends here instead of hanging between rounds.
+  const outOfPlayers =
+    currentRound > 0 &&
+    (await getRegisteredPlayers(tournamentId, { active: true })).length <
+      (tournament.teamSize || 5) * 2;
+
   // Check if tournament is complete
-  if (nextRound > mapSequence.length) {
+  if (nextRound > mapSequence.length || outOfPlayers) {
     // Tournament complete
     const completedAt = Math.floor(Date.now() / 1000);
     await db.updateAsync(
@@ -691,18 +886,42 @@ export async function advanceToNextRound(): Promise<{
         updated_at: completedAt,
       },
       'id = ?',
-      [1]
+      [tournamentId]
     );
 
+    // The leaderboard's top three players get the tournament's prizes (CS2: skins).
+    try {
+      const board = await getPlayerLeaderboard(tournamentId);
+      const placed = board
+        .filter((p) => p.matchWins + p.matchLosses > 0 && /^7656\d{13}$/.test(p.playerId))
+        .slice(0, 4)
+        .map((p, i) => ({ place: (i + 1) as 1 | 2 | 3 | 4, steamIds: [p.playerId] }));
+      const row = await db.queryOneAsync<DbTournamentRow>('SELECT * FROM tournament WHERE id = ?', [
+        tournamentId,
+      ]);
+      if (row) {
+        const { awardPlacements } = await import('../utils/matchProgression');
+        await awardPlacements(row, placed);
+      }
+    } catch (error) {
+      log.error('Shuffle placements: could not award prizes', { error });
+    }
+
     log.success(
-      `Shuffle tournament completed! All ${mapSequence.length} round(s) finished. ` +
-      `Final leaderboard available at /tournament/1/leaderboard`
+      (outOfPlayers
+        ? `Shuffle tournament completed after round ${currentRound}: too few players left. `
+        : `Shuffle tournament completed! All ${mapSequence.length} round(s) finished. `) +
+        `Final leaderboard available at /tournament/${tournamentId}/leaderboard`
     );
     return null;
   }
 
   // Generate next round matches
-  const result = await generateRoundMatches(nextRound);
+  const result = await generateRoundMatches(tournamentId, nextRound);
+
+  // A break between rounds: players get new partners every round, so the break between a
+  // team's matches (veto/break.ts) never finds an earlier match. Hold the round instead.
+  if (currentRound > 0) await holdRoundForBreak(tournamentId, nextRound, result.matches);
 
   // Update tournament status if starting first round
   if (currentRound === 0) {
@@ -714,7 +933,7 @@ export async function advanceToNextRound(): Promise<{
         updated_at: Math.floor(Date.now() / 1000),
       },
       'id = ?',
-      [1]
+      [tournamentId]
     );
   }
 
@@ -729,8 +948,10 @@ export async function advanceToNextRound(): Promise<{
 /**
  * Get player leaderboard
  */
-export async function getPlayerLeaderboard(): Promise<PlayerLeaderboardEntry[]> {
-  const players = await getRegisteredPlayers();
+export async function getPlayerLeaderboard(
+  tournamentId: number
+): Promise<PlayerLeaderboardEntry[]> {
+  const players = await getRegisteredPlayers(tournamentId);
 
   // Get match results for all players
   const leaderboard: PlayerLeaderboardEntry[] = await Promise.all(
@@ -744,9 +965,9 @@ export async function getPlayerLeaderboard(): Promise<PlayerLeaderboardEntry[]> 
         `SELECT match_slug, team, won_match 
          FROM player_match_stats 
          WHERE player_id = ? AND match_slug IN (
-           SELECT slug FROM matches WHERE tournament_id = 1
+           SELECT slug FROM matches WHERE tournament_id = ?
          )`,
-        [player.id]
+        [player.id, tournamentId]
       );
 
       // Deduplicate by match_slug so we only count each match once per player,
@@ -763,15 +984,15 @@ export async function getPlayerLeaderboard(): Promise<PlayerLeaderboardEntry[]> 
       const totalMatches = uniqueMatches.length;
       const winRate = totalMatches > 0 ? wins / totalMatches : 0;
 
-      // Aggregate ELO change for this tournament only (shuffle tournament id = 1)
+      // Aggregate ELO change for this tournament only
       const eloChangeRow = await db.queryOneAsync<{ total_elo_change: number }>(
         `
           SELECT COALESCE(SUM(elo_change), 0) as total_elo_change
           FROM player_rating_history
           WHERE player_id = ?
-            AND match_slug IN (SELECT slug FROM matches WHERE tournament_id = 1)
+            AND match_slug IN (SELECT slug FROM matches WHERE tournament_id = ?)
         `,
-        [player.id]
+        [player.id, tournamentId]
       );
       const eloChange = eloChangeRow?.total_elo_change ?? 0;
 
@@ -779,9 +1000,9 @@ export async function getPlayerLeaderboard(): Promise<PlayerLeaderboardEntry[]> 
       const statsWithAdr = await db.queryAsync<{ adr: number }>(
         `SELECT adr FROM player_match_stats 
          WHERE player_id = ? AND match_slug IN (
-           SELECT slug FROM matches WHERE tournament_id = 1
+           SELECT slug FROM matches WHERE tournament_id = ?
          ) AND adr IS NOT NULL`,
-        [player.id]
+        [player.id, tournamentId]
       );
 
       const averageAdr =
@@ -826,47 +1047,45 @@ export async function getPlayerLeaderboard(): Promise<PlayerLeaderboardEntry[]> 
  * Supports both shuffle tournaments (player-based Swiss style) and
  * standard bracket tournaments (team-based single/double elimination).
  */
-export async function getTournamentLeaderboard(): Promise<{
+export async function getTournamentLeaderboard(tournamentId: number): Promise<{
   tournament: TournamentResponse;
   leaderboard: PlayerLeaderboardEntry[];
   currentRound: number;
   totalRounds: number;
   roundStatus?: RoundStatus;
   teams?: TeamLeaderboardEntry[];
+  /** Matches currently live or loaded, across the whole tournament. Powers the public "live now" strip. */
+  liveMatchCount: number;
 }> {
-  // Load base tournament row (id = 1 for now)
-  const row = await db.queryOneAsync<{
-    id: number;
-    name: string;
-    type: TournamentType;
-    format: string;
-    status: string;
-    maps: string;
-    team_ids: string;
-    settings: string;
-    map_sequence?: string | null;
-    created_at: number;
-    updated_at?: number;
-    started_at?: number;
-    completed_at?: number;
-  }>('SELECT * FROM tournament WHERE id = 1');
+  // Load base tournament row
+  const row = await db.queryOneAsync<DbTournamentRow>('SELECT * FROM tournament WHERE id = ?', [
+    tournamentId,
+  ]);
 
   if (!row) {
     throw new Error('Tournament not found');
   }
 
+  // Postgres returns COUNT(*) as a bigint-safe string; coerce it explicitly.
+  const liveMatchCountResult = await db.queryOneAsync<{ count: number | string }>(
+    `SELECT COUNT(*) as count FROM matches WHERE tournament_id = ? AND status IN ('live', 'loaded')`,
+    [tournamentId]
+  );
+  const liveMatchCount = Number(liveMatchCountResult?.count ?? 0);
+
   // Shuffle tournaments keep the existing behaviour: player-only leaderboard
   // driven by registered players and Swiss-style rounds.
   if (row.type === 'shuffle') {
-    const tournament = await getShuffleTournament();
+    const tournament = await getShuffleTournament(tournamentId);
     if (!tournament) {
       throw new Error('No shuffle tournament found');
     }
 
-    const leaderboard = await getPlayerLeaderboard();
+    const leaderboard = await getPlayerLeaderboard(tournamentId);
 
     const currentRoundResult = await db.queryOneAsync<{ max_round: number }>(
-      'SELECT MAX(round) as max_round FROM matches WHERE tournament_id = 1'
+      'SELECT MAX(round) as max_round FROM matches WHERE tournament_id = ?',
+      [tournamentId]
     );
     const currentRound = currentRoundResult?.max_round || 0;
     const totalRounds = tournament.mapSequence?.length || tournament.maps.length;
@@ -874,8 +1093,8 @@ export async function getTournamentLeaderboard(): Promise<{
     let roundStatus: RoundStatus | undefined;
     if (currentRound > 0) {
       const matches = await db.queryAsync<DbMatchRow>(
-        'SELECT * FROM matches WHERE tournament_id = 1 AND round = ?',
-        [currentRound]
+        'SELECT * FROM matches WHERE tournament_id = ? AND round = ?',
+        [tournamentId, currentRound]
       );
 
       const completed = matches.filter((m) => m.status === 'completed').length;
@@ -898,39 +1117,53 @@ export async function getTournamentLeaderboard(): Promise<{
       currentRound,
       totalRounds,
       roundStatus,
+      liveMatchCount,
     };
   }
 
   // Standard tournament (single_elimination / double_elimination / round_robin / swiss):
-  // build a simple tournament object, team standings, and player leaderboard
-  const maps = JSON.parse(row.maps || '[]') as string[];
-  const teamIds: string[] = JSON.parse(row.team_ids || '[]');
-  const settings = row.settings ? JSON.parse(row.settings) : {};
-
-  const baseTournament: TournamentResponse = {
-    id: row.id,
-    name: row.name,
-    type: row.type,
-    format: row.format as TournamentResponse['format'],
-    status: row.status as TournamentResponse['status'],
-    maps,
-    teamIds,
-    settings,
-    teams: [],
-    created_at: row.created_at,
-    updated_at: row.updated_at ?? row.created_at,
-    started_at: row.started_at,
-    completed_at: row.completed_at,
-  };
+  // build the public tournament object (via the shared row helper so no column
+  // is dropped), team standings, and player leaderboard.
+  const baseTournament: TournamentResponse = tournamentRowToResponse(row);
+  const teamIds = baseTournament.teamIds;
+  baseTournament.teams = [];
 
   // Team standings for this tournament
   let teams: TeamLeaderboardEntry[] = [];
+  // Which team each player (by Steam ID) is on, for the player table.
+  const teamOfPlayer = new Map<
+    string,
+    { id: string; name: string; tag?: string | null; logoUrl?: string | null }
+  >();
   if (teamIds.length > 0) {
     const placeholders = teamIds.map(() => '?').join(',');
-    const teamRows = await db.queryAsync<DbTeamRow>(
-      `SELECT id, name, tag FROM teams WHERE id IN (${placeholders})`,
+    const teamRows = await db.queryAsync<DbTeamRow & { players: string | null }>(
+      `SELECT id, name, tag, players, logo_updated_at FROM teams WHERE id IN (${placeholders})`,
       teamIds
     );
+    for (const team of teamRows) {
+      let roster: Array<{ steamId?: string; steamid?: string }> = [];
+      try {
+        const parsed = JSON.parse(team.players ?? '[]') as Untrusted;
+        if (Array.isArray(parsed)) roster = parsed as typeof roster;
+      } catch {
+        roster = [];
+      }
+      for (const member of roster) {
+        const steamId = member.steamId ?? member.steamid;
+        if (steamId)
+          teamOfPlayer.set(steamId, {
+            id: team.id,
+            name: team.name,
+            tag: team.tag ?? null,
+            // The team's crest on the leaderboard's team column.
+            logoUrl: logoUrl(
+              team.id,
+              (team as { logo_updated_at?: number | null }).logo_updated_at
+            ),
+          });
+      }
+    }
 
     // Get all completed matches for win/loss counts
     const matches = await db.queryAsync<DbMatchRow>(
@@ -956,17 +1189,58 @@ export async function getTournamentLeaderboard(): Promise<{
       };
     });
 
-    // Sort teams by wins desc, then by deepest round reached, then name
-    teams.sort((a, b) => {
-      if (b.matchWins !== a.matchWins) return b.matchWins - a.matchWins;
-      return a.name.localeCompare(b.name);
-    });
+    if (row.type === 'swiss') {
+      // Same standings (and order) the Swiss pairing uses.
+      const standings = await getSwissStandingEntries(row.id);
+      const byTeam = new Map(teams.map((t) => [t.teamId, t]));
+      teams = standings.flatMap((s) => {
+        const team = byTeam.get(s.teamId);
+        if (!team) return [];
+        return [
+          {
+            ...team,
+            matchWins: s.wins,
+            matchLosses: s.losses,
+            rank: s.rank,
+            buchholz: s.buchholz,
+            roundDiff: s.roundDiff,
+          },
+        ];
+      });
+    } else if (row.type === 'round_robin') {
+      // Same standings (and order) the bracket and the champion use.
+      const standings = await getRoundRobinStandingEntries(row.id);
+      const byTeam = new Map(teams.map((t) => [t.teamId, t]));
+      teams = standings.flatMap((s) => {
+        const team = byTeam.get(s.teamId);
+        if (!team) return [];
+        return [{ ...team, rank: s.rank, roundDiff: s.roundDiff }];
+      });
+    } else {
+      // Sort teams by wins desc, then name
+      teams.sort((a, b) => {
+        if (b.matchWins !== a.matchWins) return b.matchWins - a.matchWins;
+        return a.name.localeCompare(b.name);
+      });
+    }
 
     baseTournament.teams = teamRows.map((t) => ({
       id: t.id,
       name: t.name,
       tag: t.tag ?? undefined,
     }));
+  }
+
+  // The champion, for the finished tournament's header (same rule the admin
+  // tournament route uses). Imported here to keep the two services from
+  // importing each other at load.
+  if (baseTournament.status === 'completed') {
+    const { tournamentService } = await import('./tournamentService');
+    baseTournament.winner = await tournamentService.getTournamentWinner(
+      baseTournament.id,
+      baseTournament.type,
+      baseTournament.teams
+    );
   }
 
   // Player leaderboard for this tournament, sorted by current ELO
@@ -984,13 +1258,16 @@ export async function getTournamentLeaderboard(): Promise<{
     total_assists: number;
     total_damage: number;
     total_rounds: number;
+    total_headshots: number;
+    total_flash_assists: number;
+    total_utility_damage: number;
   }>(
     `
       SELECT
         p.id as player_id,
         p.name,
         p.avatar_url,
-        p.current_elo,
+        ${RATING_ELO} AS current_elo,
         p.starting_elo,
         SUM(CASE WHEN pms.won_match THEN 1 ELSE 0 END) as match_wins,
         SUM(CASE WHEN pms.won_match THEN 0 ELSE 1 END) as match_losses,
@@ -999,14 +1276,18 @@ export async function getTournamentLeaderboard(): Promise<{
         COALESCE(SUM(pms.deaths), 0) as total_deaths,
         COALESCE(SUM(pms.assists), 0) as total_assists,
         COALESCE(SUM(pms.total_damage), 0) as total_damage,
-        COALESCE(SUM(pms.rounds_played), 0) as total_rounds
+        COALESCE(SUM(pms.rounds_played), 0) as total_rounds,
+        COALESCE(SUM(pms.headshots), 0) as total_headshots,
+        COALESCE(SUM(pms.flash_assists), 0) as total_flash_assists,
+        COALESCE(SUM(pms.utility_damage), 0) as total_utility_damage
       FROM player_match_stats pms
       JOIN matches m ON pms.match_slug = m.slug
       JOIN players p ON p.id = pms.player_id
+      ${ratingJoin('p')}
       WHERE m.tournament_id = ?
-      GROUP BY p.id, p.name, p.avatar_url, p.current_elo, p.starting_elo
+      GROUP BY p.id, p.name, p.avatar_url, pgr.current_elo, p.starting_elo
     `,
-    [row.id]
+    [ratingGame(row.game), row.id]
   );
 
   // Aggregate ELO change for this tournament only, treating the first recorded
@@ -1064,6 +1345,14 @@ export async function getTournamentLeaderboard(): Promise<{
       winRate,
       eloChange: eloChangeMap.get(pr.player_id) ?? 0,
       averageAdr: averageAdr ? Math.round(averageAdr * 100) / 100 : undefined,
+      kills: Number(pr.total_kills),
+      deaths: Number(pr.total_deaths),
+      assists: Number(pr.total_assists),
+      headshots: Number(pr.total_headshots),
+      flashAssists: Number(pr.total_flash_assists),
+      utilityDamage: Number(pr.total_utility_damage),
+      roundsPlayed: Number(pr.total_rounds),
+      team: teamOfPlayer.get(pr.player_id) ?? null,
     };
   });
 
@@ -1091,60 +1380,173 @@ export async function getTournamentLeaderboard(): Promise<{
     totalRounds,
     roundStatus: undefined,
     teams,
+    liveMatchCount,
   };
 }
 
 /**
  * Get shuffle tournament (helper)
  */
-async function getShuffleTournament(): Promise<TournamentResponse | null> {
-  const row = await db.queryOneAsync<{
-    id: number;
-    name: string;
-    type: string;
-    format: string;
-    status: string;
-    maps: string;
-    team_ids: string;
-    settings: string;
-    map_sequence?: string;
-    team_size?: number;
-    max_rounds?: number;
-    overtime_mode?: string;
-    elo_template_id?: string | null;
-    overtime_segments?: number | null;
-    created_at: number;
-    updated_at: number;
-    started_at?: number;
-    completed_at?: number;
-  }>('SELECT * FROM tournament WHERE id = 1');
+export async function getShuffleTournament(
+  tournamentId: number
+): Promise<TournamentResponse | null> {
+  const row = await db.queryOneAsync<DbTournamentRow>('SELECT * FROM tournament WHERE id = ?', [
+    tournamentId,
+  ]);
 
   if (!row || row.type !== 'shuffle') {
     return null;
   }
 
   return {
-    id: row.id,
-    name: row.name,
+    ...tournamentRowToResponse(row),
     type: 'shuffle',
-    format: row.format as 'bo1',
-    status: row.status as TournamentResponse['status'],
-    maps: JSON.parse(row.maps),
-    teamIds: JSON.parse(row.team_ids),
-    settings: JSON.parse(row.settings),
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    started_at: row.started_at,
-    completed_at: row.completed_at,
-    teams: [],
-    mapSequence: row.map_sequence ? JSON.parse(row.map_sequence) : undefined,
+    // Shuffle teams are built from registered players; 5v5 unless configured.
     teamSize: row.team_size || 5,
-    maxRounds: row.max_rounds,
-    overtimeMode: (row.overtime_mode as 'enabled' | 'disabled') || undefined,
-    overtimeSegments:
-      row.overtime_segments === null || row.overtime_segments === undefined
-        ? undefined
-        : row.overtime_segments,
-    eloTemplateId: row.elo_template_id || undefined,
-  } as TournamentResponse;
+  };
+}
+
+/**
+ * No-shows drop out (a shuffle): when a shuffle match goes live (at the latest
+ * when warmup's autostart runs out), a signed-up player on its roster who never
+ * joined the server is marked out of the shuffle (left_at), so the rounds after
+ * are made without them; their results so far stay. `seen` says whether a
+ * player was ever on the match's server. Nothing happens when no roster player
+ * was seen at all (the platform lost track, e.g. after a restart). Returns the
+ * players marked out.
+ */
+export async function dropShuffleNoShows(
+  match: {
+    slug: string;
+    tournament_id: number | null;
+    config?: string | null;
+    loaded_at?: number | null;
+  },
+  seen: (steamId: string) => boolean,
+  options: { force?: boolean } = {}
+): Promise<string[]> {
+  if (!match.tournament_id) return [];
+  const t = await db.queryOneAsync<{ type: string; status: string }>(
+    'SELECT type, status FROM tournament WHERE id = ?',
+    [match.tournament_id]
+  );
+  if (t?.type !== 'shuffle' || t.status !== 'in_progress') return [];
+  const config = match.config ?? '';
+  const ids = new Set(config.match(/\b7656\d{13}\b/g) ?? []);
+  if (ids.size === 0) return [];
+  const signed = await db.queryAsync<{ player_id: string }>(
+    'SELECT player_id FROM shuffle_tournament_players WHERE tournament_id = ? AND left_at IS NULL',
+    [match.tournament_id]
+  );
+  const roster = signed.map((r) => r.player_id).filter((id) => ids.has(id));
+  if (roster.length === 0) return [];
+  // Who connected is kept in memory. When the platform restarted after the
+  // match loaded, a player who did join reads as never seen; then drop no one
+  // unless someone was seen. Up the whole warmup, nobody showing up is real.
+  const startedAt = Math.floor(Date.now() / 1000 - process.uptime());
+  const watchedWarmup = !!match.loaded_at && startedAt <= Number(match.loaded_at);
+  if (!options.force && !watchedWarmup && !roster.some(seen)) return [];
+  const missing = roster.filter((id) => !seen(id));
+  const now = Math.floor(Date.now() / 1000);
+  for (const id of missing) {
+    await db.runAsync(
+      'UPDATE shuffle_tournament_players SET left_at = ?, left_reason = ? WHERE tournament_id = ? AND player_id = ? AND left_at IS NULL',
+      [now, 'no_show', match.tournament_id, id]
+    );
+  }
+  if (missing.length > 0) {
+    log.warn(
+      `Shuffle ${match.tournament_id}: ${missing.length} no-show(s) in ${match.slug} marked out`,
+      {
+        players: missing,
+      }
+    );
+    emitTournamentUpdate({ id: match.tournament_id, action: 'tournament_updated' });
+    await noticeNoShows(match.tournament_id, match.slug, missing).catch((error: unknown) =>
+      log.warn(`Shuffle ${match.tournament_id}: no-show notices failed`, { error: String(error) })
+    );
+  }
+  return missing;
+}
+
+/**
+ * Tells each no-show they are out of the next draws (and how to get back in:
+ * "I'm back" on the tournament page), and the admins (their bell) who was
+ * marked out.
+ * Once per match (a second check sends nothing new).
+ */
+async function noticeNoShows(tournamentId: number, slug: string, missing: string[]) {
+  const { notificationService } = await import('./notificationService');
+  const t = await db.queryOneAsync<{ name: string }>('SELECT name FROM tournament WHERE id = ?', [
+    tournamentId,
+  ]);
+  const name = t?.name ?? '';
+  for (const id of missing) {
+    await notificationService.notifyOnce(
+      [id],
+      'tournament',
+      { tournamentId, name, event: 'no_show', matchSlug: slug },
+      `tournament:${tournamentId}:no_show:${slug}`
+    );
+  }
+  const players = await playerService.getPlayersByIds(missing);
+  const names = missing.map((id) => players.find((p) => p.id === id)?.name || id);
+  const { adminNoticeService } = await import('./adminNoticeService');
+  await adminNoticeService.raise(
+    'shuffle_no_show',
+    { matchSlug: slug, tournamentId, players: names.join(', ') },
+    `shuffle_no_show:${slug}`
+  );
+}
+
+/**
+ * Auto-start found nobody from a shuffle match's roster on the server: the
+ * match is called off instead of played by bots. Everyone on it is marked out
+ * (they never came), the server is freed, and the round moves on when its
+ * other matches are done.
+ */
+export async function cancelEmptyShuffleMatch(slug: string): Promise<boolean> {
+  const match = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [slug]);
+  if (!match || String(match.status) !== 'loaded' || !match.tournament_id) return false;
+  const dropped = await dropShuffleNoShows(match, () => false, { force: true });
+  if (dropped.length === 0) return false;
+  const { scheduler } = await import('../core/scheduler');
+  await scheduler.cancelMatch(match, 'force-cancel').catch((error: unknown) =>
+    log.warn(`Shuffle ${match.tournament_id}: could not end ${slug} on its server`, {
+      error: String(error),
+    })
+  );
+  const { settleEndedMatch } = await import('./matchTerminationService');
+  await settleEndedMatch(match, 'nobody joined');
+  const { checkAndAdvanceShuffleRound } = await import('../core/matchLifecycle');
+  await checkAndAdvanceShuffleRound(match.tournament_id, match.round);
+  return true;
+}
+
+/**
+ * A player marked out as a no-show who joins their match late (a bot took
+ * their slot when it started) is back in: they play this match and are drawn
+ * for the next rounds. Returns whether they were brought back.
+ */
+export async function bringBackLateJoiner(
+  match: { slug: string; tournament_id: number | null; config?: string | null },
+  steamId: string
+): Promise<boolean> {
+  if (!match.tournament_id || !(match.config ?? '').includes(steamId)) return false;
+  const t = await db.queryOneAsync<{ type: string; status: string }>(
+    'SELECT type, status FROM tournament WHERE id = ?',
+    [match.tournament_id]
+  );
+  if (t?.type !== 'shuffle' || t.status !== 'in_progress') return false;
+  const left = await db.queryOneAsync<{ left_at: number | null }>(
+    'SELECT left_at FROM shuffle_tournament_players WHERE tournament_id = ? AND player_id = ?',
+    [match.tournament_id, steamId]
+  );
+  if (!left?.left_at) return false;
+  await db.runAsync(
+    'UPDATE shuffle_tournament_players SET left_at = NULL, left_reason = NULL WHERE tournament_id = ? AND player_id = ?',
+    [match.tournament_id, steamId]
+  );
+  log.info(`Shuffle ${match.tournament_id}: ${steamId} joined ${match.slug} late and is back in`);
+  return true;
 }

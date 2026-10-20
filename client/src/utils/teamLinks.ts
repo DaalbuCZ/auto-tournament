@@ -1,48 +1,29 @@
-/**
- * Team link utilities
- * Centralized logic for generating and handling team match URLs
- */
+import { copyTextToClipboard } from './clipboard';
+import { teamProfilePath } from '../paths';
 
 /**
- * Generate team match URL
+ * Team link utilities: the team's page, shared with its players. It shows
+ * the team's next match, a link to the match room where it is played.
  */
-export function getTeamMatchUrl(teamId: string): string {
-  return `${window.location.origin}/team/${teamId}`;
+
+/** The full address of a team's page, to share. */
+export function getTeamPageUrl(teamId: string): string {
+  return `${window.location.origin}${teamProfilePath(teamId)}`;
+}
+
+/** Path to a team's page (roster, ratings, its next match). */
+export function getTeamProfileUrl(teamId: string): string {
+  return teamProfilePath(teamId);
 }
 
 /**
- * Copy team match URL to clipboard
- * Fallback for insecure contexts (non-HTTPS/localhost)
+ * Copy a team's page address to the clipboard.
+ *
+ * Works over plain HTTP too — see `copyTextToClipboard`.
  */
-export async function copyTeamMatchUrl(teamId: string): Promise<boolean> {
+export async function copyTeamPageUrl(teamId: string): Promise<boolean> {
   try {
-    const url = getTeamMatchUrl(teamId);
-    
-    // Modern Clipboard API (requires secure context)
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(url);
-      return true;
-    }
-    
-    // Fallback for insecure contexts
-    const textArea = document.createElement('textarea');
-    textArea.value = url;
-    textArea.style.position = 'fixed';
-    textArea.style.left = '-999999px';
-    textArea.style.top = '-999999px';
-    document.body.appendChild(textArea);
-    textArea.focus();
-    textArea.select();
-    
-    try {
-      const successful = document.execCommand('copy');
-      document.body.removeChild(textArea);
-      return successful;
-    } catch (err) {
-      document.body.removeChild(textArea);
-      console.error('Fallback copy failed:', err);
-      return false;
-    }
+    return await copyTextToClipboard(getTeamPageUrl(teamId));
   } catch (error) {
     console.error('Failed to copy team link:', error);
     return false;

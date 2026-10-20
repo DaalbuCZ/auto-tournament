@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { io } from 'socket.io-client';
+import { scopedSocket } from '../utils/sharedSocket';
+import { onSocketReconnect } from '../utils/socketResync';
 import type {
   Team,
   TeamStats,
@@ -10,17 +11,18 @@ import type {
   MatchLiveStats,
   MatchPlayerStatsSnapshot,
 } from '../types';
+import type { Untrusted } from '../utils/untrusted';
 
 type BracketSocketEvent = {
   matchSlug?: string;
-  [key: string]: unknown;
+  [key: string]: Untrusted;
 };
 
 type TournamentSocketEvent = {
   deleted?: boolean;
   action?: string;
   matchSlug?: string;
-  [key: string]: unknown;
+  [key: string]: Untrusted;
 };
 
 interface UseTeamMatchDataReturn {
@@ -40,7 +42,14 @@ interface UseTeamMatchDataReturn {
   loadTeamStats: () => Promise<void>;
 }
 
-export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataReturn {
+/**
+ * A team's current match. With `matchSlug` (the match room), that match while the
+ * team plays in it and it is open: a team in two tournaments at once has two.
+ */
+export function useTeamMatchData(
+  teamId: string | undefined,
+  matchSlug?: string
+): UseTeamMatchDataReturn {
   const [team, setTeam] = useState<Team | null>(null);
   const [match, setMatch] = useState<TeamMatchInfo | null>(null);
   const [hasMatch, setHasMatch] = useState(false);
@@ -51,9 +60,10 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
   const [stats, setStats] = useState<TeamStats | null>(null);
   const [standing, setStanding] = useState<TeamStanding | null>(null);
   const [tournamentStatus, setTournamentStatus] = useState<string>('setup');
-  
+
   // Use ref to track current match slug to avoid infinite loops
   const currentMatchSlugRef = useRef<string | null>(null);
+  const currentMatchStatusRef = useRef<TeamMatchInfo['status'] | null>(null);
 
   const mergeConnectionStatus = useCallback((slug: string, status: MatchConnectionStatus) => {
     setMatch((prev) => {
@@ -80,28 +90,31 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
     };
   }, []);
 
-  const mergeLiveStats = useCallback((slug: string, stats: MatchLiveStats) => {
-    setMatch((prev) => {
-      if (!prev || prev.slug !== slug) return prev;
-      const normalizedStats = prev.isTeam1
-        ? stats
-        : {
-            ...stats,
-            team1Score: stats.team2Score,
-            team2Score: stats.team1Score,
-            team1SeriesScore: stats.team2SeriesScore,
-            team2SeriesScore: stats.team1SeriesScore,
-            playerStats: swapPlayerStats(stats.playerStats),
-          };
-      if (prev.liveStats && prev.liveStats.lastEventAt >= normalizedStats.lastEventAt) {
-        return prev;
-      }
-      return {
-        ...prev,
-        liveStats: normalizedStats,
-      };
-    });
-  }, [swapPlayerStats]);
+  const mergeLiveStats = useCallback(
+    (slug: string, stats: MatchLiveStats) => {
+      setMatch((prev) => {
+        if (!prev || prev.slug !== slug) return prev;
+        const normalizedStats = prev.isTeam1
+          ? stats
+          : {
+              ...stats,
+              team1Score: stats.team2Score,
+              team2Score: stats.team1Score,
+              team1SeriesScore: stats.team2SeriesScore,
+              team2SeriesScore: stats.team1SeriesScore,
+              playerStats: swapPlayerStats(stats.playerStats),
+            };
+        if (prev.liveStats && prev.liveStats.lastEventAt >= normalizedStats.lastEventAt) {
+          return prev;
+        }
+        return {
+          ...prev,
+          liveStats: normalizedStats,
+        };
+      });
+    },
+    [swapPlayerStats]
+  );
 
   const fetchConnectionStatus = useCallback(
     async (slug: string) => {
@@ -172,7 +185,8 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
       setError('');
 
       try {
-        const response = await fetch(`/api/team/${teamId}/match`);
+        const query = matchSlug ? `?match=${encodeURIComponent(matchSlug)}` : '';
+        const response = await fetch(`/api/team/${teamId}/match${query}`);
 
         // Handle 404 gracefully (team or no matches)
         if (response.status === 404) {
@@ -217,7 +231,7 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
         setUpdating(false);
       }
     },
-    [teamId]
+    [teamId, matchSlug]
   );
 
   const loadMatchHistory = useCallback(
@@ -263,11 +277,11 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
     [teamId]
   );
 
-  // Update ref when match changes
+  // Update refs when match changes. Cleared when the team has no match, so a
+  // finished match does not keep filtering out events about the next one.
   useEffect(() => {
-    if (match) {
-      currentMatchSlugRef.current = match.slug;
-    }
+    currentMatchSlugRef.current = match?.slug ?? null;
+    currentMatchStatusRef.current = match?.status ?? null;
   }, [match]);
 
   const currentMatchSlug = match?.slug ?? null;
@@ -287,7 +301,36 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
     loadTeamStats(false);
 
     // Setup Socket.IO for real-time updates
-    const socket = io();
+    const socket = scopedSocket();
+
+    // Silent refetch of everything the page shows, coalesced so a burst of
+    // events (a round advancing emits several) costs one round of requests.
+    let resyncTimer: ReturnType<typeof setTimeout> | null = null;
+    const resync = () => {
+      if (resyncTimer) clearTimeout(resyncTimer);
+      resyncTimer = setTimeout(() => {
+        resyncTimer = null;
+        void loadTeamMatch(true);
+        void loadMatchHistory(true);
+        void loadTeamStats(true);
+        const trackedSlug = currentMatchSlugRef.current;
+        if (trackedSlug) {
+          void fetchConnectionStatus(trackedSlug);
+          void fetchLiveStats(trackedSlug);
+        }
+      }, 250);
+    };
+
+    // An event naming a match is only safe to ignore while this team is busy
+    // with a different, unfinished match. With no match yet, or a finished
+    // one, any match event may be this team's next match being created,
+    // readied or given a server - ignoring those left the page stale until a
+    // hard refresh.
+    const isForAnotherMatch = (slug?: string) => {
+      const trackedSlug = currentMatchSlugRef.current;
+      if (!slug || !trackedSlug || slug === trackedSlug) return false;
+      return currentMatchStatusRef.current !== 'completed';
+    };
 
     const handleMatchUpdate = (data: {
       slug?: string;
@@ -338,28 +381,34 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
             changed = true;
           }
 
-          if (Object.prototype.hasOwnProperty.call(data, 'currentMap') || Object.prototype.hasOwnProperty.call(data, 'current_map')) {
+          if (
+            Object.prototype.hasOwnProperty.call(data, 'currentMap') ||
+            Object.prototype.hasOwnProperty.call(data, 'current_map')
+          ) {
             const nextMap =
-              (data as Record<string, unknown>).currentMap ??
-              (data as Record<string, unknown>).current_map ??
+              (data as Record<string, Untrusted>).currentMap ??
+              (data as Record<string, Untrusted>).current_map ??
               null;
             updated.currentMap = typeof nextMap === 'string' ? nextMap : null;
             changed = true;
           }
 
-          if (Object.prototype.hasOwnProperty.call(data, 'mapNumber') || Object.prototype.hasOwnProperty.call(data, 'map_number')) {
+          if (
+            Object.prototype.hasOwnProperty.call(data, 'mapNumber') ||
+            Object.prototype.hasOwnProperty.call(data, 'map_number')
+          ) {
             const nextMapNumber =
-              (data as Record<string, unknown>).mapNumber ??
-              (data as Record<string, unknown>).map_number ??
+              (data as Record<string, Untrusted>).mapNumber ??
+              (data as Record<string, Untrusted>).map_number ??
               null;
             updated.mapNumber =
               typeof nextMapNumber === 'number' && Number.isFinite(nextMapNumber)
                 ? Number(nextMapNumber)
-                : updated.mapNumber ?? null;
+                : (updated.mapNumber ?? null);
             changed = true;
           }
 
-          if (Array.isArray((data as Record<string, unknown>).mapResults)) {
+          if (Array.isArray((data as Record<string, Untrusted>).mapResults)) {
             updated.mapResults = (data as { mapResults: TeamMatchInfo['mapResults'] }).mapResults;
             changed = true;
           }
@@ -376,6 +425,11 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
           fetchConnectionStatus(messageSlug);
           fetchLiveStats(messageSlug);
         }
+        // A finished match changes history and stats, and may hand the team
+        // its next match.
+        if (data.status === 'completed') {
+          resync();
+        }
         return;
       }
 
@@ -383,17 +437,11 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
     };
 
     const handleBracketUpdate = (event?: BracketSocketEvent) => {
-      const trackedSlug = currentMatchSlugRef.current;
-      if (!trackedSlug) return;
-      if (event?.matchSlug && event.matchSlug !== trackedSlug) {
-        return;
-      }
-      loadTeamMatch(true);
+      if (isForAnotherMatch(event?.matchSlug)) return;
+      resync();
     };
 
-    const handleTournamentUpdate = (
-      data?: TournamentSocketEvent
-    ) => {
+    const handleTournamentUpdate = (data?: TournamentSocketEvent) => {
       if (!data) return;
 
       if (data.deleted || data.action === 'tournament_deleted') {
@@ -407,11 +455,7 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
         return;
       }
 
-      const trackedSlug = currentMatchSlugRef.current;
-      if (!trackedSlug) return;
-      if (data.matchSlug && data.matchSlug !== trackedSlug) {
-        return;
-      }
+      if (isForAnotherMatch(data.matchSlug)) return;
 
       const refreshActions = new Set([
         'tournament_reset',
@@ -430,29 +474,32 @@ export function useTeamMatchData(teamId: string | undefined): UseTeamMatchDataRe
       // refresh so veto/match readiness doesn't get stuck.
       const status = (data as { status?: string }).status;
       if (typeof status === 'string' && status.trim() !== '' && status !== tournamentStatus) {
-        loadTeamMatch(true);
+        resync();
         return;
       }
 
       if (data.action && !refreshActions.has(data.action)) return;
 
-      loadTeamMatch(true);
+      resync();
     };
 
     // Use silent updates for socket events to avoid loading spinner
     socket.on('match:update', handleMatchUpdate);
     socket.on('bracket:update', handleBracketUpdate);
     socket.on('tournament:update', handleTournamentUpdate);
+    const offReconnect = onSocketReconnect(socket, resync);
 
     return () => {
+      if (resyncTimer) clearTimeout(resyncTimer);
+      offReconnect();
       socket.off('match:update', handleMatchUpdate);
       socket.off('bracket:update', handleBracketUpdate);
       socket.off('tournament:update', handleTournamentUpdate);
       socket.close();
     };
-    // Only re-run if teamId changes, not on every state update
+    // Only re-run if the team (or the match asked for) changes, not on every state update
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [teamId]);
+  }, [teamId, matchSlug]);
 
   return {
     team,

@@ -1,8 +1,10 @@
-import { Router, Request, Response } from 'express';
+import type { Request, Response } from 'express';
+import { Router } from 'express';
 import fetch from 'node-fetch';
 import { steamService } from '../services/steamService';
 import { requireAuth } from '../middleware/auth';
 import { log } from '../utils/logger';
+import { isSteamSignInWanted } from '../config/authProviders';
 import { URLSearchParams } from 'url';
 
 const router = Router();
@@ -29,10 +31,14 @@ router.use(requireAuth);
 router.get('/status', async (_req: Request, res: Response) => {
   try {
     const health = await steamService.checkSteamWebApiHealth({ force: true });
+    // Steam sign-in turned off on purpose (AUTH_STEAM_ENABLED=false): the
+    // admin shell does not warn about Steam then.
+    const signInEnabled = isSteamSignInWanted();
 
     if (!health.configured) {
       return res.json({
         success: false,
+        signInEnabled,
         configured: false,
         valid: false,
         errorType: health.errorType,
@@ -44,6 +50,7 @@ router.get('/status', async (_req: Request, res: Response) => {
     if (health.ok) {
       return res.json({
         success: true,
+        signInEnabled,
         configured: true,
         valid: true,
         message: 'Steam integration is configured and reachable.',
@@ -52,12 +59,14 @@ router.get('/status', async (_req: Request, res: Response) => {
 
     return res.json({
       success: false,
+      signInEnabled,
       configured: true,
       valid: false,
       errorType: health.errorType,
       statusCode: health.statusCode,
       // Keep wording generic for the UI. Admins can still inspect API logs for details.
-      error: 'Steam integration is currently unavailable. Check server configuration and connectivity.',
+      error:
+        'Steam integration is currently unavailable. Check server configuration and connectivity.',
     });
   } catch (error) {
     log.error('Error in Steam status endpoint', error);
@@ -222,7 +231,9 @@ function extractWorkshopId(input: string): string | null {
 /**
  * GET /api/steam/workshop-map?input=<url-or-id>
  *
- * Resolves a Steam Workshop published file ID to a title + preview image URL.
+ * Resolves a Steam Workshop published file ID to a title + preview image URL
+ * and its Workshop tags ("Classic", "Wingman", …; the CS2 module turns them
+ * into a map type).
  * Does not require a Steam Web API key (uses RemoteStorage endpoint).
  */
 router.get('/workshop-map', async (req: Request, res: Response) => {
@@ -259,6 +270,7 @@ router.get('/workshop-map', async (req: Request, res: Response) => {
           result?: number;
           title?: string;
           preview_url?: string;
+          tags?: Array<{ tag?: string }>;
         }>;
       };
     };
@@ -275,12 +287,16 @@ router.get('/workshop-map', async (req: Request, res: Response) => {
 
     const title = typeof details?.title === 'string' ? details.title : null;
     const previewUrl = typeof details?.preview_url === 'string' ? details.preview_url : null;
+    const tags = (Array.isArray(details?.tags) ? details.tags : [])
+      .map((t) => (typeof t?.tag === 'string' ? t.tag : ''))
+      .filter(Boolean);
 
     return res.json({
       success: true,
       workshopId,
       title,
       previewUrl,
+      tags,
     });
   } catch (error) {
     log.error('Error in Steam workshop-map endpoint', error);

@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { usePageHeader } from '../contexts/PageHeaderContext';
+import { pageTitle } from '../utils/pageTitle';
+import { useState, useEffect, useCallback } from 'react';
+import { PageHead } from '../components/common/ui';
 import { useSnackbar } from '../contexts/SnackbarContext';
 import {
   Box,
@@ -15,12 +16,7 @@ import {
   Tooltip,
   Divider,
 } from '@mui/material';
-import {
-  Delete as DeleteIcon,
-  Edit as EditIcon,
-  Add as AddIcon,
-  Info as InfoIcon,
-} from '@mui/icons-material';
+import { InfoIcon, PencilSimpleIcon, PlusIcon, TrashIcon } from '@phosphor-icons/react';
 import { api } from '../utils/api';
 import { EmptyState } from '../components/shared/EmptyState';
 import EloTemplateEditorModal from '../components/modals/EloTemplateEditorModal';
@@ -28,9 +24,10 @@ import ConfirmDialog from '../components/modals/ConfirmDialog';
 import { EloTemplateImportModal } from '../components/modals/EloTemplateImportModal';
 import type { EloCalculationTemplate } from '../types/elo.types';
 import { useTranslation } from 'react-i18next';
+import { PageTabs } from '../components/manage/PageTabs';
+import { paths } from '../paths';
 
 export default function ELOTemplates() {
-  const { setHeaderActions } = usePageHeader();
   const { showSuccess, showError } = useSnackbar();
   const [templates, setTemplates] = useState<EloCalculationTemplate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -61,31 +58,9 @@ export default function ELOTemplates() {
   }, [showError, t]);
 
   useEffect(() => {
-  document.title = t('layout.pageTitle.eloTemplates');
-  loadTemplates();
-}, [loadTemplates, t]);
-
-  useEffect(() => {
-    setHeaderActions(
-      <Box display="flex" gap={1}>
-        <Button
-          variant="contained"
-          size="small"
-          startIcon={<AddIcon />}
-          onClick={() => handleOpenEditor()}
-        >
-        {t('eloTemplatesPage.header.createTemplate')}
-        </Button>
-        <Button variant="outlined" size="small" onClick={() => setImportModalOpen(true)}>
-        {t('eloTemplatesPage.header.importJson')}
-        </Button>
-      </Box>
-    );
-
-    return () => {
-      setHeaderActions(null);
-    };
-}, [setHeaderActions, t]);
+    document.title = pageTitle(t('layout.pageTitle.eloTemplates'));
+    loadTemplates();
+  }, [loadTemplates, t]);
 
   const handleOpenEditor = (template?: EloCalculationTemplate) => {
     setEditingTemplate(template || null);
@@ -118,9 +93,7 @@ export default function ELOTemplates() {
     try {
       const response = await api.delete(`/api/elo-templates/${templateToDelete.id}`);
       if (response.success) {
-        showSuccess(
-          t('eloTemplatesPage.delete.success', { name: templateToDelete.name })
-        );
+        showSuccess(t('eloTemplatesPage.delete.success', { name: templateToDelete.name }));
         await loadTemplates();
       } else {
         showError(response.error || t('eloTemplatesPage.delete.error'));
@@ -159,37 +132,72 @@ export default function ELOTemplates() {
     );
 
     await Promise.all(promises);
-    showSuccess(
-      t('eloTemplatesPage.import.success', { count: importedTemplates.length })
-    );
+    showSuccess(t('eloTemplatesPage.import.success', { count: importedTemplates.length }));
     await loadTemplates();
   };
 
   const getWeightSummary = (weights: EloCalculationTemplate['weights']): string => {
     const activeWeights = Object.entries(weights)
       .filter(([_, value]) => value !== undefined && value !== 0)
-      .map(([key, value]) => `${key}: ${value > 0 ? '+' : ''}${value}`)
+      .map(
+        ([key, value]) =>
+          `${t(`eloTemplatesPage.stats.${key}.label`, { defaultValue: key })} ${value > 0 ? '+' : ''}${value}`
+      )
       .join(', ');
     return activeWeights || t('eloTemplatesPage.weights.noAdjustmentsPure');
   };
 
+  const pageHead = (
+    <>
+      <PageHead
+        title={t('layout.pageTitle.eloTemplates')}
+        actions={
+          <>
+            <Button
+              variant="contained"
+              size="small"
+              startIcon={<PlusIcon />}
+              onClick={() => handleOpenEditor()}
+            >
+              {t('eloTemplatesPage.header.createTemplate')}
+            </Button>
+            <Button variant="outlined" size="small" onClick={() => setImportModalOpen(true)}>
+              {t('eloTemplatesPage.header.importJson')}
+            </Button>
+          </>
+        }
+      />
+      <PageTabs
+        label={t('managePage.rail.templatesAndRatings')}
+        tabs={[
+          { key: 'templates', label: t('managePage.rail.templates'), to: paths.templates },
+          { key: 'ratings', label: t('managePage.rail.ratings'), to: paths.eloTemplates },
+        ]}
+      />
+    </>
+  );
+
   if (loading) {
     return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="400px">
-        <CircularProgress />
+      <Box>
+        {pageHead}
+        <Box display="flex" justifyContent="center" alignItems="center" minHeight="400px">
+          <CircularProgress />
+        </Box>
       </Box>
     );
   }
 
   return (
     <Box sx={{ width: '100%', height: '100%' }}>
+      {pageHead}
       {templates.length === 0 ? (
         <EmptyState
           icon={InfoIcon}
           title={t('eloTemplatesPage.empty.title')}
           description={t('eloTemplatesPage.empty.description')}
           actionLabel={t('eloTemplatesPage.empty.action')}
-          actionIcon={AddIcon}
+          actionIcon={PlusIcon}
           onAction={() => handleOpenEditor()}
         />
       ) : (
@@ -201,15 +209,14 @@ export default function ELOTemplates() {
                   height: '100%',
                   display: 'flex',
                   flexDirection: 'column',
-                  transition: 'transform 0.2s, box-shadow 0.2s',
+                  transition: 'background-color 0.2s',
                   '&:hover': {
-                    transform: 'translateY(-4px)',
-                    boxShadow: 6,
+                    bgcolor: 'var(--at-paper3)',
                   },
                 }}
               >
                 <CardContent sx={{ flexGrow: 1 }}>
-                    <Box display="flex" justifyContent="space-between" alignItems="start" mb={2}>
+                  <Box display="flex" justifyContent="space-between" alignItems="start" mb={2}>
                     <Box>
                       <Typography variant="h6" fontWeight={600} gutterBottom>
                         {template.name}
@@ -223,18 +230,18 @@ export default function ELOTemplates() {
                         {template.id === 'pure-win-loss'
                           ? t('eloTemplatesPage.card.adjustment.none')
                           : template.minAdjustment === undefined &&
-                            template.maxAdjustment === undefined
-                          ? t('eloTemplatesPage.card.adjustment.uncapped')
-                          : t('eloTemplatesPage.card.adjustment.range', {
-                              min:
-                                template.minAdjustment !== undefined
-                                  ? template.minAdjustment
-                                  : t('eloTemplatesPage.card.adjustment.noMin'),
-                              max:
-                                template.maxAdjustment !== undefined
-                                  ? template.maxAdjustment
-                                  : t('eloTemplatesPage.card.adjustment.noMax'),
-                            })}
+                              template.maxAdjustment === undefined
+                            ? t('eloTemplatesPage.card.adjustment.uncapped')
+                            : t('eloTemplatesPage.card.adjustment.range', {
+                                min:
+                                  template.minAdjustment !== undefined
+                                    ? template.minAdjustment
+                                    : t('eloTemplatesPage.card.adjustment.noMin'),
+                                max:
+                                  template.maxAdjustment !== undefined
+                                    ? template.maxAdjustment
+                                    : t('eloTemplatesPage.card.adjustment.noMax'),
+                              })}
                       </Typography>
                     </Box>
                     <Box display="flex" gap={1}>
@@ -245,7 +252,7 @@ export default function ELOTemplates() {
                             onClick={() => handleOpenEditor(template)}
                             color="primary"
                           >
-                            <EditIcon fontSize="small" />
+                            <PencilSimpleIcon size={20} />
                           </IconButton>
                         </Tooltip>
                       )}
@@ -256,7 +263,7 @@ export default function ELOTemplates() {
                             onClick={() => handleDeleteClick(template)}
                             color="error"
                           >
-                            <DeleteIcon fontSize="small" />
+                            <TrashIcon size={20} />
                           </IconButton>
                         </Tooltip>
                       )}
@@ -286,18 +293,10 @@ export default function ELOTemplates() {
                     <Divider />
 
                     <Box>
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        display="block"
-                        mb={0.5}
-                      >
+                      <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>
                         {t('eloTemplatesPage.card.weightsTitle')}
                       </Typography>
-                      <Typography
-                        variant="body2"
-                        sx={{ fontFamily: 'monospace', fontSize: '0.75rem' }}
-                      >
+                      <Typography variant="body2" color="text.secondary">
                         {getWeightSummary(template.weights)}
                       </Typography>
                     </Box>
@@ -313,17 +312,18 @@ export default function ELOTemplates() {
                         >
                           {t('eloTemplatesPage.card.limitsTitle')}
                         </Typography>
-                        <Typography
-                          variant="body2"
-                          sx={{ fontFamily: 'monospace', fontSize: '0.75rem' }}
-                        >
+                        <Typography variant="body2" color="text.secondary">
                           {template.minAdjustment !== undefined &&
-                            `Min: ${template.minAdjustment}`}
+                            t('eloTemplatesPage.card.minAdjustment', {
+                              value: template.minAdjustment,
+                            })}
                           {template.minAdjustment !== undefined &&
                             template.maxAdjustment !== undefined &&
                             ', '}
                           {template.maxAdjustment !== undefined &&
-                            `Max: ${template.maxAdjustment}`}
+                            t('eloTemplatesPage.card.maxAdjustment', {
+                              value: template.maxAdjustment,
+                            })}
                         </Typography>
                       </Box>
                     )}
@@ -366,4 +366,3 @@ export default function ELOTemplates() {
     </Box>
   );
 }
-

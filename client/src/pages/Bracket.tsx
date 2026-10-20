@@ -1,4 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { BracketPauseBar } from '../components/bracket/BracketPauseBar';
+import { pageTitle } from '../utils/pageTitle';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -6,33 +8,37 @@ import {
   Alert,
   Button,
   Stack,
-  ToggleButton,
-  ToggleButtonGroup,
   IconButton,
   Chip,
-  Card,
-  Tooltip,
 } from '@mui/material';
-import RefreshIcon from '@mui/icons-material/Refresh';
-import EmojiEventsIcon from '@mui/icons-material/EmojiEvents';
-import AddIcon from '@mui/icons-material/Add';
-import ViewListIcon from '@mui/icons-material/ViewList';
-import AccountTreeOutlinedIcon from '@mui/icons-material/AccountTreeOutlined';
-import FullscreenIcon from '@mui/icons-material/Fullscreen';
-import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
+import {
+  ArrowClockwiseIcon,
+  CornersInIcon,
+  CornersOutIcon,
+  ListBulletsIcon,
+  PlusIcon,
+  TreeStructureIcon,
+  TrophyIcon,
+} from '@phosphor-icons/react';
 import { useNavigate } from 'react-router-dom';
+import { manageMatchPath, tournamentTabPath } from '../paths';
 import BracketsViewerVisualization from '../components/visualizations/BracketsViewerVisualization';
 import SwissView from '../components/visualizations/SwissView';
-import MatchDetailsModal from '../components/modals/MatchDetailsModal';
 import { EmptyState } from '../components/shared/EmptyState';
 import { MatchListCard } from '../components/shared/MatchListCard';
 import { RoundStatusCard } from '../components/tournament/RoundStatusCard';
-import { getRoundLabel } from '../utils/matchUtils';
+import { ChampionBanner } from '../components/tournament/ChampionBanner';
+import { getGlobalMatchNumber as globalMatchNumber, getRoundLabel } from '../utils/matchUtils';
 import { useBracket } from '../hooks/useBracket';
+import { useResourceAvailability } from '../hooks/useResourceAvailability';
+import { useIntegrationFor } from '../integrations/registry';
 import { api } from '../utils/api';
 import { StartTournamentButton } from '../components/dashboard';
 import type { Match } from '../types';
 import { useTranslation } from 'react-i18next';
+import { PageHead, Panel, RowList, SectionHead } from '../components/common/ui';
+import { useTopic } from '../hooks/useTopic';
+import { SegmentedControl } from '../components/common/SegmentedControl';
 
 // Interfaces are now imported from useBracket hook
 
@@ -44,14 +50,26 @@ export default function Bracket() {
     tournament,
     matches,
     totalRounds,
+    swissStandings,
+    roundRobinStandings,
     // starting handled by StartTournamentButton
     loadBracket,
   } = useBracket();
 
+  // What the waiting matches are waiting for is the game's answer, not the
+  // bracket's: CS2 matches wait for a free server and for the next allocation
+  // pass, and a game with no resources has neither (3.0 phase E). The core
+  // asks the route the module named, once, and hands the numbers to its
+  // banner; nothing here knows what a server is.
+  const resolved = useIntegrationFor(tournament);
+  const integration = tournament ? resolved : null;
+  const MatchQueueBanner = integration?.matchQueueBanner;
+  const MatchQueueChip = integration?.matchQueueChip;
+  const { availability: resourceAvailability, nextInSeconds: nextAllocationInSeconds } =
+    useResourceAvailability(integration);
+
   const [viewMode, setViewMode] = useState<'visual' | 'list'>('visual');
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [selectedMatchId, setSelectedMatchId] = useState<number | null>(null);
-  const [selectedMatchOverride, setSelectedMatchOverride] = useState<Match | null>(null);
   const [roundStatus, setRoundStatus] = useState<{
     roundNumber: number;
     totalMatches: number;
@@ -62,45 +80,16 @@ export default function Bracket() {
   } | null>(null);
   const [shuffleTotalRounds, setShuffleTotalRounds] = useState<number | null>(null);
   const fullscreenRef = useRef<globalThis.HTMLDivElement>(null);
-  const selectedMatchIdRef = useRef<number | null>(null);
-  const [allocationCountdown, setAllocationCountdown] = useState<{
-    nextAllocationInSeconds: number | null;
-    gracePeriodSeconds: number;
-    availableServerCount: number;
-    requiredServerCount: number;
-    // Snapshot of server states so we can show which ones are still in cooldown
-    // or otherwise not allocatable.
-    servers: Array<{
-      id: string;
-      name: string;
-      status: string | null;
-      inGraceWindow: boolean;
-      secondsUntilReady: number | null;
-      allocatable: boolean;
-    }>;
-  }>({
-    nextAllocationInSeconds: null,
-    gracePeriodSeconds: 120,
-    availableServerCount: 0,
-    requiredServerCount: 0,
-    servers: [],
-  });
   const { t } = useTranslation();
 
-  // Derive the current match from matches array (keeps status/score in sync with
-  // live websocket updates), and optionally merge in richer fields (e.g.
-  // mapResults) from a one-time /api/matches/:slug fetch without freezing the
-  // match in time. We always let the live bracket state "win" for core fields
-  // like status and scores to avoid stale data in the modal.
-  const baseSelectedMatch = selectedMatchId
-    ? matches.find((m) => m.id === selectedMatchId) || null
-    : null;
-  const selectedMatch: Match | null =
-    baseSelectedMatch && selectedMatchOverride
-      ? { ...selectedMatchOverride, ...baseSelectedMatch }
-      : baseSelectedMatch ?? null;
-
-  // Load round status for shuffle tournaments
+  // Load round status for shuffle tournaments, again whenever a match or the
+  // bracket changes (no timer).
+  const [roundChecks, setRoundChecks] = useState(0);
+  const recheckRound = useCallback(() => setRoundChecks((n) => n + 1), []);
+  useTopic([], recheckRound, {
+    events: ['bracket:update', 'match:update'],
+    enabled: tournament?.type === 'shuffle',
+  });
   useEffect(() => {
     if (tournament?.type === 'shuffle' && tournament?.id) {
       const loadRoundStatus = async () => {
@@ -135,157 +124,28 @@ export default function Bracket() {
         }
       };
 
-      loadRoundStatus();
-
-      // Refresh round status every 30 seconds
-      const interval = setInterval(() => {
-        void loadRoundStatus();
-      }, 30000);
-      return () => clearInterval(interval);
+      void loadRoundStatus();
     }
     // Non-shuffle or no tournament:
     // We intentionally do not reset shuffle-specific state here; guards below ensure
     // it is only used when the current tournament is a shuffle tournament.
-  }, [tournament?.type, tournament?.id, tournament?.mapSequence, tournament?.maps]);
-
-  // Poll allocation status globally so all tournament types can show the
-  // "next servers in Xs" countdown on the Bracket page.
-  useEffect(() => {
-    const loadAllocationStatus = async () => {
-      try {
-        const availability = await api.get<{
-          success: boolean;
-          availableServerCount: number;
-          gracePeriodSeconds?: number;
-          nextAllocationInSeconds?: number | null;
-          requiredServerCount?: number;
-          servers?: Array<{
-            id: string;
-            name: string;
-            online: boolean;
-            status: string | null;
-            matchSlug: string | null;
-            updatedAt: number | null;
-            inGraceWindow: boolean;
-            secondsUntilReady: number | null;
-            allocatable: boolean;
-          }>;
-          simulationEnabled?: boolean;
-        }>('/api/tournament/server-availability');
-
-        if (availability.success) {
-          setAllocationCountdown({
-            gracePeriodSeconds: availability.gracePeriodSeconds ?? 300,
-            nextAllocationInSeconds:
-              typeof availability.nextAllocationInSeconds === 'number'
-                ? availability.nextAllocationInSeconds
-                : null,
-            availableServerCount: availability.availableServerCount,
-            requiredServerCount: availability.requiredServerCount ?? 0,
-            servers:
-              availability.servers?.map((s) => ({
-                id: s.id,
-                name: s.name,
-                status: s.status,
-                inGraceWindow: s.inGraceWindow,
-                secondsUntilReady: s.secondsUntilReady,
-                allocatable: s.allocatable,
-              })) ?? [],
-          });
-        }
-      } catch (err) {
-        console.error('Failed to load allocation status for Bracket page:', err);
-      }
-    };
-
-    void loadAllocationStatus();
-    const interval = setInterval(() => {
-      void loadAllocationStatus();
-    }, 30000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Local per‑second countdown tick for "next allocation in" display
-  useEffect(() => {
-    if (
-      allocationCountdown.nextAllocationInSeconds === null ||
-      allocationCountdown.nextAllocationInSeconds <= 0
-    ) {
-      return;
-    }
-
-    const timer = setInterval(
-      () =>
-        setAllocationCountdown((prev) => ({
-          ...prev,
-          nextAllocationInSeconds:
-            prev.nextAllocationInSeconds !== null && prev.nextAllocationInSeconds > 0
-              ? prev.nextAllocationInSeconds - 1
-              : 0,
-        })),
-      1000
-    );
-
-    return () => clearInterval(timer);
-  }, [allocationCountdown.nextAllocationInSeconds]);
+  }, [tournament?.type, tournament?.id, tournament?.mapSequence, tournament?.maps, roundChecks]);
 
   // Set dynamic page title
   useEffect(() => {
-    document.title = t('layout.pageTitle.bracket');
+    document.title = pageTitle(t('layout.pageTitle.bracket'));
   }, [t]);
 
   // For shuffle tournaments, we always render the list view (no visual bracket).
   const effectiveViewMode: 'visual' | 'list' = tournament?.type === 'shuffle' ? 'list' : viewMode;
 
-  // Calculate global match number
-  const getGlobalMatchNumber = (match: Match): number => {
-    // Sort all matches by round, then by matchNumber
-    // For manual matches (round=0, match_number=0), use database ID to maintain consistent order
-    const sortedMatches = [...matches].sort((a, b) => {
-      if (a.round !== b.round) return a.round - b.round;
-      if (a.matchNumber !== b.matchNumber) return a.matchNumber - b.matchNumber;
-      // If round and match_number are the same (e.g., manual matches), sort by ID
-      return a.id - b.id;
-    });
-    return sortedMatches.findIndex((m) => m.id === match.id) + 1;
-  };
+  // Chronological numbering across upper/lower brackets (see compareMatchOrder).
+  const getGlobalMatchNumber = (match: Match): number => globalMatchNumber(match, matches);
 
-  const handleMatchClick = async (match: Match) => {
-    if (!match.team1 || !match.team2) {
-      return;
-    }
-    setSelectedMatchId(match.id);
-    selectedMatchIdRef.current = match.id;
-    setSelectedMatchOverride(null);
-
-    // Bracket matches often only have series score; load full details (including
-    // mapResults) so the modal can show correct per-map rounds even when opened
-    // from the bracket list view.
-    try {
-      const response = await api.get<{ success: boolean; match: Match }>(
-        `/api/matches/${match.slug}`
-      );
-      if (!response?.success || !response.match) {
-        return;
-      }
-      setSelectedMatchOverride((currentOverride) => {
-        // Only override if this match is still the selected one; if the user
-        // clicked a different match while this request was in flight, keep the
-        // newer selection.
-        if (selectedMatchIdRef.current !== match.id) {
-          return currentOverride;
-        }
-        return response.match;
-      });
-    } catch (err) {
-      console.error('Failed to load full match details for bracket modal:', err);
-    }
-  };
-
-  const handleCloseMatchModal = () => {
-    setSelectedMatchId(null);
-    selectedMatchIdRef.current = null;
-    setSelectedMatchOverride(null);
+  // A match opens its match room, the page players and admins run it from.
+  const handleMatchClick = (match: Match) => {
+    if (!match.team1 || !match.team2 || !match.slug) return;
+    navigate(manageMatchPath(match.slug, tournament?.id ?? null));
   };
 
   useEffect(() => {
@@ -320,9 +180,13 @@ export default function Bracket() {
     );
   }
 
+  // The states below have no tournament header of their own.
+  const pageHead = <PageHead title={t('layout.pageTitle.bracket')} />;
+
   if (error) {
     return (
       <Box sx={{ width: '100%', height: '100%' }}>
+        {pageHead}
         <Alert severity="error">{error}</Alert>
       </Box>
     );
@@ -331,13 +195,14 @@ export default function Bracket() {
   if (!tournament) {
     return (
       <Box>
+        {pageHead}
         <EmptyState
-          icon={AccountTreeOutlinedIcon}
+          icon={TreeStructureIcon}
           title={t('bracket.empty.noBracketTitle')}
           description={t('bracket.empty.noBracketDescription')}
           actionLabel={t('tournament.common.createTournament')}
-          actionIcon={AddIcon}
-          onAction={() => navigate('/tournament')}
+          actionIcon={PlusIcon}
+          onAction={() => navigate('/manage/tournament')}
         />
       </Box>
     );
@@ -347,96 +212,50 @@ export default function Bracket() {
   if (tournament.type === 'shuffle' && !matches.length) {
     return (
       <Box sx={{ width: '100%', height: '100%' }}>
-        <Card data-testid="bracket-empty-state" sx={{ textAlign: 'center', py: 8, px: 3 }}>
-          <EmojiEventsIcon sx={{ fontSize: 80, color: 'text.secondary', mb: 2 }} />
+        {pageHead}
+        <Panel data-testid="bracket-empty-state" sx={{ textAlign: 'center', py: 8, px: 3 }}>
+          <Box component={TrophyIcon} size={80} sx={{ color: 'text.secondary', mb: 2 }} />
           <Typography variant="h6" color="text.secondary" gutterBottom>
-            No bracket for shuffle tournaments
+            {t('bracket.shuffleEmpty.title')}
           </Typography>
           <Typography variant="body2" color="text.secondary" mb={2}>
-            Shuffle tournaments don&apos;t use a fixed bracket view. Teams are reshuffled each round
-            based on player ELO.
+            {t('bracket.shuffleEmpty.description')}
           </Typography>
           <Typography variant="body2" color="text.secondary" mb={3}>
-            Use the{' '}
-            <Box
-              component="a"
-              href="/matches"
-              sx={{ fontWeight: 600, textDecoration: 'underline', color: 'inherit' }}
-            >
-              Matches
-            </Box>{' '}
-            page to monitor live and upcoming matches, and the{' '}
-            <Box
-              component="a"
-              href={`/tournament/${tournament.id}/leaderboard`}
-              sx={{ fontWeight: 600, textDecoration: 'underline', color: 'inherit' }}
-            >
-              Leaderboard
-            </Box>{' '}
-            page to track player rankings.
+            {t('bracket.shuffleEmpty.hint')}
           </Typography>
           <Stack direction="row" spacing={2} justifyContent="center">
-            <Button variant="contained" onClick={() => navigate('/matches')}>
-              Go to Matches
+            <Button variant="contained" onClick={() => navigate('/manage/matches')}>
+              {t('bracket.shuffleEmpty.goToMatches')}
             </Button>
             <Button
               variant="outlined"
               onClick={() => navigate(`/tournament/${tournament.id}/leaderboard`)}
             >
-              View Leaderboard
+              {t('bracket.shuffleEmpty.viewLeaderboard')}
             </Button>
           </Stack>
-        </Card>
+        </Panel>
       </Box>
     );
   }
 
-  const showWaitingForServersBanner =
-    allocationCountdown.requiredServerCount > 0 &&
-    allocationCountdown.availableServerCount === 0;
-
-  const renderAllocationBanner = () => {
-    if (!showWaitingForServersBanner) {
-      return null;
-    }
-
-    const nextIn = allocationCountdown.nextAllocationInSeconds;
-
-    return (
-      <Box mb={2}>
-        <Alert severity="info">
-          <Typography variant="body2" fontWeight={600} gutterBottom>
-            {t('servers.allocation.title')}
-          </Typography>
-          <Typography variant="body2">
-            {t('servers.allocation.waiting')}{' '}
-            <strong>{allocationCountdown.requiredServerCount}</strong>
-          </Typography>
-          {typeof nextIn === 'number' && nextIn > 0 && (
-            <Typography variant="body2" color="text.secondary" mt={0.5}>
-              {t('servers.allocation.nextPass', { seconds: nextIn })}
-            </Typography>
-          )}
-        </Alert>
-      </Box>
-    );
-  };
-
   if (!matches.length) {
     return (
       <Box sx={{ width: '100%', height: '100%' }}>
-        <Card data-testid="bracket-empty-state" sx={{ textAlign: 'center', py: 8 }}>
-          <EmojiEventsIcon sx={{ fontSize: 80, color: 'text.secondary', mb: 2 }} />
+        {pageHead}
+        <Panel data-testid="bracket-empty-state" sx={{ textAlign: 'center', py: 8, px: 3 }}>
+          <Box component={TrophyIcon} size={80} sx={{ color: 'text.secondary', mb: 2 }} />
           <Typography variant="h6" color="text.secondary" gutterBottom>
-            Bracket not generated yet
+            {t('bracket.notGenerated.title')}
           </Typography>
           <Typography variant="body2" color="text.secondary" mb={3}>
-            Generate the bracket to create matches for {tournament.name}
+            {t('bracket.notGenerated.description', { name: tournament.name })}
           </Typography>
-          <Button variant="contained" onClick={() => navigate('/tournament')}>
-            Go to Tournament Settings
+          <Button variant="contained" onClick={() => navigate('/manage/tournament')}>
+            {t('bracket.notGenerated.goToSettings')}
           </Button>
-        </Card>
+        </Panel>
       </Box>
     );
   }
@@ -453,15 +272,15 @@ export default function Bracket() {
   // For shuffle tournaments, prefer shuffleTotalRounds; fall back to max round present
   const effectiveTotalRounds =
     tournament.type === 'shuffle'
-      ? shuffleTotalRounds ??
+      ? (shuffleTotalRounds ??
         (Object.keys(matchesByRound).length
           ? Math.max(...Object.keys(matchesByRound).map((r) => Number(r)))
-          : 0)
+          : 0))
       : totalRounds;
 
   const getBracketRoundLabel = (round: number): string => {
     if (tournament.type === 'shuffle') {
-      return `Round ${round}`;
+      return getRoundLabel(round);
     }
     return getRoundLabel(round, effectiveTotalRounds);
   };
@@ -528,7 +347,8 @@ export default function Bracket() {
       ref={fullscreenRef}
       data-testid="bracket-page"
       sx={{
-        bgcolor: 'background.default',
+        // Opaque only in fullscreen; otherwise the page sits on the body's paper colour.
+        bgcolor: isFullscreen ? 'background.default' : 'transparent',
         minHeight: '100vh',
         position: 'relative',
         height: isFullscreen ? '100vh' : 'auto',
@@ -538,84 +358,91 @@ export default function Bracket() {
       {/* Header - hidden in fullscreen mode */}
       {!isFullscreen && (
         <>
-          <Box
-            sx={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              mb: 4,
-              p: 2,
-            }}
-          >
-            <Box display="flex" alignItems="center" gap={2}>
-              <Box data-testid="bracket-tournament-info">
-                <Typography variant="h4" fontWeight={600} gutterBottom>
-                  {tournament.name}
-                </Typography>
-                <Typography variant="body2" color="text.secondary">
-                  {tournament.type.replace('_', ' ').toUpperCase()} •{' '}
-                  {tournament.format.toUpperCase()}
-                </Typography>
-              </Box>
-            </Box>
-            <Box display="flex" gap={2} alignItems="center">
-              {tournament.status === 'setup' && (
-                <StartTournamentButton variant="contained" size="medium" onSuccess={loadBracket} />
-              )}
-              <ToggleButtonGroup
-                value={effectiveViewMode}
-                exclusive
-                onChange={(_, newMode) => {
-                  if (!newMode) return;
-                  // Shuffle tournaments do not support visual mode
-                  if (tournament.type === 'shuffle' && newMode === 'visual') return;
-                  setViewMode(newMode);
-                }}
-                size="small"
-              >
-                <Tooltip
-                  title={
-                    tournament.type === 'shuffle'
-                      ? 'Shuffle tournaments do not have a visual bracket; use the list view instead.'
-                      : ''
-                  }
-                  disableHoverListener={tournament.type !== 'shuffle'}
-                  enterDelay={500}
+          {/* The page's head (the drafts' `.head`): the tournament on the
+              left, the view controls on the right; they wrap under the name
+              on a phone. */}
+          <PageHead
+            data-testid="bracket-tournament-info"
+            title={tournament.name}
+            subtitle={`${t(`tournament.typeSelector.types.${tournament.type}.label`)} • ${tournament.format.toUpperCase()}`}
+            actions={
+              <Box display="flex" gap={1} alignItems="center" flexWrap="wrap">
+                {tournament.status === 'setup' && (
+                  <StartTournamentButton
+                    variant="contained"
+                    size="medium"
+                    onSuccess={loadBracket}
+                  />
+                )}
+                <SegmentedControl
+                  size="small"
+                  label={t('bracket.view.visual')}
+                  value={effectiveViewMode}
+                  onChange={(newMode) => setViewMode(newMode)}
+                  options={[
+                    {
+                      value: 'visual',
+                      label: t('bracket.view.visual'),
+                      icon: <TreeStructureIcon size={18} />,
+                      // Shuffle tournaments do not support visual mode
+                      disabled: tournament.type === 'shuffle',
+                      title:
+                        tournament.type === 'shuffle'
+                          ? t('bracket.view.shuffleNoVisual')
+                          : undefined,
+                    },
+                    {
+                      value: 'list',
+                      label: t('bracket.view.list'),
+                      icon: <ListBulletsIcon size={18} />,
+                    },
+                  ]}
+                />
+                <Button
+                  variant="outlined"
+                  startIcon={<ArrowClockwiseIcon />}
+                  onClick={loadBracket}
+                  size="small"
                 >
-                  <span>
-                    <ToggleButton value="visual" disabled={tournament.type === 'shuffle'}>
-                      <AccountTreeOutlinedIcon sx={{ mr: 1 }} fontSize="small" />
-                      Visual
-                    </ToggleButton>
-                  </span>
-                </Tooltip>
-                <ToggleButton value="list">
-                  <ViewListIcon sx={{ mr: 1 }} fontSize="small" />
-                  List
-                </ToggleButton>
-              </ToggleButtonGroup>
-              <Button
-                variant="outlined"
-                startIcon={<RefreshIcon />}
-                onClick={loadBracket}
-                size="small"
-              >
-                Refresh
-              </Button>
-              <IconButton
-                onClick={toggleFullscreen}
-                color="primary"
-                title={isFullscreen ? 'Exit Fullscreen' : 'Enter Fullscreen'}
-              >
-                {isFullscreen ? <FullscreenExitIcon /> : <FullscreenIcon />}
-              </IconButton>
-            </Box>
-          </Box>
+                  {t('bracket.view.refresh')}
+                </Button>
+                <IconButton
+                  onClick={toggleFullscreen}
+                  color="primary"
+                  title={
+                    isFullscreen
+                      ? t('bracket.view.exitFullscreen')
+                      : t('bracket.view.enterFullscreen')
+                  }
+                >
+                  {isFullscreen ? <CornersInIcon /> : <CornersOutIcon />}
+                </IconButton>
+              </Box>
+            }
+          />
         </>
       )}
 
-      {/* Allocation / cooldown status helper */}
-      {!isFullscreen && renderAllocationBanner()}
+      {!isFullscreen && (
+        <Box>
+          <ChampionBanner tournament={tournament} />
+        </Box>
+      )}
+
+      {/* Pause the bracket when something goes wrong (services/matchHolds.ts). */}
+      {!isFullscreen && tournament.status === 'in_progress' && tournament.id !== undefined && (
+        <BracketPauseBar tournamentId={tournament.id} />
+      )}
+
+      {/* What the ready matches are waiting for, in the game's words (CS2:
+          a free server, and when the next allocation pass runs). A game whose
+          matches wait for nothing fills this with nothing. */}
+      {!isFullscreen && MatchQueueBanner && (
+        <MatchQueueBanner
+          availability={resourceAvailability}
+          nextInSeconds={nextAllocationInSeconds}
+        />
+      )}
 
       {/* Fullscreen exit button - only visible in fullscreen */}
       {isFullscreen && (
@@ -626,19 +453,19 @@ export default function Bracket() {
             top: 16,
             right: 16,
             zIndex: 1000,
-            bgcolor: 'rgba(42, 42, 42, 0.95)',
+            bgcolor: 'background.surface2',
             backdropFilter: 'blur(10px)',
-            boxShadow: 3,
-            color: '#e0e0e0',
-            border: '1px solid #555',
+            color: 'text.primary',
+            border: 1,
+            borderColor: 'divider',
             '&:hover': {
-              bgcolor: 'rgba(58, 58, 58, 1)',
-              color: '#ffffff',
+              bgcolor: 'background.surface2',
+              borderColor: 'text.disabled',
             },
           }}
-          title="Exit Fullscreen"
+          title={t('bracket.view.exitFullscreen')}
         >
-          <FullscreenExitIcon />
+          <CornersInIcon />
         </IconButton>
       )}
 
@@ -648,7 +475,14 @@ export default function Bracket() {
           roundStatus={liveRoundStatus}
           totalRounds={shuffleTotalRounds ?? totalRounds}
           isActive={!liveRoundStatus.isComplete}
-          allocationCountdownSeconds={allocationCountdown.nextAllocationInSeconds}
+          queueChip={
+            MatchQueueChip ? (
+              <MatchQueueChip
+                availability={resourceAvailability}
+                nextInSeconds={nextAllocationInSeconds}
+              />
+            ) : null
+          }
         />
       )}
 
@@ -666,6 +500,7 @@ export default function Bracket() {
             <SwissView
               matches={matches}
               teams={tournament.teams || []}
+              standings={swissStandings}
               totalRounds={totalRounds}
               onMatchClick={handleMatchClick}
             />
@@ -679,44 +514,28 @@ export default function Bracket() {
               }}
             >
               <Typography variant="h6" gutterBottom>
-                No visual bracket for shuffle tournaments
+                {t('bracket.shuffleNoVisual.title')}
               </Typography>
               <Typography variant="body2" color="text.secondary" mb={2}>
-                Matches are generated dynamically each round based on player ELO and team balancing.
+                {t('bracket.shuffleNoVisual.description')}
               </Typography>
-              <Typography variant="body2" color="text.secondary">
-                Use the{' '}
-                <Button
-                  size="small"
-                  variant="text"
-                  sx={{ px: 0.5, minWidth: 0 }}
-                  onClick={() => setViewMode('list')}
-                >
-                  <strong>List view</strong>
+              <Stack direction="row" spacing={1} justifyContent="center" flexWrap="wrap">
+                <Button size="small" variant="outlined" onClick={() => setViewMode('list')}>
+                  {t('bracket.shuffleNoVisual.listView')}
                 </Button>
-                , the{' '}
+                <Button size="small" variant="outlined" onClick={() => navigate('/manage/matches')}>
+                  {t('bracket.shuffleNoVisual.matches')}
+                </Button>
                 <Button
                   size="small"
-                  variant="text"
-                  sx={{ px: 0.5, minWidth: 0 }}
-                  onClick={() => navigate('/matches')}
+                  variant="outlined"
+                  onClick={() => navigate(tournamentTabPath(tournament.id, 'standings'))}
                 >
-                  <strong>Matches</strong>
-                </Button>{' '}
-                page, and{' '}
-                <Button
-                  size="small"
-                  variant="text"
-                  sx={{ px: 0.5, minWidth: 0 }}
-                  onClick={() => navigate('/tournament/1/leaderboard')}
-                >
-                  <strong>Standings</strong>
-                </Button>{' '}
-                to track shuffle tournament progress.
-              </Typography>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                For a full walkthrough of how shuffle works, see the{' '}
-                <strong>Shuffle Tournaments</strong> guide in the documentation.
+                  {t('bracket.shuffleNoVisual.standings')}
+                </Button>
+              </Stack>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
+                {t('bracket.shuffleNoVisual.docsHint')}
               </Typography>
             </Box>
           ) : (
@@ -724,6 +543,7 @@ export default function Bracket() {
             <BracketsViewerVisualization
               matches={matches}
               tournamentType={tournament.type}
+              rankingTeamIds={roundRobinStandings.map((s) => s.teamId)}
               isFullscreen={isFullscreen}
               onMatchClick={handleMatchClick}
             />
@@ -743,26 +563,26 @@ export default function Bracket() {
             .map((round) => {
               const roundMatches = matchesByRound[round] || [];
               // Only show matches where both teams are assigned (no TBD placeholders)
-              const visibleMatches = roundMatches.filter(
-                (match) => match.team1 && match.team2
-              );
+              const visibleMatches = roundMatches.filter((match) => match.team1 && match.team2);
               if (visibleMatches.length === 0) return null;
 
               return (
-                <Box key={round} mb={4}>
-                  <Typography variant="h6" fontWeight={600} mb={2}>
-                    {getBracketRoundLabel(round)}
-                    {tournament.type === 'shuffle' && getRoundMapLabel(round) && (
-                      <Chip
-                        label={getRoundMapLabel(round)!}
-                        size="small"
-                        sx={{ ml: 1 }}
-                        color="primary"
-                        variant="outlined"
-                      />
-                    )}
-                  </Typography>
-                  <Stack spacing={1.5}>
+                <Box
+                  component="section"
+                  key={round}
+                  mb={6}
+                  aria-labelledby={`bracket-round-${round}`}
+                >
+                  <SectionHead
+                    id={`bracket-round-${round}`}
+                    title={getBracketRoundLabel(round)}
+                    action={
+                      tournament.type === 'shuffle' && getRoundMapLabel(round) ? (
+                        <Chip label={getRoundMapLabel(round)!} size="small" />
+                      ) : undefined
+                    }
+                  />
+                  <RowList>
                     {visibleMatches.map((match) => (
                       <MatchListCard
                         key={match.id}
@@ -773,25 +593,11 @@ export default function Bracket() {
                         onClick={() => handleMatchClick(match)}
                       />
                     ))}
-                  </Stack>
+                  </RowList>
                 </Box>
               );
             })}
         </Box>
-      )}
-
-      {/* Match Details Modal */}
-      {selectedMatch && (
-        <MatchDetailsModal
-          match={selectedMatch}
-          matchNumber={getGlobalMatchNumber(selectedMatch)}
-          roundLabel={
-            tournament.type === 'shuffle'
-              ? `Round ${selectedMatch.round}`
-              : getRoundLabel(selectedMatch.round, totalRounds)
-          }
-          onClose={handleCloseMatchModal}
-        />
       )}
     </Box>
   );

@@ -1,26 +1,37 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { usePageHeader } from '../contexts/PageHeaderContext';
+import { pageTitle } from '../utils/pageTitle';
+import { useState, useEffect, useCallback } from 'react';
 import { useSnackbar } from '../contexts/SnackbarContext';
 import {
   Box,
   Button,
-  Card,
-  CardContent,
   Typography,
-  Grid,
   Chip,
+  Checkbox,
   CircularProgress,
   TextField,
   InputAdornment,
   Alert,
-  IconButton,
   Tooltip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
 } from '@mui/material';
-import AddIcon from '@mui/icons-material/Add';
-import PersonIcon from '@mui/icons-material/Person';
-import SearchIcon from '@mui/icons-material/Search';
-import OpenInNewIcon from '@mui/icons-material/OpenInNew';
-import { api } from '../utils/api';
+import {
+  ArrowSquareOutIcon,
+  EyeIcon,
+  MagnifyingGlassIcon,
+  PencilSimpleIcon,
+  PlusIcon,
+  ProhibitIcon,
+  TrashIcon,
+  UserIcon,
+  GiftIcon,
+} from '@phosphor-icons/react';
+import { PageHead, Row, RowList } from '../components/common/ui';
+import { RowMenu } from '../components/common/RowMenu';
+import { tokens } from '../theme/tokens';
+import { api, apiErrorMessage } from '../utils/api';
 import PlayerModal from '../components/modals/PlayerModal';
 import { PlayerImportModal } from '../components/modals/PlayerImportModal';
 import { EmptyState } from '../components/shared/EmptyState';
@@ -29,12 +40,22 @@ import type { PlayerDetail, PlayersResponse } from '../types/api.types';
 import { getPlayerPageUrl } from '../utils/playerLinks';
 import { PlayerAvatar } from '../components/player/PlayerAvatar';
 import { PlayerName } from '../components/player/PlayerName';
+import { NoDiscordChip } from '../components/player/NoDiscordChip';
+import { ImportWarningsMessage } from '../components/shared/ImportWarningsMessage';
 import { useTranslation } from 'react-i18next';
+import { useGameAccounts } from '../hooks/useGameAccounts';
+import { useAuth } from '../contexts/AuthContext';
+import { useInstalledIntegrations } from '../integrations/registry';
+import type { AdminPlayerActionProps } from '../integrations/types';
+import type { ComponentType } from 'react';
+import type { Untrusted } from '../utils/untrusted';
 
 export default function Players() {
   const { t } = useTranslation();
-  const { setHeaderActions } = usePageHeader();
-  const { showSuccess, showError } = useSnackbar();
+  // Steam wording only when a game here identifies players by Steam (CS2).
+  const steamContext = useGameAccounts().steam ? 'steam' : undefined;
+  const { showSuccess, showError, showWarning } = useSnackbar();
+  const { startImpersonation } = useAuth();
   const [players, setPlayers] = useState<PlayerDetail[]>([]);
   const [filteredPlayers, setFilteredPlayers] = useState<PlayerDetail[]>([]);
   const [loading, setLoading] = useState(true);
@@ -45,114 +66,130 @@ export default function Players() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedPlayerIds, setSelectedPlayerIds] = useState<Set<string>>(() => new Set());
   const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false);
+  // Ban (with a reason only admins see) and delete (final), from a row's menu.
+  const [banFor, setBanFor] = useState<PlayerDetail | null>(null);
+  const [banReason, setBanReason] = useState('');
+  const [deleteFor, setDeleteFor] = useState<PlayerDetail | null>(null);
+  // Modules' row actions (CS2: Give a drop), and the one open now.
+  const moduleActions = useInstalledIntegrations().flatMap((integration) =>
+    integration.adminPlayerAction ? [{ ...integration.adminPlayerAction, ns: integration.id }] : []
+  );
+  const [moduleAction, setModuleAction] = useState<{
+    Dialog: ComponentType<AdminPlayerActionProps>;
+    player: { id: string; name: string };
+  } | null>(null);
+  const [moderating, setModerating] = useState(false);
 
   // Set dynamic page title
   useEffect(() => {
-    document.title = t('layout.pageTitle.players');
+    document.title = pageTitle(t('layout.pageTitle.players'));
   }, [t]);
+
+  const handleImpersonate = async (player: PlayerDetail) => {
+    try {
+      // Reloads the app as the target player on success.
+      await startImpersonation(player.id);
+    } catch (error) {
+      showError(error instanceof Error ? error.message : t('impersonation.failed'));
+    }
+  };
 
   const handleOpenModal = (player?: PlayerDetail) => {
     setEditingPlayer(player || null);
     setModalOpen(true);
   };
 
-  // Set header actions
-  useEffect(() => {
-    if (players.length > 0) {
-      const allVisibleSelected =
-        filteredPlayers.length > 0 &&
-        filteredPlayers.every((player) => selectedPlayerIds.has(player.id));
+  const allVisibleSelected =
+    filteredPlayers.length > 0 &&
+    filteredPlayers.every((player) => selectedPlayerIds.has(player.id));
 
-      setHeaderActions(
-        <Box display="flex" gap={2}>
-          <Button
-            variant={selectionMode ? 'contained' : 'outlined'}
-            color={selectionMode ? 'secondary' : 'inherit'}
-            size="small"
-            onClick={() => {
-              setSelectionMode((prev) => !prev);
-              if (selectionMode) {
-                setSelectedPlayerIds(() => new Set());
-              }
-            }}
-          >
-            {selectionMode ? t('playersPage.headerSelect.done') : t('playersPage.headerSelect.select')}
-          </Button>
-          {selectionMode && (
-            <>
-              <Button
-                variant="outlined"
-                color="inherit"
-                size="small"
-                disabled={filteredPlayers.length === 0}
-                onClick={() => {
-                  setSelectedPlayerIds((prev) => {
-                    const next = new Set(prev);
-                    if (allVisibleSelected) {
-                      filteredPlayers.forEach((player) => {
-                        next.delete(player.id);
-                      });
-                    } else {
-                      filteredPlayers.forEach((player) => {
-                        next.add(player.id);
-                      });
-                    }
-                    return next;
-                  });
-                }}
-              >
-                {allVisibleSelected
-                  ? t('playersPage.headerSelect.unselectAll')
-                  : t('playersPage.headerSelect.selectAll')}
-              </Button>
-              <Button
-                variant="outlined"
-                color="error"
-                size="small"
-                disabled={selectedPlayerIds.size === 0}
-                onClick={() => {
-                  if (selectedPlayerIds.size === 0) return;
-                  setBulkDeleteConfirmOpen(true);
-                }}
-              >
-                {t('playersPage.headerSelect.deleteSelected')}
-              </Button>
-            </>
-          )}
-          {!selectionMode && (
-            <>
-              <Button variant="outlined" size="small" onClick={() => setImportModalOpen(true)}>
-                {t('playersPage.headerActions.import')}
-              </Button>
-              <Button
-                variant="contained"
-                size="small"
-                startIcon={<AddIcon />}
-                onClick={() => handleOpenModal()}
-                data-testid="add-player-button"
-              >
-                {t('playersPage.headerActions.addPlayer')}
-              </Button>
-            </>
-          )}
-        </Box>
-      );
-    } else {
-      setHeaderActions(null);
-    }
-
-    return () => {
-      setHeaderActions(null);
-    };
-  }, [players.length, setHeaderActions, selectionMode, selectedPlayerIds, filteredPlayers, t]);
+  // The page's own actions, beside its title (the drafts' `.head`), once
+  // there is someone to act on; the empty state offers them itself.
+  const headActions =
+    players.length === 0 ? null : (
+      <>
+        <Button
+          variant={selectionMode ? 'contained' : 'outlined'}
+          color={selectionMode ? 'secondary' : 'inherit'}
+          size="small"
+          onClick={() => {
+            setSelectionMode((prev) => !prev);
+            if (selectionMode) {
+              setSelectedPlayerIds(() => new Set());
+            }
+          }}
+        >
+          {selectionMode
+            ? t('playersPage.headerSelect.done')
+            : t('playersPage.headerSelect.select')}
+        </Button>
+        {selectionMode && (
+          <>
+            <Button
+              variant="outlined"
+              color="inherit"
+              size="small"
+              disabled={filteredPlayers.length === 0}
+              onClick={() => {
+                setSelectedPlayerIds((prev) => {
+                  const next = new Set(prev);
+                  if (allVisibleSelected) {
+                    filteredPlayers.forEach((player) => {
+                      next.delete(player.id);
+                    });
+                  } else {
+                    filteredPlayers.forEach((player) => {
+                      next.add(player.id);
+                    });
+                  }
+                  return next;
+                });
+              }}
+            >
+              {allVisibleSelected
+                ? t('playersPage.headerSelect.unselectAll')
+                : t('playersPage.headerSelect.selectAll')}
+            </Button>
+            <Button
+              variant="outlined"
+              color="error"
+              size="small"
+              disabled={selectedPlayerIds.size === 0}
+              onClick={() => {
+                if (selectedPlayerIds.size === 0) return;
+                setBulkDeleteConfirmOpen(true);
+              }}
+            >
+              {t('playersPage.headerSelect.deleteSelected')}
+            </Button>
+          </>
+        )}
+        {!selectionMode && (
+          <>
+            <Button variant="outlined" size="small" onClick={() => setImportModalOpen(true)}>
+              {t('playersPage.headerActions.import')}
+            </Button>
+            <Button
+              variant="contained"
+              size="small"
+              startIcon={<PlusIcon />}
+              onClick={() => handleOpenModal()}
+              data-testid="add-player-button"
+            >
+              {t('playersPage.headerActions.addPlayer')}
+            </Button>
+          </>
+        )}
+      </>
+    );
 
   const loadPlayers = useCallback(async () => {
     try {
       setLoading(true);
       const data = await api.get<PlayersResponse>('/api/players');
-      const sorted = (data.players || []).slice().sort((a, b) =>
-        a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-      );
+      const sorted = (data.players || [])
+        .slice()
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
       setPlayers(sorted);
       setFilteredPlayers(sorted);
     } catch (err) {
@@ -194,6 +231,21 @@ export default function Players() {
     handleCloseModal();
   };
 
+  const moderate = async (work: () => Promise<Untrusted>, done: string, fail: string) => {
+    setModerating(true);
+    try {
+      await work();
+      showSuccess(done);
+      await loadPlayers();
+      return true;
+    } catch (err) {
+      showError(err instanceof Error && err.message ? apiErrorMessage(err, fail) : fail);
+      return false;
+    } finally {
+      setModerating(false);
+    }
+  };
+
   const handleDelete = async (playerId: string) => {
     try {
       await api.delete(`/api/players/${playerId}`);
@@ -219,22 +271,33 @@ export default function Players() {
 
   const handleImportPlayers = async (
     importedPlayers: Array<{
-      steamId: string;
+      steamId?: string;
       name: string;
       initialELO?: number;
       avatarUrl?: string;
+      discordId?: string;
     }>
   ) => {
     try {
       const playersToImport = importedPlayers.map((p) => ({
-        id: p.steamId,
+        // No Steam ID: the API gives the player an account id of its own.
+        id: p.steamId || undefined,
         name: p.name,
         elo: p.initialELO,
         avatar: p.avatarUrl,
+        // The API validates it and only fills in players that have none yet.
+        discordId: p.discordId,
       }));
 
-      await api.post('/api/players/bulk-import', playersToImport);
+      const response = await api.post<{ warnings?: string[] }>(
+        '/api/players/bulk-import',
+        playersToImport
+      );
       showSuccess(t('playersPage.importSuccess', { count: importedPlayers.length }));
+      const warnings = Array.from(new Set(response?.warnings ?? []));
+      if (warnings.length > 0) {
+        showWarning(<ImportWarningsMessage warnings={warnings} />);
+      }
       await loadPlayers();
     } catch (err) {
       console.error('Failed to import players:', err);
@@ -245,19 +308,24 @@ export default function Players() {
 
   if (loading) {
     return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="400px">
-        <CircularProgress />
-      </Box>
+      <>
+        <PageHead title={t('layout.pageTitle.players')} />
+        <Box display="flex" justifyContent="center" alignItems="center" minHeight="400px">
+          <CircularProgress />
+        </Box>
+      </>
     );
   }
 
   return (
     <Box data-testid="players-page" sx={{ width: '100%', height: '100%' }}>
+      <PageHead title={t('layout.pageTitle.players')} actions={headActions} />
+
       {players.length > 0 && (
         <Box mb={3}>
           <TextField
             fullWidth
-            placeholder={t('playersPage.searchPlaceholder')}
+            placeholder={t('playersPage.searchPlaceholder', { context: steamContext })}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             slotProps={{
@@ -266,7 +334,7 @@ export default function Players() {
             InputProps={{
               startAdornment: (
                 <InputAdornment position="start">
-                  <SearchIcon />
+                  <MagnifyingGlassIcon />
                 </InputAdornment>
               ),
             }}
@@ -275,118 +343,210 @@ export default function Players() {
       )}
 
       {players.length === 0 ? (
-          <Box>
-            <EmptyState
-              data-testid="players-empty-state"
-              icon={PersonIcon}
-              title={t('playersPage.empty.title')}
-              description={t('playersPage.empty.description')}
-              actionLabel={t('playersPage.empty.createPlayer')}
-              actionIcon={AddIcon}
-              onAction={() => handleOpenModal()}
-            />
-            <Box display="flex" justifyContent="center" mt={2}>
-              <Button variant="outlined" onClick={() => setImportModalOpen(true)}>
-                {t('playersPage.empty.import')}
-              </Button>
-            </Box>
+        <Box>
+          <EmptyState
+            data-testid="players-empty-state"
+            icon={UserIcon}
+            title={t('playersPage.empty.title')}
+            description={t('playersPage.empty.description')}
+            actionLabel={t('playersPage.empty.createPlayer')}
+            actionIcon={PlusIcon}
+            onAction={() => handleOpenModal()}
+          />
+          <Box display="flex" justifyContent="center" mt={2}>
+            <Button variant="outlined" onClick={() => setImportModalOpen(true)}>
+              {t('playersPage.empty.import')}
+            </Button>
           </Box>
-        ) : filteredPlayers.length === 0 ? (
-          <Alert severity="info">
-            {t('playersPage.searchNoResults', { query: searchQuery })}
-          </Alert>
-        ) : (
-          <Grid container spacing={2} data-testid="players-list">
-            {filteredPlayers.map((player) => (
-              <Grid size={{ xs: 12, sm: 6, md: 4, lg: 4 }} key={player.id}>
-                <Card
-                  data-testid={`player-card-${player.id}`}
+        </Box>
+      ) : filteredPlayers.length === 0 ? (
+        <Alert severity="info">{t('playersPage.searchNoResults', { query: searchQuery })}</Alert>
+      ) : (
+        // One row per player (the drafts' `.row-list.panel`): avatar and
+        // name, a quiet rating chip, and the rest behind the row's menu.
+        // A click on the row edits the player, or picks it while selecting.
+        <RowList data-testid="players-list" aria-label={t('layout.pageTitle.players')}>
+          {filteredPlayers.map((player) => {
+            const selected = selectedPlayerIds.has(player.id);
+            return (
+              <Row
+                key={player.id}
+                data-testid={`player-card-${player.id}`}
+                columns={{
+                  xs: selectionMode ? 'auto auto minmax(0, 1fr) auto' : 'auto minmax(0, 1fr) auto',
+                  sm: selectionMode
+                    ? 'auto auto minmax(0, 1fr) auto auto'
+                    : 'auto minmax(0, 1fr) auto auto',
+                }}
+                onClick={() => {
+                  if (selectionMode) {
+                    togglePlayerSelected(player.id);
+                  } else {
+                    handleOpenModal(player);
+                  }
+                }}
+                sx={{
+                  cursor: 'pointer',
+                  py: 1.5,
+                  bgcolor: selected ? tokens.color.paper3 : 'transparent',
+                  '&:hover': { bgcolor: tokens.color.paper3 },
+                  '&:first-of-type': {
+                    borderTopLeftRadius: 'inherit',
+                    borderTopRightRadius: 'inherit',
+                  },
+                  '&:last-of-type': {
+                    borderBottomLeftRadius: 'inherit',
+                    borderBottomRightRadius: 'inherit',
+                  },
+                }}
+              >
+                {selectionMode && (
+                  <Checkbox
+                    size="small"
+                    checked={selected}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={() => togglePlayerSelected(player.id)}
+                    slotProps={{ input: { 'aria-label': player.name } }}
+                    sx={{ m: -1 }}
+                  />
+                )}
+                <PlayerAvatar
+                  id={player.id}
+                  name={player.name}
+                  avatarUrl={player.avatar}
+                  size={36}
+                  isAdmin={player.isAdmin}
+                />
+                <Box sx={{ minWidth: 0 }}>
+                  <PlayerName
+                    name={player.name}
+                    isAdmin={player.isAdmin}
+                    variant="body1"
+                    noWrap
+                    sx={{ fontWeight: 600 }}
+                  />
+                  <Typography variant="body2" color="text.secondary" noWrap>
+                    {t('playersPage.matchesCount', { count: player.matchCount })}
+                  </Typography>
+                </Box>
+                <Box
                   sx={{
-                    cursor: 'pointer',
-                    transition: 'transform 0.2s, box-shadow 0.2s, border-color 0.2s',
-                    border: selectedPlayerIds.has(player.id) ? 2 : 0,
-                    borderRadius: 2,
-                    borderStyle: 'solid',
-                    borderColor: selectedPlayerIds.has(player.id)
-                      ? 'primary.main'
-                      : 'transparent',
-                    '&:hover': {
-                      transform: 'translateY(-4px)',
-                      boxShadow: 6,
-                    },
-                  }}
-                  onClick={() => {
-                    if (selectionMode) {
-                      togglePlayerSelected(player.id);
-                    } else {
-                      handleOpenModal(player);
-                    }
+                    display: 'flex',
+                    gap: 1,
+                    flexWrap: 'wrap',
+                    alignItems: 'center',
+                    justifyContent: { xs: 'flex-start', sm: 'flex-end' },
+                    // Under the name on a phone, beside it above that.
+                    order: { xs: 1, sm: 0 },
+                    gridColumn: { xs: selectionMode ? '3 / -1' : '2 / -1', sm: 'auto' },
                   }}
                 >
-                  <CardContent>
-                    <Box display="flex" alignItems="center" gap={2} mb={2}>
-                      <PlayerAvatar
-                        id={player.id}
-                        name={player.name}
-                        avatarUrl={player.avatar}
-                        size={48}
-                        isAdmin={player.isAdmin}
+                  <Tooltip title={t('playersPage.skillRatingTooltip')}>
+                    <Chip
+                      label={t('playersPage.skillRatingLabel', { elo: player.currentElo })}
+                      size="small"
+                    />
+                  </Tooltip>
+                  {!player.discordId && (
+                    <NoDiscordChip testId={`player-card-no-discord-${player.id}`} />
+                  )}
+                  {player.banned && (
+                    <Tooltip title={player.banReason || ''}>
+                      <Chip
+                        size="small"
+                        color="error"
+                        variant="outlined"
+                        label={t('playersPage.banned')}
+                        data-testid={`player-banned-${player.id}`}
                       />
-                      <Box>
-                        <Box display="flex" alignItems="center" gap={1}>
-                          <PlayerName
-                            name={player.name}
-                            isAdmin={player.isAdmin}
-                            variant="h6"
-                            sx={{ fontWeight: 600 }}
-                          />
-                          <Tooltip title={t('playersPage.openPlayerPageTooltip')}>
-                            <IconButton
-                              size="small"
-                              component="a"
-                              href={getPlayerPageUrl(player.id)}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={(event) => event.stopPropagation()}
-                              sx={{ ml: -0.5 }}
-                            >
-                              <OpenInNewIcon fontSize="small" />
-                            </IconButton>
-                          </Tooltip>
-                        </Box>
-                        <Typography variant="caption" color="text.secondary" display="block">
-                          {player.id}
-                        </Typography>
-                      </Box>
-                    </Box>
+                    </Tooltip>
+                  )}
+                </Box>
+                <RowMenu
+                  label={t('playersPage.rowActions', { name: player.name })}
+                  data-testid={`player-actions-${player.id}`}
+                  items={[
+                    {
+                      key: 'edit',
+                      label: t('playersPage.edit'),
+                      icon: <PencilSimpleIcon size={20} />,
+                      onClick: () => handleOpenModal(player),
+                    },
+                    {
+                      key: 'open',
+                      label: t('playersPage.openPlayerPageTooltip'),
+                      icon: <ArrowSquareOutIcon size={20} />,
+                      href: getPlayerPageUrl(player.id),
+                    },
+                    // Admins can't be impersonated, so don't offer it.
+                    ...(player.isAdmin
+                      ? []
+                      : [
+                          {
+                            key: 'viewAs',
+                            label: t('impersonation.viewAs'),
+                            icon: <EyeIcon size={20} />,
+                            onClick: () => void handleImpersonate(player),
+                            'data-testid': `impersonate-player-${player.id}`,
+                          },
+                        ]),
+                    // Admins can't be banned: take admin away first.
+                    ...(player.isAdmin
+                      ? []
+                      : [
+                          player.banned
+                            ? {
+                                key: 'unban',
+                                label: t('playersPage.unban'),
+                                icon: <ProhibitIcon size={20} />,
+                                onClick: () =>
+                                  void moderate(
+                                    () => api.delete(`/api/players/${player.id}/ban`),
+                                    t('playersPage.unbanned', { name: player.name }),
+                                    t('playersPage.moderationError')
+                                  ),
+                                'data-testid': `unban-player-${player.id}`,
+                              }
+                            : {
+                                key: 'ban',
+                                label: t('playersPage.ban'),
+                                icon: <ProhibitIcon size={20} />,
+                                onClick: () => {
+                                  setBanReason('');
+                                  setBanFor(player);
+                                },
+                                'data-testid': `ban-player-${player.id}`,
+                              },
+                        ]),
+                    ...moduleActions.map((action) => ({
+                      key: `${action.ns}:${action.key}`,
+                      label: t(action.labelKey, { ns: action.ns }),
+                      icon: <GiftIcon size={20} />,
+                      onClick: () =>
+                        setModuleAction({
+                          Dialog: action.Dialog,
+                          player: { id: player.id, name: player.name },
+                        }),
+                      'data-testid': `player-action-${action.key}-${player.id}`,
+                    })),
+                    {
+                      key: 'delete',
+                      label: t('playersPage.delete'),
+                      icon: <TrashIcon size={20} />,
+                      onClick: () => setDeleteFor(player),
+                      'data-testid': `delete-player-${player.id}`,
+                    },
+                  ]}
+                />
+              </Row>
+            );
+          })}
+        </RowList>
+      )}
 
-                    <Box display="flex" alignItems="center" gap={1} mb={1}>
-                      <Tooltip title={t('playersPage.skillRatingTooltip')}>
-                        <Chip
-                          label={t('playersPage.skillRatingLabel', {
-                            elo: player.currentElo,
-                          })}
-                          size="small"
-                          color="primary"
-                          sx={{ fontWeight: 600 }}
-                        />
-                      </Tooltip>
-                      {player.matchCount > 0 && (
-                        <Chip
-                          label={t('playersPage.matchesCount', {
-                            count: player.matchCount,
-                          })}
-                          size="small"
-                          variant="outlined"
-                        />
-                      )}
-                    </Box>
-                  </CardContent>
-                </Card>
-              </Grid>
-            ))}
-          </Grid>
-        )}
+      {moduleAction && (
+        <moduleAction.Dialog player={moduleAction.player} onClose={() => setModuleAction(null)} />
+      )}
 
       <PlayerModal
         open={modalOpen}
@@ -401,12 +561,84 @@ export default function Players() {
         onImport={handleImportPlayers}
       />
 
+      <Dialog
+        open={!!banFor}
+        onClose={() => !moderating && setBanFor(null)}
+        fullWidth
+        maxWidth="xs"
+      >
+        <DialogTitle>{t('playersPage.banTitle', { name: banFor?.name ?? '' })}</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            {t('playersPage.banBody')}
+          </Typography>
+          <TextField
+            label={t('playersPage.banReason')}
+            helperText={t('playersPage.banReasonHelp')}
+            value={banReason}
+            onChange={(e) => setBanReason(e.target.value)}
+            fullWidth
+            size="small"
+            multiline
+            minRows={2}
+            inputProps={{ maxLength: 500, 'data-testid': 'ban-reason' }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setBanFor(null)} disabled={moderating}>
+            {t('playersPage.cancel')}
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            disabled={moderating}
+            data-testid="ban-confirm"
+            onClick={async () => {
+              const who = banFor!;
+              if (
+                await moderate(
+                  () =>
+                    api.post(`/api/players/${who.id}/ban`, { reason: banReason.trim() || null }),
+                  t('playersPage.bannedDone', { name: who.name }),
+                  t('playersPage.moderationError')
+                )
+              ) {
+                setBanFor(null);
+              }
+            }}
+          >
+            {t('playersPage.ban')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <ConfirmDialog
+        open={!!deleteFor}
+        title={t('playersPage.deleteTitle', { name: deleteFor?.name ?? '' })}
+        message={t('playersPage.deleteBody')}
+        confirmLabel={t('playersPage.delete')}
+        confirmColor="error"
+        loading={moderating}
+        onConfirm={async () => {
+          const who = deleteFor!;
+          if (
+            await moderate(
+              () => api.delete(`/api/players/${who.id}`),
+              t('playersPage.deletedDone', { name: who.name }),
+              t('playersPage.deleteError')
+            )
+          ) {
+            setDeleteFor(null);
+          }
+        }}
+        onCancel={() => setDeleteFor(null)}
+      />
+
       <ConfirmDialog
         open={selectionMode && bulkDeleteConfirmOpen}
         title={t('playersPage.bulkDelete.title')}
         message={t('playersPage.bulkDelete.message', {
           count: selectedPlayerIds.size,
-          suffix: selectedPlayerIds.size === 1 ? '' : 's',
         })}
         confirmLabel={t('playersPage.bulkDelete.confirm')}
         confirmColor="error"
@@ -419,21 +651,19 @@ export default function Players() {
             const ids = Array.from(selectedPlayerIds);
             const count = ids.length;
             await api.post('/api/players/bulk-delete', { ids });
-            showSuccess(`Deleted ${count} player${count === 1 ? '' : 's'}`);
+            showSuccess(t('playersPage.bulkDelete.success', { count }));
             setSelectedPlayerIds(() => new Set());
             setSelectionMode(false);
             await loadPlayers();
           } catch (err) {
             console.error('Failed to delete players:', err);
-            showError('Failed to delete one or more players');
+            showError(t('playersPage.bulkDelete.error'));
           } finally {
             setBulkDeleteConfirmOpen(false);
           }
         }}
         onCancel={() => setBulkDeleteConfirmOpen(false)}
       />
-
     </Box>
   );
 }
-

@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Box, Typography, Card, CardContent, Grid } from '@mui/material';
-import MapIcon from '@mui/icons-material/Map';
+import { MapTrifoldIcon } from '@phosphor-icons/react';
 import { api } from '../../utils/api';
 import type { Map } from '../../types/api.types';
 import { getMapDisplayName } from '../../constants/maps';
@@ -99,7 +99,7 @@ export function ShuffleMapsCard({ maps }: ShuffleMapsCardProps) {
   }, [maps, availableMaps]);
 
   return (
-    <Card sx={{ width: '33%', display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
+    <Card sx={{ width: '100%', display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
       <CardContent
         sx={{
           display: 'flex',
@@ -111,7 +111,7 @@ export function ShuffleMapsCard({ maps }: ShuffleMapsCardProps) {
         }}
       >
         <Box display="flex" alignItems="center" gap={1} mb={3}>
-          <MapIcon color="action" fontSize="small" />
+          <Box component={MapTrifoldIcon} size={20} sx={{ color: 'action.active' }} />
           <Typography variant="h6" fontWeight={600}>
             Map Order
           </Typography>

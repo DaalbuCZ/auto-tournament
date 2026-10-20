@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -17,15 +17,14 @@ import {
   Chip,
   IconButton,
 } from '@mui/material';
-import CloseIcon from '@mui/icons-material/Close';
-import SearchIcon from '@mui/icons-material/Search';
-import PersonIcon from '@mui/icons-material/Person';
+import { MagnifyingGlassIcon, UserIcon, XIcon } from '@phosphor-icons/react';
 import { api } from '../../utils/api';
 import { useSnackbar } from '../../contexts/SnackbarContext';
 import type { PlayerDetail } from '../../types/api.types';
 import { PlayerAvatar } from '../player/PlayerAvatar';
 import { PlayerName } from '../player/PlayerName';
 import { useTranslation } from 'react-i18next';
+import { useGameAccounts } from '../../hooks/useGameAccounts';
 
 interface PlayerSelectionModalProps {
   open: boolean;
@@ -56,6 +55,8 @@ export default function PlayerSelectionModal({
   const [searchQuery, setSearchQuery] = useState('');
   const { showWarning, showError } = useSnackbar();
   const { t } = useTranslation();
+  // Steam wording only when a game here identifies players by Steam (CS2).
+  const steamContext = useGameAccounts().steam ? 'steam' : undefined;
 
   // Define functions before useEffect hooks that use them
   const loadPlayers = async () => {
@@ -143,7 +144,11 @@ export default function PlayerSelectionModal({
       newSelected.delete(playerId);
     } else {
       // Enforce maxSelection when adding new IDs
-      if (typeof maxSelection === 'number' && maxSelection > 0 && newSelected.size >= maxSelection) {
+      if (
+        typeof maxSelection === 'number' &&
+        maxSelection > 0 &&
+        newSelected.size >= maxSelection
+      ) {
         return;
       }
       newSelected.add(playerId);
@@ -177,10 +182,8 @@ export default function PlayerSelectionModal({
       <DialogTitle>
         <Box display="flex" justifyContent="space-between" alignItems="center">
           <Box display="flex" alignItems="center" gap={1}>
-            <PersonIcon color="primary" />
-            <Typography variant="h6">
-              {title || t('playerSelectionModal.title')}
-            </Typography>
+            <Box component={UserIcon} sx={{ color: 'primary.main' }} />
+            <Typography variant="h6">{title || t('playerSelectionModal.title')}</Typography>
             {selectedIds.size > 0 && (
               <Chip
                 label={t('playerSelectionModal.selectedCount', {
@@ -192,7 +195,7 @@ export default function PlayerSelectionModal({
             )}
           </Box>
           <IconButton size="small" onClick={handleCancel}>
-            <CloseIcon />
+            <XIcon />
           </IconButton>
         </Box>
       </DialogTitle>
@@ -200,13 +203,13 @@ export default function PlayerSelectionModal({
         <Box mb={2} display="flex" gap={1}>
           <TextField
             fullWidth
-            placeholder={t('playerSelectionModal.searchPlaceholder')}
+            placeholder={t('playerSelectionModal.searchPlaceholder', { context: steamContext })}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             InputProps={{
               startAdornment: (
                 <InputAdornment position="start">
-                  <SearchIcon />
+                  <MagnifyingGlassIcon />
                 </InputAdornment>
               ),
             }}
@@ -280,7 +283,7 @@ export default function PlayerSelectionModal({
           </Box>
         ) : filteredPlayers.length === 0 ? (
           <Box textAlign="center" py={4}>
-            <PersonIcon sx={{ fontSize: 48, color: 'text.secondary', mb: 2 }} />
+            <Box component={UserIcon} size={48} sx={{ color: 'text.secondary', mb: 2 }} />
             <Typography variant="body1" color="text.secondary">
               {searchQuery
                 ? t('playerSelectionModal.empty.noSearchResults')
@@ -313,12 +316,13 @@ export default function PlayerSelectionModal({
                         borderColor: selected ? 'primary.main' : 'divider',
                         bgcolor: selected ? 'action.selected' : 'background.paper',
                         transition: 'all 0.2s',
-                        '&:hover': disabled || selectionLockedForOthers
-                          ? {}
-                          : {
-                              borderColor: 'primary.main',
-                              boxShadow: 2,
-                            },
+                        '&:hover':
+                          disabled || selectionLockedForOthers
+                            ? {}
+                            : {
+                                borderColor: 'primary.main',
+                                bgcolor: 'var(--at-paper3)',
+                              },
                       }}
                       onClick={() =>
                         !disabled && !selectionLockedForOthers && handleTogglePlayer(player.id)
@@ -331,7 +335,9 @@ export default function PlayerSelectionModal({
                               checked={selected}
                               disabled={disabled}
                               onChange={() =>
-                                !disabled && !selectionLockedForOthers && handleTogglePlayer(player.id)
+                                !disabled &&
+                                !selectionLockedForOthers &&
+                                handleTogglePlayer(player.id)
                               }
                               onClick={(e) => e.stopPropagation()}
                               sx={{ p: 0 }}
@@ -384,10 +390,7 @@ export default function PlayerSelectionModal({
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2 }}>
         <Button onClick={handleCancel}>{t('common.cancel')}</Button>
-        <Button
-          variant="contained"
-          onClick={handleConfirm}
-        >
+        <Button variant="contained" onClick={handleConfirm}>
           {confirmButtonText ||
             t('playerSelectionModal.addPlayersButton', {
               count: selectedIds.size,

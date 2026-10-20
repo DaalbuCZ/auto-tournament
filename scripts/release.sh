@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# MatchZy Auto Tournament - Release Script
+# Auto Tournament - Release Script
 # Builds project, builds Docker image, bumps version, commits, and releases
 
 # Colors for output
@@ -32,30 +32,184 @@ if [ -n "${DOCKER_HOST:-}" ] && echo "${DOCKER_HOST}" | grep -qi "rancher-deskto
     unset DOCKER_HOST
 fi
 
+# Collect the changes in this release, newest last.
+#
+# PRs are squash-merged here, so each one lands as a single commit whose subject
+# ends in "(#123)" — there is no merge commit to read. This used to look only at
+# `git log --merges`, which in a squash-merge repository finds nothing except
+# the release PR itself. That is why past releases were published with a
+# changelog reading, in full, "- chore: bump version to X.Y.Z".
+#
+# Merge commits are still read, so this keeps working if a PR is ever merged
+# rather than squashed. The release's own version-bump commit is dropped: it is
+# noise in every changelog it has ever appeared in.
+collect_changes() {
+    local current_tag="v${NEW_VERSION}"
+    local prev_tag
+    local range
+
+    # The tag immediately *preceding* this version, not merely the newest other
+    # tag. Those are the same thing while releasing the newest version, which is
+    # why the old form worked in practice — but it silently produced an inverted,
+    # empty range for anything else, so the function could never be tested.
+    # `current_tag` is added to the list in case the tag does not exist yet.
+    prev_tag=$(
+        { git tag --sort=v:refname 2>/dev/null; echo "${current_tag}"; } \
+            | sort -V -u \
+            | grep -B1 -x -- "${current_tag}" \
+            | head -1
+    )
+    [ "$prev_tag" = "${current_tag}" ] && prev_tag=""
+
+    if [ -n "$prev_tag" ]; then
+        range="${prev_tag}..${current_tag}"
+    elif git rev-parse "${current_tag}" >/dev/null 2>&1; then
+        range="${current_tag}"
+    else
+        range=""
+    fi
+
+    local changes
+    changes=$(
+        {
+            # Squash-merged PRs: subject ends in (#123).
+            git log ${range} --no-merges --format="%s" 2>/dev/null | grep -E '\(#[0-9]+\)$' || true
+            # Genuine merge commits: the PR title is the first non-empty body line.
+            git log ${range} --merges --format="%B" 2>/dev/null | awk '
+                /^Merge pull request/ { getline; getline; if (NF > 0) print }
+            ' || true
+        } | grep -vE '^chore: bump version to ' || true
+    )
+
+    # Nothing looked like a PR, so fall back to plain commit subjects. A release
+    # made from direct pushes should still say what is in it rather than fall
+    # through to the "- Release vX.Y.Z" placeholder.
+    if [ -z "$changes" ]; then
+        changes=$(
+            git log ${range} --no-merges --format="%s" 2>/dev/null \
+                | grep -vE '^chore: bump version to ' || true
+        )
+    fi
+
+    printf '%s\n' "$changes" \
+        | grep -v '^$' \
+        | head -30 \
+        | sed 's/^/- /' \
+        | { if [[ "$OSTYPE" == "darwin"* ]]; then tail -r; else tac; fi; }
+}
+
+
 # Configuration
+#
+# Three image names get the same content from the same build:
+#   - GHCR_IMAGE: the primary, ghcr.io/auto-tournament/auto-tournament.
+#   - DOCKER_IMAGE_NEW: the Docker Hub mirror under the new name.
+#   - DOCKER_IMAGE: the old Docker Hub name, kept for existing installs
+#     that still pull sivertio/matchzy-auto-tournament.
 DOCKER_USERNAME="${DOCKER_USERNAME:-sivertio}"
 IMAGE_NAME="matchzy-auto-tournament"
 DOCKER_IMAGE="${DOCKER_USERNAME}/${IMAGE_NAME}"
-BUILDER_NAME="matchzy-release"
-REPO_OWNER="sivert-io"
-REPO_NAME="matchzy-auto-tournament"
+GHCR_OWNER="${GHCR_OWNER:-auto-tournament}"
+GHCR_IMAGE="ghcr.io/${GHCR_OWNER}/auto-tournament"
+DOCKER_IMAGE_NEW="${DOCKER_USERNAME}/auto-tournament"
+RELEASE_IMAGES=("$GHCR_IMAGE" "$DOCKER_IMAGE_NEW" "$DOCKER_IMAGE")
+BUILDER_NAME="auto-tournament-release"
+REPO_OWNER="Auto-Tournament"
+REPO_NAME="auto-tournament"
 
-echo -e "${GREEN}MatchZy Auto Tournament - Release${NC}"
+# stable publishes :X.Y.Z and :latest everywhere; beta publishes :X.Y.Z-beta.N
+# and :next everywhere, and never touches :latest or main's package.json.
+RELEASE_CHANNEL="${RELEASE_CHANNEL:-stable}"
+case "$RELEASE_CHANNEL" in
+    stable|beta) ;;
+    *)
+        echo -e "${RED}Invalid RELEASE_CHANNEL: ${RELEASE_CHANNEL} (must be stable or beta)${NC}"
+        exit 1
+        ;;
+esac
+
+echo -e "${GREEN}Auto Tournament - Release${NC}"
 echo "========================================="
 echo ""
+
+# Optional non-interactive mode for CI/workflows
+RELEASE_TYPE_INPUT="${1:-${RELEASE_TYPE:-}}"
+RELEASE_NON_INTERACTIVE="${RELEASE_NON_INTERACTIVE:-false}"
+RELEASE_RUN_TESTS="${RELEASE_RUN_TESTS:-false}"
+
+if [ "${CI:-false}" = "true" ]; then
+    RELEASE_NON_INTERACTIVE=true
+fi
+
+# Split-build mode, used by .github/workflows/release.yml. Local runs leave all
+# of these unset and behave as before.
+#
+# RELEASE_SKIP_DOCKER_BUILD=true
+#     Do not clean up, build or push images here. Images were already built per
+#     platform (natively) and pushed by digest before this script runs.
+# RELEASE_IMAGE_DIGESTS="user/image@sha256:... user/image@sha256:..."
+#     With RELEASE_SKIP_DOCKER_BUILD, step 9 stitches these into the
+#     multi-arch :X.Y.Z and :latest tags instead of building.
+# RELEASE_SKIP_PROJECT_BUILD=true
+#     Skip step 1 (yarn build). The image build already compiled this commit.
+# RELEASE_EXPECTED_VERSION / RELEASE_EXPECTED_SHA
+#     The version and origin/main commit the images were built for. The
+#     release aborts before pushing anything if either has moved.
+RELEASE_SKIP_DOCKER_BUILD="${RELEASE_SKIP_DOCKER_BUILD:-false}"
+RELEASE_IMAGE_DIGESTS="${RELEASE_IMAGE_DIGESTS:-}"
+RELEASE_SKIP_PROJECT_BUILD="${RELEASE_SKIP_PROJECT_BUILD:-false}"
+RELEASE_EXPECTED_VERSION="${RELEASE_EXPECTED_VERSION:-}"
+RELEASE_EXPECTED_SHA="${RELEASE_EXPECTED_SHA:-}"
+
+# How the version bump reaches main.
+#
+# By default the "chore: bump version to X.Y.Z" commit is made on main and
+# pushed straight to origin/main (fast-forward only). main has no branch
+# protection or rulesets, so the old route — push a `release` branch, open a PR,
+# merge it three seconds later — reviewed nothing. When the Release workflow did
+# it with GITHUB_TOKEN, the bot-authored PR also left a red CI run behind every
+# release ("workflow file issue" / approval expired) with no jobs in it.
+#
+# RELEASE_BUMP_VIA_PR=true
+#     Use the old release branch + PR + merge route. Needed only if main ever
+#     gets protection that forbids direct pushes. The Release workflow would
+#     then also need `pull-requests: write` back in its permissions.
+RELEASE_BUMP_VIA_PR="${RELEASE_BUMP_VIA_PR:-false}"
+
+if [ "$RELEASE_SKIP_DOCKER_BUILD" = "true" ] && [ -z "$RELEASE_IMAGE_DIGESTS" ] && [ "$RELEASE_NON_INTERACTIVE" = "true" ]; then
+    echo -e "${RED}RELEASE_SKIP_DOCKER_BUILD=true needs RELEASE_IMAGE_DIGESTS in non-interactive mode,${NC}"
+    echo -e "${RED}otherwise the release would be published with no images.${NC}"
+    exit 1
+fi
+
+if [ -n "$RELEASE_TYPE_INPUT" ]; then
+    case "$RELEASE_TYPE_INPUT" in
+        patch|minor|major|custom|skip|unchanged)
+            ;;
+        *)
+            echo -e "${RED}Invalid release type: ${RELEASE_TYPE_INPUT}${NC}"
+            echo -e "${YELLOW}Valid values: patch, minor, major, custom, skip, unchanged${NC}"
+            exit 1
+            ;;
+    esac
+fi
 
 # Early safety confirmation before doing anything destructive
 echo -e "${YELLOW}This script will:${NC}"
 echo "  - Check disk space and Docker status"
-echo "  - Stop and remove existing MatchZy-related containers/images"
+echo "  - Stop and remove existing Auto Tournament containers/images"
 echo "  - Prune Docker build and system caches"
 echo "  - Build, test, tag, and publish a new release"
 echo ""
-read -p "Are you sure you want to continue with the release process? (y/N) " -r EARLY_CONFIRM
-echo
-if [[ ! "$EARLY_CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Release aborted before making any changes."
-    exit 0
+if [ "$RELEASE_NON_INTERACTIVE" = "true" ]; then
+    echo -e "${BLUE}Non-interactive mode enabled: auto-confirming release start${NC}"
+else
+    read -p "Are you sure you want to continue with the release process? (y/N) " -r EARLY_CONFIRM
+    echo
+    if [[ ! "$EARLY_CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Release aborted before making any changes."
+        exit 0
+    fi
 fi
 
 # Check prerequisites
@@ -65,17 +219,19 @@ if ! command -v gh &> /dev/null; then
     exit 1
 fi
 
-if ! docker info > /dev/null 2>&1; then
-    echo -e "${RED}Error: Docker is not running.${NC}"
-    echo -e "${YELLOW}Please start OrbStack or Docker Desktop.${NC}"
-    exit 1
-fi
+if [ "$RELEASE_SKIP_DOCKER_BUILD" != "true" ]; then
+    if ! docker info > /dev/null 2>&1; then
+        echo -e "${RED}Error: Docker is not running.${NC}"
+        echo -e "${YELLOW}Please start OrbStack or Docker Desktop.${NC}"
+        exit 1
+    fi
 
-# Verify Docker is actually accessible
-if ! docker ps > /dev/null 2>&1; then
-    echo -e "${RED}Error: Docker daemon is not accessible.${NC}"
-    echo -e "${YELLOW}Please ensure OrbStack or Docker Desktop is running and try again.${NC}"
-    exit 1
+    # Verify Docker is actually accessible
+    if ! docker ps > /dev/null 2>&1; then
+        echo -e "${RED}Error: Docker daemon is not accessible.${NC}"
+        echo -e "${YELLOW}Please ensure OrbStack or Docker Desktop is running and try again.${NC}"
+        exit 1
+    fi
 fi
 
 if ! docker buildx version > /dev/null 2>&1; then
@@ -93,13 +249,36 @@ if ! gh auth status &> /dev/null; then
     fi
 fi
 
-# Check if logged in to Docker Hub
-if ! docker info | grep -q "Username"; then
+# Check if logged in to Docker Hub (split-build mode logs in via docker/login-action)
+if [ "$RELEASE_SKIP_DOCKER_BUILD" != "true" ] && ! docker info | grep -q "Username"; then
     echo -e "${YELLOW}Not logged in to Docker Hub. Attempting to log in...${NC}"
     docker login
     if [ $? -ne 0 ]; then
         echo -e "${RED}Failed to login to Docker Hub${NC}"
         exit 1
+    fi
+fi
+
+# Log in to GHCR for a local run (split-build/CI mode logs in via
+# docker/login-action with GITHUB_TOKEN before this script runs). This uses
+# the gh CLI's own token, so it only needs whatever scopes `gh auth login`
+# already has; it is not required to release — if it fails, the local run
+# just skips publishing the GHCR image and keeps publishing the two Docker
+# Hub ones, same as before this image was added.
+GHCR_LOGIN_OK=true
+if [ "$RELEASE_SKIP_DOCKER_BUILD" != "true" ]; then
+    if GH_CLI_TOKEN=$(gh auth token 2>/dev/null) && [ -n "$GH_CLI_TOKEN" ] && GH_CLI_USER=$(gh api user --jq .login 2>/dev/null); then
+        if echo "$GH_CLI_TOKEN" | docker login ghcr.io -u "$GH_CLI_USER" --password-stdin > /dev/null 2>&1; then
+            echo -e "${GREEN}✅ Logged in to ghcr.io as ${GH_CLI_USER}${NC}"
+        else
+            GHCR_LOGIN_OK=false
+        fi
+    else
+        GHCR_LOGIN_OK=false
+    fi
+    if [ "$GHCR_LOGIN_OK" != "true" ]; then
+        echo -e "${YELLOW}⚠️  Could not log in to ghcr.io (need a gh token with write:packages). Skipping ${GHCR_IMAGE}; publishing the Docker Hub images only.${NC}"
+        RELEASE_IMAGES=("$DOCKER_IMAGE_NEW" "$DOCKER_IMAGE")
     fi
 fi
 
@@ -165,57 +344,62 @@ check_disk_space() {
     return 0
 }
 
-# Check disk space before starting Docker operations
-# Allow override via environment variable (in GB)
-MIN_DISK_SPACE_GB="${MIN_DISK_SPACE_GB:-10}"
-echo ""
-echo -e "${YELLOW}Checking disk space requirements...${NC}"
-check_disk_space "$MIN_DISK_SPACE_GB"
+# Split-build mode never builds here, so there is nothing to clean up or make room for.
+if [ "$RELEASE_SKIP_DOCKER_BUILD" != "true" ]; then
+    # Check disk space before starting Docker operations
+    # Allow override via environment variable (in GB)
+    MIN_DISK_SPACE_GB="${MIN_DISK_SPACE_GB:-10}"
+    echo ""
+    echo -e "${YELLOW}Checking disk space requirements...${NC}"
+    check_disk_space "$MIN_DISK_SPACE_GB"
 
-# Cleanup Docker: Stop containers, remove images, prune everything for clean slate
-echo ""
-echo -e "${YELLOW}Cleaning up Docker for fresh build...${NC}"
+    # Cleanup Docker: Stop containers, remove images, prune everything for clean slate
+    echo ""
+    echo -e "${YELLOW}Cleaning up Docker for fresh build...${NC}"
 
-# Stop and remove any running containers related to this project
-echo -e "${BLUE}Stopping and removing containers...${NC}"
-CONTAINERS=$(docker ps -a --filter "name=matchzy" --format "{{.ID}}" 2>/dev/null || true)
-if [ -n "$CONTAINERS" ]; then
-    echo "$CONTAINERS" | while read -r id; do
-        [ -n "$id" ] && docker stop "$id" 2>/dev/null || true
-        [ -n "$id" ] && docker rm "$id" 2>/dev/null || true
-    done
+    # Stop and remove any running containers related to this project
+    echo -e "${BLUE}Stopping and removing containers...${NC}"
+    CONTAINERS=$(docker ps -a --filter "name=auto-tournament" --format "{{.ID}}" 2>/dev/null || true)
+    if [ -n "$CONTAINERS" ]; then
+        echo "$CONTAINERS" | while read -r id; do
+            [ -n "$id" ] && docker stop "$id" 2>/dev/null || true
+            [ -n "$id" ] && docker rm "$id" 2>/dev/null || true
+        done
+    fi
+
+    # Remove Docker images related to this project
+    echo -e "${BLUE}Removing Docker images...${NC}"
+    IMAGES=$(docker images "${DOCKER_IMAGE}"* --format "{{.ID}}" 2>/dev/null | sort -u || true)
+    if [ -n "$IMAGES" ]; then
+        echo "$IMAGES" | while read -r id; do
+            [ -n "$id" ] && docker rmi -f "$id" 2>/dev/null || true
+        done
+    fi
+
+    # Remove test build image if it exists
+    TEST_IMAGE=$(docker images "${DOCKER_IMAGE}:test-build" --format "{{.ID}}" 2>/dev/null | head -1 || true)
+    if [ -n "$TEST_IMAGE" ]; then
+        docker rmi -f "$TEST_IMAGE" 2>/dev/null || true
+    fi
+
+    # Prune build cache and builder cache
+    echo -e "${BLUE}Pruning Docker build cache...${NC}"
+    docker builder prune -af --filter "until=24h" 2>/dev/null || true
+
+    # Prune system (removes unused data, but not volumes by default to avoid data loss)
+    echo -e "${BLUE}Pruning Docker system...${NC}"
+    docker system prune -af 2>/dev/null || true
+
+    # Clean up buildx builder cache if it exists
+    if docker buildx inspect "${BUILDER_NAME}" > /dev/null 2>&1; then
+        echo -e "${BLUE}Pruning buildx builder cache...${NC}"
+        docker buildx prune -af 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}✅ Docker cleanup complete${NC}"
+else
+    echo -e "${BLUE}RELEASE_SKIP_DOCKER_BUILD=true: skipping disk check and Docker cleanup${NC}"
 fi
-
-# Remove Docker images related to this project
-echo -e "${BLUE}Removing Docker images...${NC}"
-IMAGES=$(docker images "${DOCKER_IMAGE}"* --format "{{.ID}}" 2>/dev/null | sort -u || true)
-if [ -n "$IMAGES" ]; then
-    echo "$IMAGES" | while read -r id; do
-        [ -n "$id" ] && docker rmi -f "$id" 2>/dev/null || true
-    done
-fi
-
-# Remove test build image if it exists
-TEST_IMAGE=$(docker images "${DOCKER_IMAGE}:test-build" --format "{{.ID}}" 2>/dev/null | head -1 || true)
-if [ -n "$TEST_IMAGE" ]; then
-    docker rmi -f "$TEST_IMAGE" 2>/dev/null || true
-fi
-
-# Prune build cache and builder cache
-echo -e "${BLUE}Pruning Docker build cache...${NC}"
-docker builder prune -af --filter "until=24h" 2>/dev/null || true
-
-# Prune system (removes unused data, but not volumes by default to avoid data loss)
-echo -e "${BLUE}Pruning Docker system...${NC}"
-docker system prune -af 2>/dev/null || true
-
-# Clean up buildx builder cache if it exists
-if docker buildx inspect "${BUILDER_NAME}" > /dev/null 2>&1; then
-    echo -e "${BLUE}Pruning buildx builder cache...${NC}"
-    docker buildx prune -af 2>/dev/null || true
-fi
-
-echo -e "${GREEN}✅ Docker cleanup complete${NC}"
 
 # Get current (root) version from package.json
 if [ -f "package.json" ]; then
@@ -246,34 +430,10 @@ for WS in "${WORKSPACES[@]}"; do
     fi
 done
 
-# Function to bump version
-bump_version() {
-    local current="$1"
-    local type="$2"  # patch, minor, or major
-    
-    IFS='.' read -r major minor patch <<< "$current"
-    
-    case "$type" in
-        patch)
-            patch=$((patch + 1))
-            ;;
-        minor)
-            minor=$((minor + 1))
-            patch=0
-            ;;
-        major)
-            major=$((major + 1))
-            minor=0
-            patch=0
-            ;;
-        *)
-            echo "$current"
-            return 1
-            ;;
-    esac
-    
-    echo "${major}.${minor}.${patch}"
-}
+# bump_version lives in release-version.sh, shared with the Release workflow
+# so both compute the same version.
+# shellcheck source=scripts/release-version.sh
+source "${SCRIPT_DIR}/release-version.sh"
 
 # Prompt for version bump type or manual version
 echo ""
@@ -286,8 +446,16 @@ echo "  3) ${GREEN}major${NC} - ${CURRENT_VERSION} → $(bump_version "$CURRENT_
 echo "  4) ${GREEN}custom${NC} - Enter a specific version"
 echo "  5) ${GREEN}skip${NC} - Keep current version (${CURRENT_VERSION})"
 echo ""
-read -p "Enter choice (1-5) or press Enter for patch: " -r VERSION_CHOICE
-VERSION_CHOICE="${VERSION_CHOICE:-1}"
+if [ -n "$RELEASE_TYPE_INPUT" ]; then
+    VERSION_CHOICE="$RELEASE_TYPE_INPUT"
+    echo -e "${BLUE}Using release type from input:${NC} ${GREEN}${VERSION_CHOICE}${NC}"
+elif [ "$RELEASE_NON_INTERACTIVE" = "true" ]; then
+    VERSION_CHOICE="patch"
+    echo -e "${BLUE}Non-interactive mode enabled: defaulting to patch bump${NC}"
+else
+    read -p "Enter choice (1-5) or press Enter for patch: " -r VERSION_CHOICE
+    VERSION_CHOICE="${VERSION_CHOICE:-1}"
+fi
 
 case "$VERSION_CHOICE" in
     1|patch)
@@ -325,9 +493,34 @@ case "$VERSION_CHOICE" in
         ;;
 esac
 
-# Validate version format (semver)
-if ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+# Beta channel: the actual version (X.Y.Z-beta.N) was computed once by the
+# Release workflow's `prepare` job and handed down as RELEASE_EXPECTED_VERSION.
+# bump_version above only knows plain X.Y.Z, so its result is discarded here
+# rather than trying to teach it prerelease math a second time.
+if [ "$RELEASE_CHANNEL" = "beta" ]; then
+    if [ -z "$RELEASE_EXPECTED_VERSION" ]; then
+        echo -e "${RED}RELEASE_CHANNEL=beta requires RELEASE_EXPECTED_VERSION (the workflow always sets this).${NC}"
+        exit 1
+    fi
+    NEW_VERSION="$RELEASE_EXPECTED_VERSION"
+    VERSION_TYPE="beta"
+fi
+
+# Validate version format (semver, optionally with a -beta.N prerelease suffix
+# on the beta channel).
+if [ "$RELEASE_CHANNEL" = "beta" ]; then
+    if ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+        echo -e "${RED}Invalid beta version format: ${NEW_VERSION} (expected X.Y.Z-beta.N)${NC}"
+        exit 1
+    fi
+elif ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo -e "${RED}Invalid version format. Use semantic versioning (e.g., 1.0.0)${NC}"
+    exit 1
+fi
+
+if [ -n "$RELEASE_EXPECTED_VERSION" ] && [ "$NEW_VERSION" != "$RELEASE_EXPECTED_VERSION" ]; then
+    echo -e "${RED}Computed version ${NEW_VERSION} does not match RELEASE_EXPECTED_VERSION ${RELEASE_EXPECTED_VERSION}.${NC}"
+    echo -e "${RED}The images were built for a different version. Aborting before any changes.${NC}"
     exit 1
 fi
 
@@ -366,10 +559,17 @@ echo -e "  ${BLUE}0.${NC} Clean up Docker (stop containers, remove images, prune
 echo -e "  ${BLUE}1.${NC} Build project (yarn build)"
 echo -e "  ${BLUE}2.${NC} Run tests (yarn test) - optional, skip by default"
 echo -e "  ${BLUE}3.${NC} Build Docker image (test build)"
-echo -e "  ${BLUE}4.${NC} Update release branch (rebase onto main)"
-echo -e "  ${BLUE}5.${NC} Bump version: ${CURRENT_VERSION} → ${GREEN}${NEW_VERSION}${NC}"
-echo -e "  ${BLUE}6.${NC} Create PR and merge to main"
-echo -e "  ${BLUE}7.${NC} Rebase release branch back onto main"
+if [ "$RELEASE_BUMP_VIA_PR" = "true" ]; then
+    echo -e "  ${BLUE}4.${NC} Update release branch (rebase onto main)"
+    echo -e "  ${BLUE}5.${NC} Bump version: ${CURRENT_VERSION} → ${GREEN}${NEW_VERSION}${NC}"
+    echo -e "  ${BLUE}6.${NC} Create PR and merge to main"
+    echo -e "  ${BLUE}7.${NC} Rebase release branch back onto main"
+else
+    echo -e "  ${BLUE}4.${NC} Stay on main"
+    echo -e "  ${BLUE}5.${NC} Bump version: ${CURRENT_VERSION} → ${GREEN}${NEW_VERSION}${NC}"
+    echo -e "  ${BLUE}6.${NC} Commit the bump on main"
+    echo -e "  ${BLUE}7.${NC} Push the bump commit to origin/main (fast-forward only)"
+fi
 echo -e "  ${BLUE}8.${NC} Create git tag: ${GREEN}v${NEW_VERSION}${NC}"
 echo -e "  ${BLUE}9.${NC} Push Docker images to Docker Hub"
 echo -e "  ${BLUE}10.${NC} Create GitHub release"
@@ -377,11 +577,15 @@ echo -e "  ${BLUE}11.${NC} Send Discord release notification"
 echo ""
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
 echo ""
-read -p "Continue? (y/n) " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Release cancelled."
-    exit 0
+if [ "$RELEASE_NON_INTERACTIVE" = "true" ]; then
+    echo -e "${BLUE}Non-interactive mode enabled: auto-confirming release plan${NC}"
+else
+    read -p "Continue? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Release cancelled."
+        exit 0
+    fi
 fi
 
 # Ensure we're on main and up to date
@@ -435,22 +639,46 @@ if [ "$LOCAL_COMMIT" != "$REMOTE_COMMIT" ]; then
     git reset --hard origin/main
 fi
 
-# Step 1: Build project
-echo ""
-echo -e "${YELLOW}Step 1: Building project...${NC}"
-yarn build
-if [ $? -ne 0 ]; then
-    echo -e "${RED}❌ Project build failed${NC}"
+# In split-build mode the images were built from a specific commit. If main
+# has moved since, tagging it would publish a release whose images do not
+# contain what the tag says. Nothing has been pushed yet at this point.
+if [ -n "$RELEASE_EXPECTED_SHA" ] && [ "$(git rev-parse HEAD)" != "$RELEASE_EXPECTED_SHA" ]; then
+    echo -e "${RED}origin/main is $(git rev-parse HEAD), but the images were built from ${RELEASE_EXPECTED_SHA}.${NC}"
+    echo -e "${RED}Main moved during the release. Aborting before any changes; re-run the release.${NC}"
     exit 1
 fi
-echo -e "${GREEN}✅ Project build successful${NC}"
+
+# Step 1: Build project
+echo ""
+if [ "$RELEASE_SKIP_PROJECT_BUILD" = "true" ]; then
+    echo -e "${YELLOW}Step 1: Skipping project build (RELEASE_SKIP_PROJECT_BUILD=true)${NC}"
+else
+    echo -e "${YELLOW}Step 1: Building project...${NC}"
+    yarn build
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ Project build failed${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Project build successful${NC}"
+fi
 
 # Step 2: Run tests (optional; skip by default)
 echo ""
 echo -e "${YELLOW}Step 2: Run tests?${NC}"
-read -p "Run tests (yarn test)? (y/N) [default: skip] " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
+RUN_TESTS_REPLY="n"
+if [ "$RELEASE_NON_INTERACTIVE" = "true" ]; then
+    if [ "$RELEASE_RUN_TESTS" = "true" ]; then
+        RUN_TESTS_REPLY="y"
+        echo -e "${BLUE}Non-interactive mode: RELEASE_RUN_TESTS=true, running tests${NC}"
+    else
+        echo -e "${BLUE}Non-interactive mode: skipping tests${NC}"
+    fi
+else
+    read -p "Run tests (yarn test)? (y/N) [default: skip] " -n 1 -r
+    echo
+    RUN_TESTS_REPLY="$REPLY"
+fi
+if [[ $RUN_TESTS_REPLY =~ ^[Yy]$ ]]; then
     echo -e "${BLUE}Running tests... This may take a few minutes.${NC}"
     yarn test
     if [ $? -ne 0 ]; then
@@ -465,83 +693,73 @@ else
 fi
 
 # Step 3: Build Docker image (test build)
-echo ""
-echo -e "${YELLOW}Step 3: Building Docker image (test build)...${NC}"
-
-# Ensure we're using OrbStack context (or default if OrbStack not available)
-if docker context ls | grep -q "orbstack \*"; then
-    echo -e "${GREEN}✅ Using OrbStack context${NC}"
-elif docker context show | grep -q "orbstack"; then
-    docker context use orbstack
-    echo -e "${GREEN}✅ Switched to OrbStack context${NC}"
+# In split-build mode the per-platform image builds already did this.
+if [ "$RELEASE_SKIP_DOCKER_BUILD" = "true" ]; then
+    echo -e "${YELLOW}Step 3: Skipping Docker test build (RELEASE_SKIP_DOCKER_BUILD=true)${NC}"
 else
-    echo -e "${YELLOW}⚠️  OrbStack context not found, using default${NC}"
-fi
+    echo ""
+    echo -e "${YELLOW}Step 3: Building Docker image (test build)...${NC}"
 
-# Set up Docker Buildx builder
-if docker buildx inspect "${BUILDER_NAME}" > /dev/null 2>&1; then
-    # Check if builder endpoint is valid
-    BUILDER_ENDPOINT=$(docker buildx inspect "${BUILDER_NAME}" 2>/dev/null | grep "Endpoint:" | awk '{print $2}' || echo "")
-    if [ -n "$BUILDER_ENDPOINT" ] && [ "$BUILDER_ENDPOINT" != "desktop-linux" ]; then
-        docker buildx use "${BUILDER_NAME}"
-        echo -e "${GREEN}✅ Using existing builder${NC}"
-        # Bootstrap the builder if it's inactive
-        echo -e "${BLUE}Booting builder...${NC}"
-        docker buildx inspect "${BUILDER_NAME}" --bootstrap > /dev/null 2>&1 || true
+    # Ensure we're using OrbStack context (or default if OrbStack not available)
+    if docker context ls | grep -q "orbstack \*"; then
+        echo -e "${GREEN}✅ Using OrbStack context${NC}"
+    elif docker context show | grep -q "orbstack"; then
+        docker context use orbstack
+        echo -e "${GREEN}✅ Switched to OrbStack context${NC}"
     else
-        echo -e "${YELLOW}⚠️  Existing builder uses invalid endpoint, removing and recreating...${NC}"
-        docker buildx rm "${BUILDER_NAME}" 2>/dev/null || true
-        docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
-        echo -e "${GREEN}✅ Builder recreated${NC}"
+        echo -e "${YELLOW}⚠️  OrbStack context not found, using default${NC}"
     fi
-else
-    docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
-    echo -e "${GREEN}✅ Builder created${NC}"
-fi
 
-# Test build (single platform for speed, load into local Docker)
-docker buildx build \
-    --platform linux/amd64 \
-    --file docker/Dockerfile \
-    --tag "${DOCKER_IMAGE}:test-build" \
-    --load \
-    --cache-from type=registry,ref="${DOCKER_IMAGE}:buildcache" \
-    --cache-to type=registry,ref="${DOCKER_IMAGE}:buildcache,mode=max" \
-    --progress=plain \
-    .
+    # Set up Docker Buildx builder
+    if docker buildx inspect "${BUILDER_NAME}" > /dev/null 2>&1; then
+        # Check if builder endpoint is valid
+        BUILDER_ENDPOINT=$(docker buildx inspect "${BUILDER_NAME}" 2>/dev/null | grep "Endpoint:" | awk '{print $2}' || echo "")
+        if [ -n "$BUILDER_ENDPOINT" ] && [ "$BUILDER_ENDPOINT" != "desktop-linux" ]; then
+            docker buildx use "${BUILDER_NAME}"
+            echo -e "${GREEN}✅ Using existing builder${NC}"
+            # Bootstrap the builder if it's inactive
+            echo -e "${BLUE}Booting builder...${NC}"
+            docker buildx inspect "${BUILDER_NAME}" --bootstrap > /dev/null 2>&1 || true
+        else
+            echo -e "${YELLOW}⚠️  Existing builder uses invalid endpoint, removing and recreating...${NC}"
+            docker buildx rm "${BUILDER_NAME}" 2>/dev/null || true
+            docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
+            echo -e "${GREEN}✅ Builder recreated${NC}"
+        fi
+    else
+        docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
+        echo -e "${GREEN}✅ Builder created${NC}"
+    fi
 
-if [ $? -ne 0 ]; then
-    echo -e "${RED}❌ Docker build failed${NC}"
-    exit 1
+    # Test build (single platform for speed, load into local Docker)
+    docker buildx build \
+        --platform linux/amd64 \
+        --file docker/Dockerfile \
+        --tag "${DOCKER_IMAGE}:test-build" \
+        --load \
+        --cache-from type=registry,ref="${DOCKER_IMAGE}:buildcache" \
+        --cache-to type=registry,ref="${DOCKER_IMAGE}:buildcache,mode=max" \
+        --progress=plain \
+        .
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ Docker build failed${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Docker build successful${NC}"
 fi
-echo -e "${GREEN}✅ Docker build successful${NC}"
 
 # Step 4: Set up or update release branch
 echo ""
-echo -e "${YELLOW}Step 4: Setting up release branch...${NC}"
-RELEASE_BRANCH="release"
+if [ "$RELEASE_BUMP_VIA_PR" = "true" ]; then
+    echo -e "${YELLOW}Step 4: Setting up release branch...${NC}"
+    RELEASE_BRANCH="release"
 
-# Check if release branch exists locally
-if git show-ref --verify --quiet refs/heads/"${RELEASE_BRANCH}"; then
-    echo -e "${GREEN}Release branch exists locally${NC}"
-    git checkout "${RELEASE_BRANCH}"
-    # Rebase release branch onto main to keep it up to date
-    echo -e "${YELLOW}Rebasing release branch onto main...${NC}"
-    git rebase origin/main
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}Rebase failed. Please resolve conflicts manually.${NC}"
-        if [ "$STASHED_CHANGES" = true ]; then
-            echo -e "${YELLOW}Restoring stashed changes...${NC}"
-            git stash pop > /dev/null 2>&1 || true
-        fi
-        exit 1
-    fi
-else
-    # Check if release branch exists on remote
-    if git show-ref --verify --quiet refs/remotes/origin/"${RELEASE_BRANCH}"; then
-        echo -e "${GREEN}Release branch exists on remote, checking out...${NC}"
-        git checkout -b "${RELEASE_BRANCH}" "origin/${RELEASE_BRANCH}"
-        # Rebase onto main
+    # Check if release branch exists locally
+    if git show-ref --verify --quiet refs/heads/"${RELEASE_BRANCH}"; then
+        echo -e "${GREEN}Release branch exists locally${NC}"
+        git checkout "${RELEASE_BRANCH}"
+        # Rebase release branch onto main to keep it up to date
         echo -e "${YELLOW}Rebasing release branch onto main...${NC}"
         git rebase origin/main
         if [ $? -ne 0 ]; then
@@ -553,21 +771,42 @@ else
             exit 1
         fi
     else
-        # Create new release branch from main
-        echo -e "${GREEN}Creating new release branch from main...${NC}"
-        git checkout -b "${RELEASE_BRANCH}"
+        # Check if release branch exists on remote
+        if git show-ref --verify --quiet refs/remotes/origin/"${RELEASE_BRANCH}"; then
+            echo -e "${GREEN}Release branch exists on remote, checking out...${NC}"
+            git checkout -b "${RELEASE_BRANCH}" "origin/${RELEASE_BRANCH}"
+            # Rebase onto main
+            echo -e "${YELLOW}Rebasing release branch onto main...${NC}"
+            git rebase origin/main
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}Rebase failed. Please resolve conflicts manually.${NC}"
+                if [ "$STASHED_CHANGES" = true ]; then
+                    echo -e "${YELLOW}Restoring stashed changes...${NC}"
+                    git stash pop > /dev/null 2>&1 || true
+                fi
+                exit 1
+            fi
+        else
+            # Create new release branch from main
+            echo -e "${GREEN}Creating new release branch from main...${NC}"
+            git checkout -b "${RELEASE_BRANCH}"
+        fi
     fi
-fi
 
-# Restore stashed changes after switching to release branch
-if [ "$STASHED_CHANGES" = true ]; then
-    echo -e "${YELLOW}Restoring stashed changes on release branch...${NC}"
-    git stash pop > /dev/null 2>&1 || echo -e "${YELLOW}⚠️  Note: Some stashed changes may have conflicts${NC}"
-fi
+    # Restore stashed changes after switching to release branch
+    if [ "$STASHED_CHANGES" = true ]; then
+        echo -e "${YELLOW}Restoring stashed changes on release branch...${NC}"
+        git stash pop > /dev/null 2>&1 || echo -e "${YELLOW}⚠️  Note: Some stashed changes may have conflicts${NC}"
+    fi
 
-# Push release branch to ensure it's up to date on remote
-echo -e "${YELLOW}Pushing release branch to origin...${NC}"
-git push -u origin "${RELEASE_BRANCH}" || git push origin "${RELEASE_BRANCH}" --force-with-lease
+    # Push release branch to ensure it's up to date on remote
+    echo -e "${YELLOW}Pushing release branch to origin...${NC}"
+    git push -u origin "${RELEASE_BRANCH}" || git push origin "${RELEASE_BRANCH}" --force-with-lease
+else
+    echo -e "${YELLOW}Step 4: Staying on main (the bump is pushed directly to origin/main)${NC}"
+    # Any stash taken above stays stashed until the bump commit is pushed, so
+    # none of it can end up in a commit that goes straight to main.
+fi
 
 # Step 5: Bump version
 echo ""
@@ -578,11 +817,18 @@ echo ""
 
 VERSION_BUMPED=false
 
+# Beta channel never bumps main's package.json — the prerelease version only
+# ever lives in the image (baked in by the build job's ephemeral, uncommitted
+# workspace edit) and in the git tag. Committing "3.0.0-beta.1" to main would
+# make `bump_version` compute the next stable release from a prerelease
+# string and break the eventual 3.0.0 stable release.
+if [ "$RELEASE_CHANNEL" = "beta" ]; then
+    echo -e "${BLUE}Beta channel: not bumping package.json on main (current: ${CURRENT_VERSION}).${NC}"
 # Check if version actually needs to change
-if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
+elif [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
     echo -e "${YELLOW}⚠️  Version is already ${NEW_VERSION}. Skipping version bump.${NC}"
 else
-    # We're on the release branch
+    # We're on main (default) or the release branch (RELEASE_BUMP_VIA_PR=true)
 
     bump_version_file() {
         local file="$1"
@@ -615,140 +861,26 @@ else
         done
     fi
     
-    # Update changelog.md
+    # Changelog
+    #
+    # The changelog is not in this repository. It lives in the docs site, at
+    # content/docs/reference/changelog.mdx in Auto-Tournament/docs, and
+    # is written by hand in prose rather than PR titles.
+    #
+    # This step used to write docs/changelog.md here. That path went away when
+    # the docs moved out, so it silently did nothing for every release since —
+    # it printed "Changelog file not found" and carried on, and nobody reads a
+    # warning in the middle of a successful release. Rather than pretend, print
+    # the changes so whoever is releasing can paste them into the docs repo.
     echo ""
-    echo -e "${YELLOW}Updating changelog...${NC}"
-    
-    # Function to get changelog from merged PR titles (same as in Step 10)
-    get_changelog_for_docs() {
-        local prev_tag
-        local current_tag="v${NEW_VERSION}"
-        
-        # Get the previous tag (second most recent, excluding the current one)
-        prev_tag=$(git tag --sort=-v:refname | grep -v "^${current_tag}$" | sed -n '1p' 2>/dev/null || echo "")
-        
-        # Extract PR titles from merge commits
-        # Reverse order so oldest PRs are first (git log shows newest first by default)
-        extract_pr_titles() {
-            local log_range="$1"
-            local temp_output
-            temp_output=$(git log ${log_range} --merges --format="%B" | \
-                awk '
-                    /^Merge pull request/ {
-                        # Skip the merge line and blank line, get the next non-empty line (PR title)
-                        getline
-                        getline
-                        if (NF > 0) {
-                            print "- " $0
-                        }
-                    }
-                ' | head -30)
-            
-            # Reverse the order (oldest first) - use tail -r on macOS, tac on Linux
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                echo "$temp_output" | tail -r
-            else
-                echo "$temp_output" | tac
-            fi
-        }
-        
-        if [ -z "$prev_tag" ]; then
-            # No previous tag, get all merged PRs up to the current tag
-            if git rev-parse "${current_tag}" >/dev/null 2>&1; then
-                extract_pr_titles "${current_tag}"
-            else
-                # Tag doesn't exist, get recent merged PRs
-                extract_pr_titles ""
-            fi
-        else
-            # Get merged PRs between previous tag and current tag
-            extract_pr_titles "${prev_tag}..${current_tag}"
-        fi
-    }
-    
-    # Get changelog entries
-    CHANGELOG_ENTRIES=$(get_changelog_for_docs)
-    
-    # If changelog is empty, use a default message
-    if [ -z "$CHANGELOG_ENTRIES" ] || [ ${#CHANGELOG_ENTRIES} -lt 10 ]; then
-        CHANGELOG_ENTRIES="- Release v${NEW_VERSION}"
-    fi
-    
-    # Get current date in YYYY-MM-DD format
-    RELEASE_DATE=$(date +%Y-%m-%d)
-    
-    # Get previous version for the link
-    PREV_TAG=$(git tag --sort=-v:refname | grep -v "^v${NEW_VERSION}$" | sed -n '1p' 2>/dev/null || echo "")
-    if [ -z "$PREV_TAG" ]; then
-        PREV_TAG="HEAD"
-    else
-        PREV_TAG="${PREV_TAG}"
-    fi
-    
-    # Update changelog.md
-    CHANGELOG_FILE="docs/changelog.md"
-    if [ -f "$CHANGELOG_FILE" ]; then
-        # Create temporary files
-        TEMP_CHANGELOG=$(mktemp)
-        TEMP_VERSION_SECTION=$(mktemp)
-        
-        # Write the new version section to a temp file
-        cat > "$TEMP_VERSION_SECTION" <<EOF
-## [${NEW_VERSION}] - ${RELEASE_DATE}
+    echo -e "${YELLOW}Changelog${NC}"
+    echo -e "${BLUE}The changelog lives in the docs site, not here. Add an entry to:${NC}"
+    echo -e "  ${GREEN}content/docs/reference/changelog.mdx${NC} (Auto-Tournament/docs)"
+    echo ""
+    echo -e "${BLUE}Landing in v${NEW_VERSION}:${NC}"
+    collect_changes | sed 's/^/  /'
+    echo ""
 
-### Added
-${CHANGELOG_ENTRIES}
-
----
-EOF
-        
-        # Insert new version section after the "---" following [Unreleased]
-        # Use awk to insert the file content after the line containing "---" that comes after [Unreleased]
-        awk -v version_file="$TEMP_VERSION_SECTION" '
-            /^## \[Unreleased\]/ { unreleased_found=1; print; next }
-            unreleased_found && /^---$/ { 
-                print
-                print ""
-                while ((getline line < version_file) > 0) {
-                    print line
-                }
-                close(version_file)
-                unreleased_found=0
-                next
-            }
-            { print }
-        ' "$CHANGELOG_FILE" > "$TEMP_CHANGELOG"
-        
-        rm -f "$TEMP_VERSION_SECTION"
-        
-        # Update the [Unreleased] link to point to the new version
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            # macOS
-            sed -i '' "s|\[Unreleased\]: https://github.com/${REPO_OWNER}/${REPO_NAME}/compare/v.*\.\.\.HEAD|[Unreleased]: https://github.com/${REPO_OWNER}/${REPO_NAME}/compare/v${NEW_VERSION}...HEAD|" "$TEMP_CHANGELOG"
-        else
-            # Linux
-            sed -i "s|\[Unreleased\]: https://github.com/${REPO_OWNER}/${REPO_NAME}/compare/v.*\.\.\.HEAD|[Unreleased]: https://github.com/${REPO_OWNER}/${REPO_NAME}/compare/v${NEW_VERSION}...HEAD|" "$TEMP_CHANGELOG"
-        fi
-        
-        # Add the new version link if it doesn't exist
-        if ! grep -q "\[${NEW_VERSION}\]:" "$TEMP_CHANGELOG"; then
-            # Add the link after [Unreleased] link
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                # macOS - need to escape newline properly
-                sed -i '' "/\[Unreleased\]:/a\\
-[${NEW_VERSION}]: https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/v${NEW_VERSION}" "$TEMP_CHANGELOG"
-            else
-                # Linux
-                sed -i "/\[Unreleased\]:/a[${NEW_VERSION}]: https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/v${NEW_VERSION}" "$TEMP_CHANGELOG"
-            fi
-        fi
-        
-        # Replace the original file
-        mv "$TEMP_CHANGELOG" "$CHANGELOG_FILE"
-        echo -e "${GREEN}✅ Changelog updated${NC}"
-    else
-        echo -e "${YELLOW}⚠️  Changelog file not found: ${CHANGELOG_FILE}${NC}"
-    fi
     
     # Step 6: Commit version bump and changelog
     echo ""
@@ -765,32 +897,126 @@ EOF
     if ! git diff --quiet client/package.json 2>/dev/null; then
         FILES_TO_COMMIT+=("client/package.json")
     fi
-    if [ -f "$CHANGELOG_FILE" ] && ! git diff --quiet "$CHANGELOG_FILE" 2>/dev/null; then
-        FILES_TO_COMMIT+=("$CHANGELOG_FILE")
-    fi
     
     if [ ${#FILES_TO_COMMIT[@]} -gt 0 ]; then
         git add "${FILES_TO_COMMIT[@]}"
-        git commit -m "chore: bump version to ${NEW_VERSION} and update changelog"
+        git commit -m "chore: bump version to ${NEW_VERSION}"
         echo -e "${GREEN}✅ Version bumped to ${NEW_VERSION} in root, api, and client package.json files${NC}"
-        if [ -f "$CHANGELOG_FILE" ]; then
-            echo -e "${GREEN}✅ Changelog updated${NC}"
-        fi
         VERSION_BUMPED=true
     else
         echo -e "${YELLOW}⚠️  No changes detected. Version may already be ${NEW_VERSION}.${NC}"
     fi
 fi
 
-# Push branch
-echo -e "${YELLOW}Pushing release branch to origin...${NC}"
-git push origin "${RELEASE_BRANCH}" || git push origin "${RELEASE_BRANCH}" --force-with-lease
+# The only files a version bump commit may touch.
+VERSION_FILES_RE='^(package\.json|api/package\.json|client/package\.json)$'
 
-# Check if there are commits between main and release branch
-COMMITS_AHEAD=$(git rev-list --count origin/main..origin/"${RELEASE_BRANCH}" 2>/dev/null || echo "0")
+# Fail unless every file changed between $1 and $2 is a version file.
+assert_only_version_files() {
+    local from="$1" to="$2" other
+    other=$(git diff --name-only "$from" "$to" | grep -vE "$VERSION_FILES_RE" || true)
+    if [ -n "$other" ]; then
+        echo -e "${RED}Bump commit $(git rev-parse --short "$to") changes more than the version files:${NC}"
+        printf '  %s\n' "$other"
+        exit 1
+    fi
+}
+
+# Push the bump commit (HEAD on local main) to origin/main.
+#
+# The push is fast-forward only; nothing here ever force-pushes main.
+#
+# In split-build mode (RELEASE_EXPECTED_SHA set) the images were built from
+# RELEASE_EXPECTED_SHA with the version applied in the workspace, so the commit
+# that gets tagged must be exactly that commit plus the version files. If main
+# moved between the check near the top and this push, rebasing would give a
+# tag containing code the images do not have. The release stops here instead:
+# no tag, manifest, GitHub release or Discord post has happened yet, and the
+# unpushed bump commit is simply left behind on the runner. Re-run the release.
+#
+# Local runs build the images after tagging, from the tagged commit, so there a
+# rejected push is retried once: fetch, check that nothing new on main touched
+# the version files, rebase the bump commit on top and push again.
+push_bump_to_main() {
+    local base
+    base=$(git rev-parse HEAD~1)
+
+    if [ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]; then
+        echo -e "${RED}Expected to be on main to push the version bump, but on $(git rev-parse --abbrev-ref HEAD).${NC}"
+        exit 1
+    fi
+    if [ -n "$RELEASE_EXPECTED_SHA" ] && [ "$base" != "$RELEASE_EXPECTED_SHA" ]; then
+        echo -e "${RED}Bump commit's parent is ${base}, but the images were built from ${RELEASE_EXPECTED_SHA}. Aborting.${NC}"
+        exit 1
+    fi
+    assert_only_version_files "$base" HEAD
+
+    echo -e "${YELLOW}Pushing version bump to origin/main...${NC}"
+    if git push origin HEAD:refs/heads/main; then
+        git fetch origin main --quiet
+        echo -e "${GREEN}✅ Version bump pushed to main ($(git rev-parse --short HEAD))${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}Push rejected: origin/main moved since this release started.${NC}"
+    git fetch origin main --quiet
+    if [ -n "$RELEASE_EXPECTED_SHA" ]; then
+        echo -e "${RED}origin/main is now $(git rev-parse origin/main); the images were built from ${RELEASE_EXPECTED_SHA}.${NC}"
+        echo -e "${RED}Tagging a rebased bump would publish images that lack the new commits.${NC}"
+        echo -e "${RED}Nothing was tagged or published. Re-run the release.${NC}"
+        exit 1
+    fi
+
+    local touched
+    touched=$(git diff --name-only "$base" origin/main | grep -E "$VERSION_FILES_RE" || true)
+    if [ -n "$touched" ]; then
+        echo -e "${RED}New commits on origin/main change the version files. Aborting; re-run the release.${NC}"
+        printf '  %s\n' "$touched"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}New commits on main do not touch the version files. Rebasing the bump onto origin/main...${NC}"
+    git log --oneline "${base}..origin/main" | sed 's/^/  /'
+    if ! git rebase origin/main; then
+        git rebase --abort 2>/dev/null || true
+        echo -e "${RED}Rebasing the version bump onto origin/main failed. Aborting.${NC}"
+        exit 1
+    fi
+    assert_only_version_files HEAD~1 HEAD
+
+    if ! git push origin HEAD:refs/heads/main; then
+        echo -e "${RED}Push to main rejected again. Aborting; nothing was tagged or published.${NC}"
+        exit 1
+    fi
+    git fetch origin main --quiet
+    echo -e "${GREEN}✅ Version bump pushed to main ($(git rev-parse --short HEAD))${NC}"
+}
+
+if [ "$RELEASE_BUMP_VIA_PR" != "true" ]; then
+    echo ""
+    echo -e "${YELLOW}Step 7: Pushing version bump to main...${NC}"
+    if [ "$VERSION_BUMPED" = "true" ]; then
+        push_bump_to_main
+    else
+        echo -e "${BLUE}No bump commit to push; tagging origin/main as it is.${NC}"
+    fi
+    if [ "$STASHED_CHANGES" = true ]; then
+        echo -e "${YELLOW}Restoring stashed changes...${NC}"
+        git stash pop > /dev/null 2>&1 || echo -e "${YELLOW}⚠️  Note: Some stashed changes may have conflicts${NC}"
+    fi
+else
+    # Push branch
+    echo -e "${YELLOW}Pushing release branch to origin...${NC}"
+    git push origin "${RELEASE_BRANCH}" || git push origin "${RELEASE_BRANCH}" --force-with-lease
+
+    # Check if there are commits between main and release branch
+    COMMITS_AHEAD=$(git rev-list --count origin/main..origin/"${RELEASE_BRANCH}" 2>/dev/null || echo "0")
+fi
 
 # Create PR and merge (only if there are commits to merge)
-if [ "$COMMITS_AHEAD" -gt 0 ]; then
+if [ "$RELEASE_BUMP_VIA_PR" != "true" ]; then
+    : # Done above.
+elif [ "$COMMITS_AHEAD" -gt 0 ]; then
     echo ""
     echo -e "${YELLOW}Step 7: Creating PR to merge version bump...${NC}"
     PR_BODY="## Release ${NEW_VERSION}
@@ -813,8 +1039,13 @@ This PR bumps the version to ${NEW_VERSION} in preparation for release.
         
         if [ $? -ne 0 ]; then
             echo -e "${YELLOW}⚠️  Could not auto-merge PR. Please merge manually: ${PR_URL}${NC}"
-            echo -e "${BLUE}Press Enter after the PR is merged to continue...${NC}"
-            read -r
+            if [ "$RELEASE_NON_INTERACTIVE" = "true" ]; then
+                echo -e "${RED}Non-interactive mode cannot continue with manual PR merge. Aborting.${NC}"
+                exit 1
+            else
+                echo -e "${BLUE}Press Enter after the PR is merged to continue...${NC}"
+                read -r
+            fi
         fi
         
         # Switch back to main and ensure it's up to date
@@ -992,164 +1223,170 @@ echo ""
 echo -e "${YELLOW}Step 9: Building and pushing Docker images...${NC}"
 echo ""
 
-# Build both platforms by default (no prompt). Override via BUILD_PLATFORMS env if needed.
-if [ -z "${BUILD_PLATFORMS:-}" ]; then
-    BUILD_PLATFORMS="linux/amd64,linux/arm64"
+# Floating tag: stable gets :latest, beta gets :next. Beta never touches
+# :latest, so `docker compose pull` on an existing stable install can never
+# pick up a prerelease.
+if [ "$RELEASE_CHANNEL" = "beta" ]; then
+    FLOATING_TAG="next"
+else
+    FLOATING_TAG="latest"
 fi
 
-if [ "$BUILD_PLATFORMS" = "linux/amd64" ]; then
-    echo -e "${BLUE}Platform: linux/amd64 only${NC}"
+VERIFY_IMAGES=true
+if [ "$RELEASE_SKIP_DOCKER_BUILD" = "true" ]; then
+    # Split-build mode: each platform was built natively and pushed by digest
+    # to GHCR only (untagged). Publishing the release tags is just writing a
+    # manifest list that points at those digests for every target image —
+    # imagetools create can source a manifest from one registry and publish
+    # it to a completely different one, so the other two images (Docker Hub,
+    # new and legacy names) are populated without rebuilding or re-pushing
+    # any layer.
+    BUILD_PLATFORMS="${BUILD_PLATFORMS:-linux/amd64,linux/arm64}"
+    if [ -z "$RELEASE_IMAGE_DIGESTS" ]; then
+        echo -e "${YELLOW}⚠️  RELEASE_SKIP_DOCKER_BUILD=true and no RELEASE_IMAGE_DIGESTS: no Docker images published${NC}"
+        VERIFY_IMAGES=false
+    else
+        for image in "${RELEASE_IMAGES[@]}"; do
+            echo -e "${BLUE}Creating ${image}:${NEW_VERSION} and :${FLOATING_TAG} from:${NC}"
+            for ref in $RELEASE_IMAGE_DIGESTS; do echo "  ${ref}"; done
+            # shellcheck disable=SC2086 # one argument per digest
+            if ! docker buildx imagetools create \
+                --tag "${image}:${NEW_VERSION}" \
+                --tag "${image}:${FLOATING_TAG}" \
+                $RELEASE_IMAGE_DIGESTS; then
+                echo -e "${RED}❌ Failed to create multi-arch image tags for ${image}${NC}"
+                exit 1
+            fi
+        done
+    fi
 else
-    echo -e "${BLUE}Platforms: ${BUILD_PLATFORMS}${NC}"
-fi
-echo ""
+    # Build both platforms by default (no prompt). Override via BUILD_PLATFORMS env if needed.
+    if [ -z "${BUILD_PLATFORMS:-}" ]; then
+        BUILD_PLATFORMS="linux/amd64,linux/arm64"
+    fi
 
-# Ensure versions are synced before Docker build (critical - must use new version)
-echo -e "${BLUE}Ensuring versions are synced before Docker build...${NC}"
-if [ -f "scripts/sync-version.sh" ]; then
-    bash scripts/sync-version.sh
-    echo -e "${GREEN}✅ Versions synced: root, api, and client package.json all have version ${NEW_VERSION}${NC}"
-else
-    echo -e "${RED}⚠️  sync-version.sh not found! Versions may be out of sync.${NC}"
-    echo -e "${YELLOW}Please manually verify api/package.json and client/package.json have version ${NEW_VERSION}${NC}"
-    read -p "Continue anyway? (y/n) " -r CONTINUE_BUILD
-    if [[ ! "$CONTINUE_BUILD" =~ ^[Yy]$ ]]; then
-        echo "Build cancelled. Please fix version sync manually."
+    if [ "$BUILD_PLATFORMS" = "linux/amd64" ]; then
+        echo -e "${BLUE}Platform: linux/amd64 only${NC}"
+    else
+        echo -e "${BLUE}Platforms: ${BUILD_PLATFORMS}${NC}"
+    fi
+    echo ""
+
+    # Ensure versions are synced before Docker build (critical - must use new version)
+    echo -e "${BLUE}Ensuring versions are synced before Docker build...${NC}"
+    if [ -f "scripts/sync-version.sh" ]; then
+        bash scripts/sync-version.sh
+        echo -e "${GREEN}✅ Versions synced: root, api, and client package.json all have version ${NEW_VERSION}${NC}"
+    else
+        echo -e "${RED}⚠️  sync-version.sh not found! Versions may be out of sync.${NC}"
+        echo -e "${YELLOW}Please manually verify api/package.json and client/package.json have version ${NEW_VERSION}${NC}"
+        if [ "$RELEASE_NON_INTERACTIVE" = "true" ]; then
+            echo -e "${RED}Non-interactive mode cannot continue without sync-version.sh. Aborting.${NC}"
+            exit 1
+        else
+            read -p "Continue anyway? (y/n) " -r CONTINUE_BUILD
+            if [[ ! "$CONTINUE_BUILD" =~ ^[Yy]$ ]]; then
+                echo "Build cancelled. Please fix version sync manually."
+                exit 1
+            fi
+        fi
+    fi
+    echo ""
+
+    # Re-check disk space before multi-platform build (requires more space)
+    echo -e "${YELLOW}Re-checking disk space before multi-platform build...${NC}"
+    # Multi-platform builds need more space, so require 12GB instead of 10GB
+    MULTI_PLATFORM_MIN_GB="${MIN_DISK_SPACE_GB:-12}"
+    if [ "$MULTI_PLATFORM_MIN_GB" -lt 12 ]; then
+        MULTI_PLATFORM_MIN_GB=12
+    fi
+    check_disk_space "$MULTI_PLATFORM_MIN_GB"
+
+    # Ensure we have a suitable Buildx builder (docker-container driver) before running multi-arch build
+    if docker buildx inspect "${BUILDER_NAME}" > /dev/null 2>&1; then
+        # Check if builder endpoint is valid and not tied to a stale/alternate runtime
+        BUILDER_ENDPOINT=$(docker buildx inspect "${BUILDER_NAME}" 2>/dev/null | grep "Endpoint:" | awk '{print $2}' || echo "")
+
+        # Treat OrbStack-backed or unknown endpoints as invalid so we recreate the builder
+        if [ -z "$BUILDER_ENDPOINT" ] || echo "$BUILDER_ENDPOINT" | grep -qi "orbstack"; then
+            echo -e "${YELLOW}⚠️  Existing builder uses invalid/stale endpoint (${BUILDER_ENDPOINT:-unknown}), removing and recreating...${NC}"
+            docker buildx rm "${BUILDER_NAME}" 2>/dev/null || true
+            docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
+            echo -e "${GREEN}✅ Builder recreated${NC}"
+        else
+            docker buildx use "${BUILDER_NAME}"
+            echo -e "${GREEN}✅ Using existing builder (endpoint: ${BUILDER_ENDPOINT})${NC}"
+            # Bootstrap the builder if it's inactive
+            echo -e "${BLUE}Booting builder...${NC}"
+            docker buildx inspect "${BUILDER_NAME}" --bootstrap > /dev/null 2>&1 || true
+        fi
+    else
+        docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
+        echo -e "${GREEN}✅ Builder created${NC}"
+    fi
+
+    # One buildx build, tagged for every target image (GHCR + both Docker Hub
+    # names, minus GHCR if the login above failed) and pushed to all of them
+    # at once — buildx pushes each --tag to whichever registry it names.
+    # Cache is still keyed off the legacy Docker Hub image so this doesn't
+    # need a GHCR-hosted cache to work.
+    BUILD_TAG_ARGS=()
+    for image in "${RELEASE_IMAGES[@]}"; do
+        BUILD_TAG_ARGS+=(--tag "${image}:${NEW_VERSION}" --tag "${image}:${FLOATING_TAG}")
+    done
+
+    # Build with network host mode for better connectivity in ARM64 emulation
+    docker buildx build \
+        --platform "${BUILD_PLATFORMS}" \
+        --file docker/Dockerfile \
+        "${BUILD_TAG_ARGS[@]}" \
+        --push \
+        --cache-from type=registry,ref="${DOCKER_IMAGE}:buildcache" \
+        --cache-to type=registry,ref="${DOCKER_IMAGE}:buildcache,mode=max" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        --progress=plain \
+        .
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}❌ Failed to build and push Docker images${NC}"
         exit 1
     fi
-fi
-echo ""
-
-# Re-check disk space before multi-platform build (requires more space)
-echo -e "${YELLOW}Re-checking disk space before multi-platform build...${NC}"
-# Multi-platform builds need more space, so require 12GB instead of 10GB
-MULTI_PLATFORM_MIN_GB="${MIN_DISK_SPACE_GB:-12}"
-if [ "$MULTI_PLATFORM_MIN_GB" -lt 12 ]; then
-    MULTI_PLATFORM_MIN_GB=12
-fi
-check_disk_space "$MULTI_PLATFORM_MIN_GB"
-
-# Ensure we have a suitable Buildx builder (docker-container driver) before running multi-arch build
-if docker buildx inspect "${BUILDER_NAME}" > /dev/null 2>&1; then
-    # Check if builder endpoint is valid and not tied to a stale/alternate runtime
-    BUILDER_ENDPOINT=$(docker buildx inspect "${BUILDER_NAME}" 2>/dev/null | grep "Endpoint:" | awk '{print $2}' || echo "")
-
-    # Treat OrbStack-backed or unknown endpoints as invalid so we recreate the builder
-    if [ -z "$BUILDER_ENDPOINT" ] || echo "$BUILDER_ENDPOINT" | grep -qi "orbstack"; then
-        echo -e "${YELLOW}⚠️  Existing builder uses invalid/stale endpoint (${BUILDER_ENDPOINT:-unknown}), removing and recreating...${NC}"
-        docker buildx rm "${BUILDER_NAME}" 2>/dev/null || true
-        docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
-        echo -e "${GREEN}✅ Builder recreated${NC}"
-    else
-        docker buildx use "${BUILDER_NAME}"
-        echo -e "${GREEN}✅ Using existing builder (endpoint: ${BUILDER_ENDPOINT})${NC}"
-        # Bootstrap the builder if it's inactive
-        echo -e "${BLUE}Booting builder...${NC}"
-        docker buildx inspect "${BUILDER_NAME}" --bootstrap > /dev/null 2>&1 || true
-    fi
-else
-    docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use
-    echo -e "${GREEN}✅ Builder created${NC}"
-fi
-
-# Build with network host mode for better connectivity in ARM64 emulation
-docker buildx build \
-    --platform "${BUILD_PLATFORMS}" \
-    --file docker/Dockerfile \
-    --tag "${DOCKER_IMAGE}:${NEW_VERSION}" \
-    --tag "${DOCKER_IMAGE}:latest" \
-    --push \
-    --cache-from type=registry,ref="${DOCKER_IMAGE}:buildcache" \
-    --cache-to type=registry,ref="${DOCKER_IMAGE}:buildcache,mode=max" \
-    --build-arg BUILDKIT_INLINE_CACHE=1 \
-    --progress=plain \
-    .
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}❌ Failed to build and push Docker images${NC}"
-    exit 1
 fi
 
 # Verify images
-echo ""
-echo -e "${YELLOW}Verifying pushed images...${NC}"
-docker buildx imagetools inspect "${DOCKER_IMAGE}:${NEW_VERSION}" > /tmp/image_inspect.txt 2>&1
-# Check platforms based on what we built
-if [ "$BUILD_PLATFORMS" = "linux/amd64,linux/arm64" ]; then
-    if ! grep -q 'linux/amd64' /tmp/image_inspect.txt || ! grep -q 'linux/arm64' /tmp/image_inspect.txt; then
-        echo -e "${RED}❌ Multi-platform build verification failed${NC}"
-        echo -e "${YELLOW}Expected both linux/amd64 and linux/arm64, but got:${NC}"
-        cat /tmp/image_inspect.txt
-        rm -f /tmp/image_inspect.txt
-        exit 1
+if [ "$VERIFY_IMAGES" = "true" ]; then
+    echo ""
+    echo -e "${YELLOW}Verifying pushed images...${NC}"
+    docker buildx imagetools inspect "${DOCKER_IMAGE}:${NEW_VERSION}" > /tmp/image_inspect.txt 2>&1
+    # Check platforms based on what we built
+    if [ "$BUILD_PLATFORMS" = "linux/amd64,linux/arm64" ]; then
+        if ! grep -q 'linux/amd64' /tmp/image_inspect.txt || ! grep -q 'linux/arm64' /tmp/image_inspect.txt; then
+            echo -e "${RED}❌ Multi-platform build verification failed${NC}"
+            echo -e "${YELLOW}Expected both linux/amd64 and linux/arm64, but got:${NC}"
+            cat /tmp/image_inspect.txt
+            rm -f /tmp/image_inspect.txt
+            exit 1
+        fi
+        echo -e "${GREEN}✅ Verified images for both platforms (linux/amd64 and linux/arm64)${NC}"
+    elif [ "$BUILD_PLATFORMS" = "linux/amd64" ]; then
+        if ! grep -q 'linux/amd64' /tmp/image_inspect.txt; then
+            echo -e "${RED}❌ AMD64 build verification failed${NC}"
+            cat /tmp/image_inspect.txt
+            rm -f /tmp/image_inspect.txt
+            exit 1
+        fi
+        echo -e "${GREEN}✅ Verified linux/amd64 platform${NC}"
     fi
-    echo -e "${GREEN}✅ Verified images for both platforms (linux/amd64 and linux/arm64)${NC}"
-elif [ "$BUILD_PLATFORMS" = "linux/amd64" ]; then
-    if ! grep -q 'linux/amd64' /tmp/image_inspect.txt; then
-        echo -e "${RED}❌ AMD64 build verification failed${NC}"
-        cat /tmp/image_inspect.txt
-        rm -f /tmp/image_inspect.txt
-        exit 1
-    fi
-    echo -e "${GREEN}✅ Verified linux/amd64 platform${NC}"
+    rm -f /tmp/image_inspect.txt
 fi
-rm -f /tmp/image_inspect.txt
 
 # Step 10: Create GitHub release
 echo ""
 echo -e "${YELLOW}Step 10: Creating GitHub release...${NC}"
 
-# Function to get changelog from merged PR titles
-get_changelog() {
-    local prev_tag
-    local current_tag="v${NEW_VERSION}"
-    
-    # Get the previous tag (second most recent, excluding the current one)
-    prev_tag=$(git tag --sort=-v:refname | grep -v "^${current_tag}$" | sed -n '1p' 2>/dev/null || echo "")
-    
-    # Extract PR titles from merge commits
-    # Format: "Merge pull request #XX..." followed by blank line, then PR title
-    # Reverse order so oldest PRs are first (git log shows newest first by default)
-    extract_pr_titles() {
-        local log_range="$1"
-        local temp_output
-        temp_output=$(git log ${log_range} --merges --format="%B" | \
-            awk '
-                /^Merge pull request/ {
-                    # Skip the merge line and blank line, get the next non-empty line (PR title)
-                    getline
-                    getline
-                    if (NF > 0) {
-                        print "- " $0
-                    }
-                }
-            ' | head -30)
-        
-        # Reverse the order (oldest first) - use tail -r on macOS, tac on Linux
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            echo "$temp_output" | tail -r
-        else
-            echo "$temp_output" | tac
-        fi
-    }
-    
-    if [ -z "$prev_tag" ]; then
-        # No previous tag, get all merged PRs up to the current tag
-        if git rev-parse "${current_tag}" >/dev/null 2>&1; then
-            extract_pr_titles "${current_tag}"
-        else
-            # Tag doesn't exist, get recent merged PRs
-            extract_pr_titles ""
-        fi
-    else
-        # Get merged PRs between previous tag and current tag
-        extract_pr_titles "${prev_tag}..${current_tag}"
-    fi
-}
-
 # Generate changelog
 echo -e "${BLUE}Generating changelog from merged PRs...${NC}"
-CHANGELOG=$(get_changelog)
+CHANGELOG=$(collect_changes)
 
 # If changelog is empty, use a default message
 if [ -z "$CHANGELOG" ] || [ ${#CHANGELOG} -lt 10 ]; then
@@ -1163,26 +1400,46 @@ if gh release view "v${NEW_VERSION}" --repo "${REPO_OWNER}/${REPO_NAME}" >/dev/n
     echo -e "${BLUE}Deleted existing GitHub release${NC}"
 fi
 
-RELEASE_BODY="## 🐳 Docker Release v${NEW_VERSION}
+IMAGE_LIST_LINES=""
+FLOATING_LIST_LINES=""
+for image in "${RELEASE_IMAGES[@]}"; do
+    IMAGE_LIST_LINES="${IMAGE_LIST_LINES}- \`${image}:${NEW_VERSION}\`
+"
+    FLOATING_LIST_LINES="${FLOATING_LIST_LINES}- \`${image}:${FLOATING_TAG}\`
+"
+done
+# First image actually published in this run (GHCR unless its login failed
+# locally, in which case RELEASE_IMAGES only has the two Docker Hub names).
+PRIMARY_IMAGE="${RELEASE_IMAGES[0]}"
 
+if [ "$RELEASE_CHANNEL" = "beta" ]; then
+    RELEASE_HEADING="## 🧪 Beta Release v${NEW_VERSION}"
+    RELEASE_NOTE="This is a **prerelease/beta build**, tagged \`:${FLOATING_TAG}\` (never \`:latest\`). It is not installed by \`docker compose pull\` on a stable install."
+else
+    RELEASE_HEADING="## 🐳 Docker Release v${NEW_VERSION}"
+    RELEASE_NOTE=""
+fi
+
+RELEASE_BODY="${RELEASE_HEADING}
+
+${RELEASE_NOTE}
 ### Changelog
 
 ${CHANGELOG}
 
 ### Docker Images
 
-- \`${DOCKER_IMAGE}:${NEW_VERSION}\`
-- \`${DOCKER_IMAGE}:latest\`
-
+${IMAGE_LIST_LINES}${FLOATING_LIST_LINES}
 ### Pull Command
 
 \`\`\`bash
-docker pull ${DOCKER_IMAGE}:${NEW_VERSION}
+docker pull ${PRIMARY_IMAGE}:${NEW_VERSION}
 \`\`\`
 
-### Docker Hub
+### Docker Hub / GHCR
 
-https://hub.docker.com/r/${DOCKER_USERNAME}/${IMAGE_NAME}
+- https://hub.docker.com/r/${DOCKER_USERNAME}/auto-tournament
+- https://github.com/orgs/${REPO_OWNER}/packages/container/package/auto-tournament
 
 ### Platforms
 
@@ -1195,12 +1452,14 @@ https://hub.docker.com/r/${DOCKER_USERNAME}/${IMAGE_NAME}
 docker compose -f docker/docker-compose.yml up -d
 \`\`\`
 
-See [Getting Started Guide](https://docs.sivert.io/docs/mat/quick-start) for full setup instructions."
+See [Getting Started Guide](https://docs.autotournament.gg) for full setup instructions."
 
-gh release create "v${NEW_VERSION}" \
-    --title "Release v${NEW_VERSION}" \
-    --notes "$RELEASE_BODY" \
-    --repo "${REPO_OWNER}/${REPO_NAME}"
+GH_RELEASE_ARGS=(--title "Release v${NEW_VERSION}" --notes "$RELEASE_BODY" --repo "${REPO_OWNER}/${REPO_NAME}")
+if [ "$RELEASE_CHANNEL" = "beta" ]; then
+    GH_RELEASE_ARGS+=(--prerelease)
+fi
+
+gh release create "v${NEW_VERSION}" "${GH_RELEASE_ARGS[@]}"
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✅ GitHub release created${NC}"
@@ -1209,15 +1468,23 @@ else
 fi
 
 # Step 11: Send Discord webhook notification
+#
+# Betas skip this entirely rather than post to the same channel regular
+# users watch for stable releases. discord-webhook.sh also only understands
+# plain X.Y.Z versions, so a beta string would fail its format check anyway.
 echo ""
-echo -e "${YELLOW}Step 11: Sending Discord release notification...${NC}"
+if [ "$RELEASE_CHANNEL" = "beta" ]; then
+    echo -e "${YELLOW}Step 11: Skipping Discord notification (beta channel)${NC}"
+else
+    echo -e "${YELLOW}Step 11: Sending Discord release notification...${NC}"
 
-# Call the standalone Discord webhook script
-# Use SCRIPT_DIR that was set at the top of the script (before cd to PROJECT_ROOT)
-"${SCRIPT_DIR}/discord-webhook.sh" "${NEW_VERSION}"
+    # Call the standalone Discord webhook script
+    # Use SCRIPT_DIR that was set at the top of the script (before cd to PROJECT_ROOT)
+    "${SCRIPT_DIR}/discord-webhook.sh" "${NEW_VERSION}"
 
-if [ $? -ne 0 ]; then
-    echo -e "${YELLOW}⚠️  Discord webhook failed, but release completed successfully${NC}"
+    if [ $? -ne 0 ]; then
+        echo -e "${YELLOW}⚠️  Discord webhook failed, but release completed successfully${NC}"
+    fi
 fi
 
 # Summary
@@ -1229,13 +1496,16 @@ echo -e "${GREEN}Release Summary${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo "Version: ${NEW_VERSION}"
+echo "Channel: ${RELEASE_CHANNEL}"
 echo "Git Tag: v${NEW_VERSION}"
 echo "Docker Images:"
-echo -e "  ${GREEN}${DOCKER_IMAGE}:${NEW_VERSION}${NC}"
-echo -e "  ${GREEN}${DOCKER_IMAGE}:latest${NC}"
+for image in "${RELEASE_IMAGES[@]}"; do
+    echo -e "  ${GREEN}${image}:${NEW_VERSION}${NC}"
+    echo -e "  ${GREEN}${image}:${FLOATING_TAG}${NC}"
+done
 echo ""
 echo "GitHub Release: https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/v${NEW_VERSION}"
-echo "Docker Hub: https://hub.docker.com/r/${DOCKER_USERNAME}/${IMAGE_NAME}"
+echo "Docker Hub: https://hub.docker.com/r/${DOCKER_USERNAME}/auto-tournament"
 echo ""
 echo -e "${GREEN}✨ Release complete!${NC}"
 echo ""

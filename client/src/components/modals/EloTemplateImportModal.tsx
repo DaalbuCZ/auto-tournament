@@ -16,15 +16,16 @@ import {
   Collapse,
 } from '@mui/material';
 import {
-  Close as CloseIcon,
-  CheckCircle as CheckCircleIcon,
-  Info as InfoIcon,
-  ExpandMore as ExpandMoreIcon,
-  ExpandLess as ExpandLessIcon,
-} from '@mui/icons-material';
+  CaretDownIcon,
+  CaretUpIcon,
+  CheckCircleIcon,
+  InfoIcon,
+  XIcon,
+} from '@phosphor-icons/react';
 import { useSnackbar } from '../../contexts/SnackbarContext';
 import type { EloTemplateWeights } from '../../types/elo.types';
 import { useTranslation } from 'react-i18next';
+import type { Untrusted } from '../../utils/untrusted';
 
 interface ImportTemplate {
   id?: string;
@@ -63,12 +64,12 @@ export const EloTemplateImportModal: React.FC<EloTemplateImportModalProps> = ({
     onClose();
   };
 
-  const validateTemplate = (template: unknown, index: number): string | null => {
+  const validateTemplate = (template: Untrusted, index: number): string | null => {
     if (!template || typeof template !== 'object' || template === null) {
       return `Template ${index + 1}: Must be an object`;
     }
 
-    const typed = template as { [key: string]: unknown };
+    const typed = template as { [key: string]: Untrusted };
 
     if (!typed.name || typeof typed.name !== 'string' || typed.name.trim() === '') {
       return `Template ${index + 1}: Missing or invalid "name"`;
@@ -87,10 +88,14 @@ export const EloTemplateImportModal: React.FC<EloTemplateImportModalProps> = ({
     }
 
     if (typed.weights !== undefined) {
-      if (typeof typed.weights !== 'object' || typed.weights === null || Array.isArray(typed.weights)) {
+      if (
+        typeof typed.weights !== 'object' ||
+        typed.weights === null ||
+        Array.isArray(typed.weights)
+      ) {
         return `Template "${typed.name}": "weights" must be an object if provided`;
       }
-      for (const [key, value] of Object.entries(typed.weights as Record<string, unknown>)) {
+      for (const [key, value] of Object.entries(typed.weights as Record<string, Untrusted>)) {
         if (value !== undefined && typeof value !== 'number') {
           return `Template "${typed.name}": Weight "${key}" must be a number`;
         }
@@ -189,7 +194,7 @@ export const EloTemplateImportModal: React.FC<EloTemplateImportModalProps> = ({
             {t('eloTemplatesPage.importModal.title')}
           </Typography>
           <IconButton onClick={handleClose} size="small">
-            <CloseIcon />
+            <XIcon />
           </IconButton>
         </Box>
       </DialogTitle>
@@ -269,7 +274,7 @@ export const EloTemplateImportModal: React.FC<EloTemplateImportModalProps> = ({
                         />
                       </Box>
                       <IconButton size="small">
-                        {expandedItems.has(index) ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                        {expandedItems.has(index) ? <CaretUpIcon /> : <CaretDownIcon />}
                       </IconButton>
                     </Box>
                     <Collapse in={expandedItems.has(index)}>
@@ -342,6 +347,4 @@ export const EloTemplateImportModal: React.FC<EloTemplateImportModalProps> = ({
       </DialogActions>
     </Dialog>
   );
-}
-
-
+};

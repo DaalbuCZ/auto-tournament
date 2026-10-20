@@ -1,6 +1,12 @@
-import React from 'react';
 import { Stack, Typography, Chip, Paper, Box } from '@mui/material';
-import { CURRENT_MAP_SCORE_LABEL, SERIES_SCORE_LABEL } from '../../utils/matchScoreDisplay';
+import { useTranslation } from 'react-i18next';
+import { tokens, mono } from '../../theme/tokens';
+
+/**
+ * The score keeps its own size: the `h1` variant is the page title's fluid
+ * size, and a score is a number, not a heading (hence `component="p"`).
+ */
+const scoreSize = '2.75rem';
 
 interface MatchScoreboardProps {
   leftName?: string | null;
@@ -36,48 +42,58 @@ export function MatchScoreboard({
   hideSeriesWins,
   hideMapRounds,
 }: MatchScoreboardProps) {
+  const { t } = useTranslation();
+
   return (
     <Paper
       variant="outlined"
       sx={{
-        p: 4,
-        background: 'linear-gradient(135deg, rgba(0,0,0,0.02) 0%, rgba(0,0,0,0.05) 100%)',
+        p: { xs: 2, sm: 4 },
+        bgcolor: 'background.surface2',
+        borderColor: 'transparent',
+        borderRadius: `${tokens.radius.md}px`,
       }}
     >
       <Box display="flex" justifyContent="space-between" alignItems="center">
         <Stack spacing={1} alignItems="center" flex={1}>
-          <Typography variant="h4" fontWeight={700} color="primary.main" align="center">
+          <Typography variant="h5" color="text.primary" align="center" sx={{ overflowWrap: 'anywhere' }}>
             {leftName}
           </Typography>
           {typeof leftTeamElo === 'number' && Number.isFinite(leftTeamElo) && (
             <Typography variant="body2" color="text.secondary">
-              ELO (avg): {leftTeamElo}
+              {t('matchInfo.scoreboard.eloAvg', { elo: leftTeamElo })}
             </Typography>
           )}
           {!hideSeriesWins && (
             <>
-              <Typography variant="h1" fontWeight={900} color="primary.main">
+              <Typography
+                variant="h1"
+                component="p"
+                fontWeight={600}
+                color="text.primary"
+                sx={{ ...mono, fontSize: scoreSize }}
+              >
                 {leftSeriesWins}
               </Typography>
               <Typography variant="body2" color="text.secondary">
-                {SERIES_SCORE_LABEL}
+                {t('matchInfo.scoreboard.mapsWon')}
               </Typography>
             </>
           )}
           {!hideMapRounds && (
             <>
-              <Typography variant="h4" fontWeight={700} color="primary.main">
+              <Typography variant="h4" fontWeight={600} color="text.secondary" sx={mono}>
                 {leftMapRounds}
               </Typography>
               <Typography variant="body2" color="text.secondary">
-                {CURRENT_MAP_SCORE_LABEL}
+                {t('matchInfo.scoreboard.currentMapScore')}
               </Typography>
             </>
           )}
         </Stack>
-        <Stack spacing={1} alignItems="center" mx={3}>
-          <Typography variant="h3" color="text.secondary" fontWeight={700}>
-            VS
+        <Stack spacing={1} alignItems="center" mx={{ xs: 1, sm: 3 }}>
+          <Typography variant="body2" color="text.disabled" sx={mono}>
+            {t('matchInfo.scoreboard.vs')}
           </Typography>
           {liveStatusDisplay && (
             <Chip
@@ -89,31 +105,37 @@ export function MatchScoreboard({
           )}
         </Stack>
         <Stack spacing={1} alignItems="center" flex={1}>
-          <Typography variant="h4" fontWeight={700} color="error.main" align="center">
-            {rightName || 'TBD'}
+          <Typography variant="h5" color="text.primary" align="center" sx={{ overflowWrap: 'anywhere' }}>
+            {rightName || t('matchInfo.scoreboard.tbd')}
           </Typography>
           {typeof rightTeamElo === 'number' && Number.isFinite(rightTeamElo) && (
             <Typography variant="body2" color="text.secondary">
-              ELO (avg): {rightTeamElo}
+              {t('matchInfo.scoreboard.eloAvg', { elo: rightTeamElo })}
             </Typography>
           )}
           {!hideSeriesWins && (
             <>
-              <Typography variant="h1" fontWeight={900} color="error.main">
+              <Typography
+                variant="h1"
+                component="p"
+                fontWeight={600}
+                color="text.primary"
+                sx={{ ...mono, fontSize: scoreSize }}
+              >
                 {rightSeriesWins}
               </Typography>
               <Typography variant="body2" color="text.secondary">
-                {SERIES_SCORE_LABEL}
+                {t('matchInfo.scoreboard.mapsWon')}
               </Typography>
             </>
           )}
           {!hideMapRounds && (
             <>
-              <Typography variant="h4" fontWeight={700} color="error.main">
+              <Typography variant="h4" fontWeight={600} color="text.secondary" sx={mono}>
                 {rightMapRounds}
               </Typography>
               <Typography variant="body2" color="text.secondary">
-                {CURRENT_MAP_SCORE_LABEL}
+                {t('matchInfo.scoreboard.currentMapScore')}
               </Typography>
             </>
           )}

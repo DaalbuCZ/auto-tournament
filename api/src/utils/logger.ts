@@ -2,6 +2,10 @@
 
 // Load environment variables FIRST (before reading process.env.LOG_LEVEL)
 // This ensures LOG_LEVEL=debug from .env is respected
+import type { LoggerOptions } from 'pino';
+import type { Untrusted } from './untrusted';
+import type * as NodePath from 'node:path';
+import type * as DiscordIdModule from './discordId';
 try {
   require('dotenv').config();
 } catch {
@@ -23,7 +27,7 @@ const isLogLevelDebug = _logLevel === 'debug';
  */
 const isBundledDist = (() => {
   try {
-    const path = require('node:path') as typeof import('node:path');
+    const path = require('node:path') as typeof NodePath;
     return typeof __dirname === 'string' && __dirname.split(path.sep).includes('dist');
   } catch {
     return false;
@@ -47,8 +51,7 @@ const isBundledDist = (() => {
  *
  * Errors and warnings are **never** suppressed by these flags.
  */
-export const LOG_HTTP_REQUESTS =
-  (process.env.LOG_HTTP_REQUESTS || '').toLowerCase() !== 'false';
+export const LOG_HTTP_REQUESTS = (process.env.LOG_HTTP_REQUESTS || '').toLowerCase() !== 'false';
 
 const _dbVerboseEnv = (process.env.LOG_DB_VERBOSE || '').toLowerCase();
 const _dbValuesEnv = (process.env.LOG_DB_VALUES || '').toLowerCase();
@@ -59,8 +62,7 @@ export const LOG_DB_VERBOSE =
 export const LOG_DB_VALUES =
   _dbValuesEnv === 'true' || (isLogLevelDebug && _dbValuesEnv !== 'false');
 
-export const LOG_RCON_VERBOSE =
-  (process.env.LOG_RCON_VERBOSE || '').toLowerCase() === 'true';
+export const LOG_RCON_VERBOSE = (process.env.LOG_RCON_VERBOSE || '').toLowerCase() === 'true';
 
 /**
  * Create a Pino logger instance with compatibility for older Node.js 18 releases.
@@ -93,7 +95,7 @@ function createPinoLogger() {
   // bundled / slim images we don't ship it, so we must gracefully
   // fall back to JSON to avoid hard crashes like:
   // "unable to determine transport target for \"pino-pretty\"".
-  let transport: unknown = undefined;
+  let transport: LoggerOptions['transport'] = undefined;
 
   if (isDevelopment && !isBundledDist) {
     try {
@@ -105,7 +107,8 @@ function createPinoLogger() {
         target: 'pino-pretty',
         options: {
           colorize: true,
-          translateTime: 'UTC:yyyy-MM-dd HH:mm:ss',
+          // pino-pretty uses dateformat tokens: mm is the month, MM the minutes.
+          translateTime: 'UTC:yyyy-mm-dd HH:MM:ss',
           ignore: 'pid,hostname',
           singleLine: false,
         },
@@ -147,6 +150,14 @@ function addToBuffer(level: string, message: string, meta?: object) {
   if (logBuffer.length > MAX_LOGS) {
     logBuffer.shift();
   }
+  for (const listener of logListeners) listener();
+}
+
+const logListeners: Array<() => void> = [];
+
+/** Run `listener` after each entry reaches the buffer (the log viewer's `logs` topic). */
+export function onLogEntry(listener: () => void): void {
+  logListeners.push(listener);
 }
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -156,11 +167,7 @@ type LogLevel = 'debug' | 'info' | 'warn' | 'error';
  * consistently apply feature flags (e.g. HTTP/DB/RCON verbosity) without
  * touching every call site.
  */
-function emit(
-  level: LogLevel,
-  message: string,
-  meta?: object
-): void {
+function emit(level: LogLevel, message: string, meta?: object): void {
   // Errors and warnings are always logged
   if (level === 'error') {
     addToBuffer('error', message, meta);
@@ -297,7 +304,11 @@ export const log = {
     const meta = { endpoint };
     emit('debug', msg, meta);
   },
-  authFailed: (endpoint: string, reason: string) => {
+  authFailed: (rawEndpoint: string, reason: string) => {
+    // Endpoint paths can carry a Discord ID (`/by-discord-id/:id`), which is
+    // private. Required lazily, matching this file's other requires.
+    const { redactDiscordIdsInPath } = require('./discordId') as typeof DiscordIdModule;
+    const endpoint = redactDiscordIdsInPath(rawEndpoint);
     const msg = `[AUTH] Auth failed: ${endpoint} - ${reason}`;
     const meta = { endpoint, reason };
     emit('warn', msg, meta);
@@ -310,7 +321,7 @@ export const log = {
   },
 
   // Errors
-  error: (message: string, error?: Error | unknown, meta?: object) => {
+  error: (message: string, error?: Untrusted, meta?: object) => {
     const errorDetails =
       error instanceof Error ? { error: error.message, stack: error.stack } : { error };
     const msg = `[ERROR] ${message}`;

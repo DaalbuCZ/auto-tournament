@@ -1,4 +1,5 @@
 import auth from './auth.json';
+import compat from './compat.json';
 import core from './core.json';
 import dashboardSettings from './dashboardSettings.json';
 import devTools from './devTools.json';
@@ -7,7 +8,9 @@ import matchesAndModals from './matchesAndModals.json';
 import misc from './misc.json';
 import playersTeams from './playersTeams.json';
 import serversAdmin from './serversAdmin.json';
+import social from './social.json';
 import tournament from './tournament.json';
+import webhooks from './webhooks.json';
 
 const itTranslation = {
   ...core,
@@ -20,6 +23,9 @@ const itTranslation = {
   ...devTools,
   ...misc,
   ...tournament,
+  ...compat,
+  ...webhooks,
+  ...social,
 } as const;
 
 export default itTranslation;

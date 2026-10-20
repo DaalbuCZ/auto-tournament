@@ -5,6 +5,10 @@ import { ensureSignedIn } from '../helpers/auth';
  * Settings UI tests
  * Tests settings page functionality
  *
+ * NOTE: the Steam API key is no longer editable here — it is supplied via the
+ * STEAM_API_KEY environment variable (see example.env). These tests previously
+ * asserted a `settings-steam-api-key-input` field that no longer exists.
+ *
  * @tag ui
  * @tag settings
  * @tag configuration
@@ -15,84 +19,86 @@ test.describe.serial('Settings UI', () => {
     await ensureSignedIn(page);
   });
 
-  test.skip(
+  test(
     'should navigate to and display settings page',
     {
       tag: ['@ui', '@settings'],
     },
     async ({ page }) => {
-      await page.goto('/settings');
+      await page.goto('/manage/settings');
       await expect(page).toHaveURL(/\/settings/);
       await expect(page).toHaveTitle(/Settings/i);
       await page.waitForLoadState('networkidle');
 
-      // Check for webhook URL input
-      await expect(page.getByTestId('settings-webhook-url-input')).toBeVisible({ timeout: 5000 });
+      // A list of sections beside the open one (Site first); each opens its
+      // card, and nothing of CS2's is here.
+      await expect(page.getByTestId('settings-card-site')).toBeVisible({ timeout: 15000 });
+      for (const card of ['signin', 'players', 'webhooks', 'advanced']) {
+        await page.getByTestId(`settings-section-${card}`).click();
+        await expect(page).toHaveURL(new RegExp(`section=${card}`));
+        await expect(page.getByTestId(`settings-card-${card}`)).toBeVisible({ timeout: 15000 });
+        await expect(page.getByTestId(`settings-section-${card}`)).toHaveAttribute(
+          'aria-current',
+          'page'
+        );
+      }
 
-      // Check for Steam API key input
-      await expect(page.getByTestId('settings-steam-api-key-input')).toBeVisible({ timeout: 5000 });
+      // CS2's settings are its Match rules page, linked from here.
+      await page
+        .getByTestId('settings-game-links')
+        .getByRole('link', { name: 'Match rules' })
+        .click();
+      await expect(page).toHaveURL(/\/match-rules$/);
+      await expect(page.getByTestId('cs2-server-defaults')).toBeVisible({ timeout: 15000 });
+      await expect(page.getByTestId('cs2-settings-reset-button')).toBeVisible();
+
+      // The Steam API key is env-only; a field here would mean a secret is being
+      // round-tripped through the browser.
+      await expect(page.getByTestId('settings-steam-api-key-input')).toHaveCount(0);
     }
   );
 
-  test.skip(
-    'should update and clear webhook URL and Steam API key',
+  test(
+    'a CS2 server default saves on its own, and the CS2 reset clears it',
     {
       tag: ['@ui', '@settings', '@configuration'],
     },
     async ({ page }) => {
-      await page.goto('/settings');
-      await page.waitForLoadState('networkidle');
+      const readSettings = async () =>
+        (await (await page.request.get('/api/settings')).json()).settings as Record<
+          string,
+          unknown
+        >;
 
-      // Locate inputs once to assert presence
-      const webhookInput = page.getByTestId('settings-webhook-url-input');
-      await expect(webhookInput).toBeVisible({ timeout: 5000 });
-      const steamInput = page.getByTestId('settings-steam-api-key-input');
-      await expect(steamInput).toBeVisible({ timeout: 5000 });
+      // A field the tab does not touch, to prove its saves are partial.
+      const before = await readSettings();
 
-      // --- Update webhook URL (auto-saved on change/blur) ---
-      const testWebhookUrl = `https://example.com/webhook/${Date.now()}`;
-      await webhookInput.clear();
-      await webhookInput.fill(testWebhookUrl);
-      await webhookInput.blur();
-      await page.waitForTimeout(1500); // allow debounce + save to complete
+      await page.goto('/manage/match-rules');
+      await page.getByTestId('cs2-settings-demos-summary').click({ timeout: 30000 });
+      const delay = page.getByTestId('at-kick-delay-input');
+      await expect(delay).toBeVisible({ timeout: 15000 });
 
-      // Reload to verify value was persisted server-side
-      await page.reload();
-      await page.waitForLoadState('networkidle');
-      const webhookAfterSave = page.getByTestId('settings-webhook-url-input');
-      await expect(webhookAfterSave).toBeVisible({ timeout: 5000 });
-      const savedWebhook = await webhookAfterSave.inputValue();
-      expect(savedWebhook).toBe(testWebhookUrl);
+      const value = 40 + (Date.now() % 50);
+      await delay.fill(String(value));
+      await delay.blur();
 
-      // --- Update Steam API key (auto-saved) ---
-      const steamInput2 = page.getByTestId('settings-steam-api-key-input');
-      await expect(steamInput2).toBeVisible({ timeout: 5000 });
+      await expect
+        .poll(async () => (await readSettings()).atSeriesEndKickDelayNoDemo, {
+          message: 'kick delay to be saved',
+          timeout: 15000,
+        })
+        .toBe(value);
+      expect((await readSettings()).ratingsEnabled).toBe(before.ratingsEnabled);
 
-      const testSteamKey = `TEST_STEAM_KEY_${Date.now()}`;
-      await steamInput2.clear();
-      await steamInput2.fill(testSteamKey);
-      await steamInput2.blur();
-      await page.waitForTimeout(1500);
-
-      await page.reload();
-      await page.waitForLoadState('networkidle');
-      const steamAfterSave = page.getByTestId('settings-steam-api-key-input');
-      await expect(steamAfterSave).toBeVisible({ timeout: 5000 });
-      const savedSteamKey = await steamAfterSave.inputValue();
-      expect(savedSteamKey).toBe(testSteamKey);
-
-      // --- Clear webhook URL and verify empty persisted value ---
-      const webhookInput2 = page.getByTestId('settings-webhook-url-input');
-      await expect(webhookInput2).toBeVisible({ timeout: 5000 });
-      await webhookInput2.clear();
-      await webhookInput2.blur();
-      await page.waitForTimeout(1500);
-
-      await page.reload();
-      await page.waitForLoadState('networkidle');
-      const webhookAfterClear = page.getByTestId('settings-webhook-url-input');
-      const clearedValue = await webhookAfterClear.inputValue();
-      expect(clearedValue).toBe('');
+      await page.getByTestId('cs2-settings-reset-button').click();
+      await page.getByTestId('cs2-settings-reset-confirm').click();
+      await expect
+        .poll(async () => (await readSettings()).atSeriesEndKickDelayNoDemo, {
+          message: 'kick delay to be reset',
+          timeout: 15000,
+        })
+        .not.toBe(value);
+      await expect(delay).toHaveValue('30');
     }
   );
 });

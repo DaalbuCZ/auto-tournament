@@ -1,16 +1,50 @@
-import { Router, Request, Response } from 'express';
+import { getOwnNameState } from '../services/playerName';
+import { randomBytes } from 'crypto';
+import { URLSearchParams } from 'url';
+import type { Request, Response, NextFunction } from 'express';
+import { Router } from 'express';
 import { log } from '../utils/logger';
 import { getAuthProvidersConfig } from '../config/authProviders';
 import { steamService } from '../services/steamService';
 import { playerService } from '../services/playerService';
-import { passport } from '../config/passport';
+import { presetAccounts } from '../services/gameAccounts';
+import { passport, isStrategyConfigured } from '../config/passport';
 import { settingsService } from '../services/settingsService';
-import { authIdentityService, AuthProvider } from '../services/authIdentityService';
+import type { AuthProvider } from '../services/authIdentityService';
+import { authIdentityService } from '../services/authIdentityService';
+import { signPlayerSteamId, getVerifiedPlayerSteamId } from '../utils/signedPlayerCookie';
 import {
-  signPlayerSteamId,
-  getVerifiedPlayerSteamId,
-} from '../utils/signedPlayerCookie';
+  PENDING_STEAM_LINK_COOKIE_NAME,
+  PENDING_STEAM_LINK_TTL_MS,
+  signPendingSteamLink,
+  verifyPendingSteamLink,
+  type PendingSteamLinkRejection,
+} from '../utils/signedPendingSteamLink';
 import { shouldBlockAdminAsDirectAccess } from '../utils/canonicalOrigin';
+import { signImpersonatedSteamId, IMPERSONATION_COOKIE_NAME } from '../utils/impersonationCookie';
+import { resolveViewerAccount, resolveViewerIdentity } from '../utils/viewerIdentity';
+import { authenticateServiceToken, requireAuth } from '../middleware/auth';
+import {
+  peekOAuthLinkIntent,
+  type LinkIntentRequest,
+  type OAuthLinkIntent,
+} from '../utils/oauthStateCookie';
+import { isSameSiteRequest } from '../utils/accountConnections';
+import { isAdminEmail } from '../utils/adminEmails';
+import {
+  grantAdminForAdminEmailMatch,
+  grantAdminForVerifiedEmail,
+} from '../services/adminSeedService';
+import { localAdminService } from '../services/localAdminService';
+import {
+  SteamLinkError,
+  STEAM_ID_RE,
+  connectSteamToLocalAccount,
+  isSteamlessPlayerId,
+} from '../services/localAccountSteamLink';
+import { isLocalReauthFresh, markLocalReauth } from '../utils/localReauth';
+import { effectiveProviderSettings, parseLogoDataUrl } from '../config/signInProviders';
+import type { Untrusted } from '../utils/untrusted';
 
 const router = Router();
 
@@ -52,7 +86,34 @@ function shouldUseSecureCookie(req: Request): boolean {
   return getFrontendBaseUrl(req).startsWith('https://');
 }
 
-function setPlayerSteamCookie(req: Request, res: Response, steamId: string): void {
+function setImpersonationCookie(req: Request, res: Response, steamId: string): void {
+  res.cookie(IMPERSONATION_COOKIE_NAME, signImpersonatedSteamId(steamId), {
+    // Read server-side only; the client learns about impersonation via
+    // /api/auth/me and /api/auth/impersonate.
+    httpOnly: true,
+    secure: shouldUseSecureCookie(req),
+    sameSite: 'lax',
+    path: '/',
+    // Deliberately short-lived: impersonation is a debugging tool, not a login.
+    maxAge: 1000 * 60 * 60 * 2, // 2 hours
+  });
+}
+
+function clearImpersonationCookie(req: Request, res: Response): void {
+  res.clearCookie(IMPERSONATION_COOKIE_NAME, {
+    path: '/',
+    httpOnly: true,
+    secure: shouldUseSecureCookie(req),
+    sameSite: 'lax',
+  });
+}
+
+export function setPlayerSteamCookie(req: Request, res: Response, steamId: string): void {
+  // Every sign-in path (Steam, SSO resolved to Steam) ends here, so this is
+  // where a sign-in is stamped. Best-effort: it never fails the login.
+  void playerService.recordSignIn(steamId).catch((error: unknown) => {
+    log.warn('Failed to record sign-in time', { steamId, error: (error as Error).message });
+  });
   res.cookie('player_steam_id', signPlayerSteamId(steamId), {
     // Frontend never needs to read this cookie directly; it calls /api/auth/me.
     // Keeping it httpOnly reduces XSS impact.
@@ -62,6 +123,276 @@ function setPlayerSteamCookie(req: Request, res: Response, steamId: string): voi
     path: '/',
     maxAge: 1000 * 60 * 60 * 24 * 30, // 30 days
   });
+}
+
+/**
+ * Clear every cookie that identifies the person at this browser: the signed
+ * player_steam_id, the pending SSO→Steam link, and admin impersonation.
+ *
+ * The attributes must match the setters (path, sameSite, secure) or the
+ * browser keeps the original cookie. This matters on shared PCs: a leftover
+ * player_steam_id would make the next person's SSO login auto-link to the
+ * previous user's Steam account.
+ */
+function clearIdentityCookies(req: Request, res: Response): void {
+  res.clearCookie('player_steam_id', {
+    path: '/',
+    httpOnly: true,
+    secure: shouldUseSecureCookie(req),
+    sameSite: 'lax',
+  });
+  res.clearCookie('pending_steam_link', {
+    path: '/',
+    httpOnly: true,
+    // Matches setPendingSteamLinkCookie (PENDING_STEAM_LINK_COOKIE_OPTIONS).
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+  });
+  clearImpersonationCookie(req, res);
+}
+
+/**
+ * Which sign-in's picture a player shows: Steam first, then Discord, then
+ * Google, then the other providers; the generated placeholder last. Higher
+ * wins; an admin-set picture (unknown host) is never replaced.
+ */
+function avatarRank(url: string | null | undefined): number {
+  if (!url || url.startsWith('/api/players/')) return 0;
+  if (/steamstatic|steamcdn|akamaihd/.test(url)) return 4;
+  if (/cdn\.discordapp\.com/.test(url)) return 3;
+  if (/googleusercontent\.com/.test(url)) return 2;
+  if (/githubusercontent\.com|jtvnw\.net|twitch/.test(url)) return 1;
+  return 5; // set by hand: keep it
+}
+
+/** Use a provider's picture when it outranks the player's current one. */
+/**
+ * Store the provider's name, picture and verified email on the identity, for
+ * its owner's /me/connections. Best effort: never fails a sign-in.
+ */
+async function rememberIdentityProfile(
+  provider: AuthProvider,
+  providerUserId: string,
+  user: Record<string, Untrusted>
+): Promise<void> {
+  const text = (v: Untrusted) =>
+    typeof v === 'string' && v.trim() ? v.trim().slice(0, 256) : null;
+  const avatar = text(user.avatarUrl);
+  try {
+    await authIdentityService.saveProfile(provider, providerUserId, {
+      displayName: text(user.displayName) ?? text(user.username),
+      avatarUrl: avatar && /^https:\/\//.test(avatar) ? avatar : null,
+      email: text(user.verifiedEmail),
+    });
+  } catch (error) {
+    log.warn('Could not save the sign-in profile', { provider, error: (error as Error).message });
+  }
+}
+
+async function applyProviderAvatar(steamId: string, avatarUrl: Untrusted): Promise<void> {
+  if (typeof avatarUrl !== 'string' || !avatarUrl) return;
+  try {
+    const player = await playerService.getPlayerById(steamId);
+    if (!player) return;
+    if (avatarRank(avatarUrl) > avatarRank(player.avatar)) {
+      await playerService.updatePlayer(steamId, { avatar: avatarUrl });
+    }
+  } catch (error) {
+    log.warn('Could not update the player picture from a sign-in', {
+      error: (error as Error).message,
+    });
+  }
+}
+
+/** Truncate a provider user id for logs; enough to correlate, not to identify. */
+function redactProviderUserId(id: string | undefined | null): string | null {
+  if (!id) return null;
+  return id.length <= 4 ? '****' : `${id.slice(0, 4)}…`;
+}
+
+type PendingSteamLinkSessionRequest = Request & {
+  session?: {
+    pendingSteamLink?: { provider: AuthProvider; providerUserId: string; adminEmail?: true };
+  };
+};
+
+/** Cookie attributes for pending_steam_link. `clearIdentityCookies` and
+ * `completePendingSteamLink` clear it with the same path/sameSite/secure. */
+const PENDING_STEAM_LINK_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  path: '/',
+};
+
+/**
+ * Set the short-lived `pending_steam_link` cookie that carries "link this SSO
+ * identity once Steam proves an account" into `/steam/callback`. Passport
+ * regenerates the session on the Steam login, so this cookie, not the session
+ * copy, is what normally survives.
+ *
+ * The callback re-points a login based on it, so the value is signed with
+ * SESSION_SECRET and carries its own expiry (see `utils/signedPendingSteamLink`).
+ * This is the only writer; `readPendingSteamLink` is the only reader.
+ */
+export function setPendingSteamLinkCookie(
+  res: Response,
+  provider: AuthProvider,
+  providerUserId: string,
+  adminEmail = false
+): void {
+  const link = adminEmail
+    ? { provider, providerUserId, adminEmail: true as const }
+    : { provider, providerUserId };
+  res.cookie(PENDING_STEAM_LINK_COOKIE_NAME, signPendingSteamLink(link), {
+    ...PENDING_STEAM_LINK_COOKIE_OPTIONS,
+    maxAge: PENDING_STEAM_LINK_TTL_MS,
+  });
+}
+
+export type PendingSteamLinkRead = {
+  /** What the Steam callback would link, or null for a plain Steam login. */
+  link: { provider: AuthProvider; providerUserId: string; adminEmail?: true } | null;
+  source: 'session' | 'cookie' | null;
+  /**
+   * Why a cookie that WAS present was not trusted, or null when there was no
+   * cookie or it verified. Reported even when the session copy wins.
+   */
+  cookieRejected: Exclude<PendingSteamLinkRejection, 'missing'> | null;
+};
+
+/**
+ * Work out which SSO identity, if any, the Steam callback should link.
+ *
+ * The session copy wins when it exists, as before: the server wrote it and the
+ * client cannot touch it. Usually it is gone by now, so the cookie is the normal
+ * source, and it is only believed if its signature and expiry check out. A
+ * cookie that is present but fails is logged with a reason code and ignored;
+ * the login then carries on as a plain Steam login. Neither the cookie value
+ * nor the provider user id it names is logged.
+ *
+ * `now` exists for the test helper only, so expiry can be checked without
+ * waiting ten minutes.
+ */
+export function readPendingSteamLink(
+  req: Request,
+  options: { now?: number } = {}
+): PendingSteamLinkRead {
+  const anyReq = req as PendingSteamLinkSessionRequest;
+
+  let rawCookie: string | undefined;
+  try {
+    rawCookie = parseCookies(req.headers.cookie)[PENDING_STEAM_LINK_COOKIE_NAME];
+  } catch {
+    // decodeURIComponent throws on a malformed %-escape anywhere in the header.
+    // If a pending cookie might be in there, treat it as malformed, never as absent-but-fine.
+    rawCookie = (req.headers.cookie ?? '').includes(`${PENDING_STEAM_LINK_COOKIE_NAME}=`)
+      ? '\u0000unparseable'
+      : undefined;
+  }
+
+  let cookieLink: PendingSteamLinkRead['link'] = null;
+  let cookieRejected: PendingSteamLinkRead['cookieRejected'] = null;
+  const verification = verifyPendingSteamLink(rawCookie, { now: options.now });
+  if (verification.ok) {
+    cookieLink = verification.link;
+  } else if (verification.reason !== 'missing') {
+    cookieRejected = verification.reason;
+    // Reason code only. The provider inside a rejected cookie is unverified, so
+    // it is not logged, and neither is the value.
+    log.warn('Steam callback: rejected pending_steam_link cookie; nothing will be linked from it', {
+      reason: verification.reason,
+    });
+  }
+
+  const sessionPending = anyReq.session?.pendingSteamLink ?? null;
+  if (sessionPending) {
+    // Same precedence as before signing: any session value shadows the cookie.
+    return sessionPending.provider && sessionPending.providerUserId
+      ? { link: sessionPending, source: 'session', cookieRejected }
+      : { link: null, source: null, cookieRejected };
+  }
+  if (cookieLink) {
+    return { link: cookieLink, source: 'cookie', cookieRejected };
+  }
+  return { link: null, source: null, cookieRejected };
+}
+
+/**
+ * The linking step of `/steam/callback`, once Steam has proven `steamId`: link
+ * the pending SSO identity (per `readPendingSteamLink`) to it and clear the
+ * pending state. An identity that already belongs to another Steam account is
+ * refused and left alone, never re-pointed; the pending state is still cleared
+ * and the Steam login goes ahead as a plain Steam login. Errors are logged and
+ * swallowed; a failed link must not fail the Steam login itself.
+ *
+ * Exported so the test helper runs exactly this code, since a test cannot
+ * complete a real Steam OpenID login.
+ */
+export async function completePendingSteamLink(
+  req: Request,
+  res: Response,
+  steamId: string,
+  options: { now?: number } = {}
+): Promise<PendingSteamLinkRead & { linked: boolean }> {
+  const anyReq = req as PendingSteamLinkSessionRequest;
+
+  let read: PendingSteamLinkRead = { link: null, source: null, cookieRejected: null };
+  try {
+    read = readPendingSteamLink(req, options);
+    log.info('Steam Passport callback: checking for pending external identity link', {
+      hasSession: !!anyReq.session,
+      source: read.source,
+      pendingProvider: read.link?.provider ?? null,
+      cookieRejected: read.cookieRejected,
+    });
+
+    if (!read.link) {
+      log.info('Steam Passport callback: no trusted pending external identity link; skipping link');
+      return { ...read, linked: false };
+    }
+
+    const outcome = await authIdentityService.linkIdentityUnlessOwnedElsewhere(
+      read.link.provider,
+      read.link.providerUserId,
+      steamId
+    );
+
+    // The pending link is spent either way: clear the session copy and the
+    // bridging cookie so a refused link is not retried on the next Steam login.
+    if (anyReq.session) {
+      delete anyReq.session.pendingSteamLink;
+    }
+    res.clearCookie(PENDING_STEAM_LINK_COOKIE_NAME, PENDING_STEAM_LINK_COOKIE_OPTIONS);
+
+    if (outcome === 'taken') {
+      log.warn(
+        'Steam callback: pending identity already linked to another Steam account; not re-pointed',
+        {
+          provider: read.link.provider,
+          providerUserId: redactProviderUserId(read.link.providerUserId),
+          steamId,
+          linkSource: read.source,
+        }
+      );
+      return { ...read, linked: false };
+    }
+
+    log.success('Linked external auth identity to Steam', {
+      provider: read.link.provider,
+      providerUserId: redactProviderUserId(read.link.providerUserId),
+      steamId,
+      linkSource: read.source,
+    });
+    // The provider verified an ADMIN_EMAILS address at its callback.
+    if (read.link.adminEmail) {
+      await grantAdminForAdminEmailMatch(steamId, read.link.provider);
+    }
+    return { ...read, linked: true };
+  } catch (linkError) {
+    log.warn('Failed to persist external auth → Steam link', linkError as Error);
+    return { ...read, linked: false };
+  }
 }
 
 /**
@@ -92,9 +423,9 @@ function sendAdminLoginBridgePage(req: Request, res: Response): void {
   res.redirect(302, redirectUrl);
 }
 
+/** Steam sign-in is on and has a Web API key (environment or Settings -> Sign-in). */
 function isSteamAuthConfigured(): boolean {
-  const apiKey = process.env.STEAM_API_KEY;
-  return !!apiKey && apiKey.trim().length > 0;
+  return isStrategyConfigured('steam');
 }
 
 /**
@@ -104,11 +435,11 @@ function isSteamAuthConfigured(): boolean {
  */
 router.get('/steam', (req: Request, res: Response, next) => {
   if (!isSteamAuthConfigured()) {
-    log.warn('Steam auth requested but STEAM_API_KEY is not configured');
+    log.warn('Steam auth requested but Steam sign-in is not set up');
     return res.status(503).json({
       success: false,
       error:
-        'Steam authentication is not configured on the server. Please set STEAM_API_KEY and restart the API.',
+        'Steam sign-in is not set up. An admin can set it up on Settings -> Sign-in (or set STEAM_API_KEY).',
     });
   }
 
@@ -126,12 +457,30 @@ router.get('/steam', (req: Request, res: Response, next) => {
  */
 router.get('/steam/callback', (req: Request, res: Response, _next) => {
   if (!isSteamAuthConfigured()) {
-    log.warn('Steam callback hit but STEAM_API_KEY is not configured');
+    log.warn('Steam callback hit but Steam sign-in is not set up');
     return res.status(503).json({
       success: false,
       error:
-        'Steam authentication is not configured on the server. Please set STEAM_API_KEY and restart the API.',
+        'Steam sign-in is not set up. An admin can set it up on Settings -> Sign-in (or set STEAM_API_KEY).',
     });
+  }
+
+  // Connecting Steam to a local admin account (POST /api/auth/steam/link):
+  // verify the assertion without signing in as the Steam user.
+  if (readSteamLinkIntent(req)) {
+    return passport.authenticate('steam', { session: false }, (err: Untrusted, user: Untrusted) => {
+      const verified = user as { steamId?: string } | false | null | undefined;
+      const steamId = verified ? verified.steamId : undefined;
+      if (err || !steamId) {
+        clearSteamLinkIntent(req);
+        log.warn('Steam account link refused', {
+          reason: 'passport_failure',
+          error: (err as Error)?.message,
+        });
+        return linkResultRedirect(req, res, 'steam', 'failed');
+      }
+      void completeSteamLink(req, res, steamId);
+    })(req, res, _next);
   }
 
   return passport.authenticate('steam', {
@@ -149,7 +498,7 @@ router.get('/steam/callback', (req: Request, res: Response, _next) => {
         | undefined;
 
       log.info('Steam Passport callback: user object received', {
-        user,
+        steamId: user?.steamId ?? null,
       });
 
       const steamId = user?.steamId;
@@ -202,118 +551,43 @@ router.get('/steam/callback', (req: Request, res: Response, _next) => {
             hasAnyAdmin,
           });
           await playerService.getOrCreatePlayer(steamId, displayName, avatarUrl);
+        } else if (existingPlayer) {
+          // Players created without Steam data (ADMIN_STEAM_IDS seeding, admin
+          // imports) carry the Steam ID as a placeholder name and no avatar.
+          // Fill those in from Steam, and keep Steam avatars current, but never
+          // overwrite a name or avatar someone set by hand.
+          const updates: { name?: string; avatar?: string } = {};
+          if (existingPlayer.name === steamId && displayName !== steamId) {
+            updates.name = displayName;
+          }
+          const currentAvatar = existingPlayer.avatar ?? '';
+          // Steam's picture wins over the placeholder and other sign-ins' pictures.
+          const avatarFromSteam = avatarRank(currentAvatar) < 5;
+          if (avatarUrl && avatarFromSteam && currentAvatar !== avatarUrl) {
+            updates.avatar = avatarUrl;
+          }
+          if (updates.name || updates.avatar) {
+            log.info('Steam Passport callback: refreshing player profile from Steam', {
+              steamId,
+              name: Boolean(updates.name),
+              avatar: Boolean(updates.avatar),
+            });
+            await playerService.updatePlayer(steamId, updates);
+          }
         }
 
-        // If this is the very first admin, promote this Steam user to admin.
-        await playerService.ensureFirstAdmin(steamId);
+        // No "first account becomes admin" here any more: the first admin is
+        // created on /setup with the code the server logs (routes/localAdmin.ts).
       } catch (playerError) {
         log.warn('Failed to ensure player record during Steam login', playerError as Error);
       }
 
       // If this Steam login was initiated from a non‑Steam provider (Discord,
-      // Keycloak, GitHub), persist that association so future logins via that
+      // GitHub, Google, ...), persist that association so future logins via that
       // provider automatically resolve the Steam ID without asking to link
       // again.
-      try {
-        const anyReq = req as Request & {
-          session?: {
-            pendingSteamLink?: { provider: AuthProvider; providerUserId: string };
-          };
-        } & {
-          sessionID?: string;
-        };
-        const sessionId = anyReq.sessionID ?? '(unknown)';
-        const cookies = parseCookies(req.headers.cookie);
-        const rawCookiePending = cookies.pending_steam_link;
-
-        let cookiePending: { provider: AuthProvider; providerUserId: string } | null = null;
-        if (rawCookiePending) {
-          try {
-            const parsed = JSON.parse(rawCookiePending) as {
-              provider?: string;
-              providerUserId?: string;
-            };
-            if (
-              parsed &&
-              parsed.provider &&
-              (parsed.provider === 'discord' ||
-                parsed.provider === 'keycloak' ||
-                parsed.provider === 'github') &&
-              typeof parsed.providerUserId === 'string' &&
-              parsed.providerUserId.trim() !== ''
-            ) {
-              cookiePending = {
-                provider: parsed.provider as AuthProvider,
-                providerUserId: parsed.providerUserId,
-              };
-            } else {
-              log.info(
-                'Steam Passport callback: pending_steam_link cookie present but invalid; ignoring',
-                {
-                  sessionId,
-                  rawCookiePending,
-                  parsed,
-                }
-              );
-            }
-          } catch (parseErr) {
-            log.warn('Steam Passport callback: failed to parse pending_steam_link cookie', {
-              sessionId,
-              rawCookiePending,
-              error:
-                parseErr instanceof Error
-                  ? { message: parseErr.message, stack: parseErr.stack }
-                  : parseErr,
-            });
-          }
-        }
-
-        const sessionPending = anyReq.session?.pendingSteamLink ?? null;
-        log.info('Steam Passport callback: checking for pending external identity link', {
-          sessionId,
-          hasSession: !!anyReq.session,
-          sessionPending,
-          cookiePending,
-        });
-
-        const pending = sessionPending || cookiePending;
-        if (pending && pending.provider && pending.providerUserId) {
-          await authIdentityService.linkIdentityToSteam(
-            pending.provider,
-            pending.providerUserId,
-            steamId
-          );
-
-          if (anyReq.session) {
-            delete anyReq.session.pendingSteamLink;
-          }
-
-          // Clear the bridging cookie once we've successfully linked.
-          res.clearCookie('pending_steam_link', {
-            path: '/',
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'lax',
-          });
-
-          log.success('Linked external auth identity to Steam', {
-            provider: pending.provider,
-            providerUserId: pending.providerUserId,
-            steamId,
-            sessionId,
-            linkSource: cookiePending ? 'cookie' : 'session',
-          });
-        } else {
-          log.info(
-            'Steam Passport callback: no pending external identity link found in session or cookie; skipping link',
-            {
-              sessionId,
-            }
-          );
-        }
-      } catch (linkError) {
-        log.warn('Failed to persist external auth → Steam link', linkError as Error);
-      }
+      // Only the session copy or a correctly signed, unexpired cookie is acted on.
+      await completePendingSteamLink(req, res, steamId);
 
       // Set a signed player_steam_id cookie (verified on read to prevent forgery).
       setPlayerSteamCookie(req, res, steamId);
@@ -367,20 +641,13 @@ router.get('/steam/callback', (req: Request, res: Response, _next) => {
  *
  * POST /api/auth/logout
  *
- * This only clears the non-privileged player_steam_id cookie. It does NOT
+ * Clears the player_steam_id, pending_steam_link and impersonation cookies. It does NOT
  * affect admin API token authentication (which is handled purely on the
  * frontend via localStorage today).
  */
-router.post('/logout', (_req: Request, res: Response) => {
+router.post('/logout', (req: Request, res: Response) => {
   try {
-    res.clearCookie('player_steam_id', {
-      path: '/',
-      httpOnly: true,
-      // Clearing cookies does not require matching secure=true, but browsers can be picky.
-      // Use the common case here; if running HTTPS, this will still clear correctly.
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-    });
+    clearIdentityCookies(req, res);
 
     return res.status(204).end();
   } catch (error) {
@@ -393,408 +660,796 @@ router.post('/logout', (_req: Request, res: Response) => {
 });
 
 /**
- * Keycloak OIDC admin login
- *
- * GET /api/auth/keycloak
- * Redirects to the Keycloak authorization endpoint.
+ * The field on the Passport user that holds each SSO provider's user id.
+ * The strategies in config/passport.ts set it.
  */
-router.get(
-  '/keycloak',
-  // Initial redirect – session will be established on the callback.
-  passport.authenticate('keycloak', {
-    // Request standard OIDC scopes so that the UserInfo endpoint
-    // can return a usable profile.
-    scope: ['openid', 'profile', 'email'],
-  })
-);
+const SSO_USER_ID_FIELD: Record<AuthProvider, string> = {
+  discord: 'discordId',
+  github: 'githubId',
+  google: 'googleId',
+  twitch: 'twitchId',
+  epic: 'epicId',
+  oidc: 'oidcId',
+};
+
+const SSO_PROVIDER_LABEL: Record<AuthProvider, string> = {
+  discord: 'Discord',
+  github: 'GitHub',
+  google: 'Google',
+  twitch: 'Twitch',
+  epic: 'Epic Games',
+  oidc: 'OpenID Connect',
+};
 
 /**
- * Keycloak OIDC callback
- *
- * GET /api/auth/keycloak/callback
- * Exchanges the authorization code for tokens and then drops the admin API
- * token into localStorage via a small HTML bridge page.
+ * Answer 503 instead of letting Passport throw "Unknown authentication
+ * strategy" when a provider's client credentials are not configured.
  */
-router.get(
-  '/keycloak/callback',
-  passport.authenticate('keycloak', {
-    failureRedirect: '/login',
-  }),
-  async (req: Request, res: Response) => {
+export function requireStrategy(strategyName: string, provider: AuthProvider) {
+  return (_req: Request, res: Response, next: NextFunction) => {
+    if (!isStrategyConfigured(strategyName)) {
+      log.warn(`${SSO_PROVIDER_LABEL[provider]} auth requested but it is not configured`);
+      return res.status(503).json({
+        success: false,
+        error: `${SSO_PROVIDER_LABEL[provider]} authentication is not configured on the server.`,
+      });
+    }
+    return next();
+  };
+}
+
+/**
+ * What every SSO callback does once Passport has verified the login (state
+ * checked, code exchanged, profile fetched). The same for all providers:
+ *
+ *  1. A verified player_steam_id cookie is already present (the user signed in
+ *     with Steam earlier in this browser): link this identity to that Steam ID,
+ *     unless it already belongs to a different Steam account. Then nothing is
+ *     changed: the identity row is not re-pointed and the session stays the
+ *     signed-in account (no switch to the identity's owner, which would swap
+ *     accounts under a user who is signed in and most likely meant to add a
+ *     sign-in method). The user lands on /me/connections?link=taken, the same
+ *     outcome as the explicit Connect flow.
+ *  2. The identity is already linked: sign in as the linked Steam ID.
+ *  3. Otherwise: remember the identity in a signed pending_steam_link cookie
+ *     (and the session) and send the user to /connect-steam. The Steam
+ *     callback links it once Steam proves an account.
+ *
+ * Admin rights are never decided here. They come from players.is_admin for
+ * the resolved Steam ID, as for a Steam login.
+ *
+ * Exported so the test-only fake provider routes run exactly this code.
+ */
+export function ssoCallbackHandler(expectedProvider: AuthProvider) {
+  const label = SSO_PROVIDER_LABEL[expectedProvider];
+
+  return async (req: Request, res: Response) => {
     const anyReq = req as Request & {
-      user?: {
-        provider?: string;
-        keycloakId?: string;
-        steamId?: string;
-      };
+      user?: Record<string, Untrusted> & { provider?: string; steamId?: string };
       session?: {
-        pendingSteamLink?: { provider: AuthProvider; providerUserId: string };
+        pendingSteamLink?: { provider: AuthProvider; providerUserId: string; adminEmail?: true };
       };
-      sessionID?: string;
     };
 
     const user = anyReq.user;
     const provider = user?.provider as AuthProvider | undefined;
-    const providerUserId = user?.keycloakId;
-    const sessionId = anyReq.sessionID ?? '(unknown)';
-
-    log.info('Keycloak callback: resolved Passport user', {
-      sessionId,
-      user,
+    const rawId = user?.[SSO_USER_ID_FIELD[expectedProvider]];
+    const providerUserId = typeof rawId === 'string' && rawId.length > 0 ? rawId : undefined;
+    // Never log the Passport user object. Provider plus a truncated provider
+    // user id is enough to correlate.
+    log.info(`${label} callback: resolved Passport user`, {
       provider,
-      providerUserId,
+      providerUserId: redactProviderUserId(providerUserId),
     });
 
-    if (!provider || provider !== 'keycloak' || !providerUserId) {
-      log.warn('Keycloak callback missing provider or keycloakId on user');
+    if (!user || provider !== expectedProvider || !providerUserId) {
+      log.warn(`${label} callback missing provider or user id on user`);
       return sendAdminLoginBridgePage(req, res);
     }
+
+    // ADMIN_EMAILS: only an address the provider verified counts (the
+    // strategies set verifiedEmail only then). Never used to pick an account.
+    const verifiedEmail = typeof user.verifiedEmail === 'string' ? user.verifiedEmail : undefined;
 
     try {
       const baseUrl = getFrontendBaseUrl(req);
 
-      // Fast-path: if a verified player_steam_id cookie exists (e.g. previous Steam
-      // login), persist the mapping so the user doesn't have to go through link again.
+      // Fast path: a verified player_steam_id cookie (e.g. an earlier Steam
+      // login) means we already know who this is, so persist the mapping.
       const cookieSteamId = getVerifiedPlayerSteamId(req.headers.cookie);
-      log.info('Keycloak callback: checking for existing player_steam_id cookie', {
-        sessionId,
+      log.info(`${label} callback: checking for existing player_steam_id cookie`, {
         cookieSteamId: cookieSteamId ?? null,
       });
       if (cookieSteamId) {
-        await authIdentityService.linkIdentityToSteam(provider, providerUserId, cookieSteamId);
-        (anyReq.user as { steamId?: string }).steamId = cookieSteamId;
+        const outcome = await authIdentityService.linkIdentityUnlessOwnedElsewhere(
+          provider,
+          providerUserId,
+          cookieSteamId
+        );
+        if (outcome === 'taken') {
+          // Leave the identity row and this browser's session exactly as they were.
+          log.warn(`${label} login refused: identity already linked to another Steam account`, {
+            provider,
+            providerUserId: redactProviderUserId(providerUserId),
+            steamId: cookieSteamId,
+          });
+          return linkResultRedirect(req, res, provider, 'taken');
+        }
+        user.steamId = cookieSteamId;
+        await rememberIdentityProfile(provider, providerUserId, user);
+        await grantAdminForVerifiedEmail(cookieSteamId, provider, verifiedEmail);
+        await applyProviderAvatar(cookieSteamId, user.avatarUrl);
         setPlayerSteamCookie(req, res, cookieSteamId);
 
-        log.success('Keycloak login auto-linked via existing Steam cookie', {
+        log.success(`${label} login auto-linked via existing Steam cookie`, {
+          provider,
+          providerUserId: redactProviderUserId(providerUserId),
           steamId: cookieSteamId,
-          sessionId,
         });
         return res.redirect(302, `${baseUrl}/`);
       }
 
       const steamId = await authIdentityService.findSteamIdForIdentity(provider, providerUserId);
-      log.info('Keycloak callback: result of auth identity lookup', {
-        sessionId,
+      log.info(`${label} callback: result of auth identity lookup`, {
         provider,
-        providerUserId,
+        providerUserId: redactProviderUserId(providerUserId),
         steamId: steamId ?? null,
       });
-      const baseUrlResolved = baseUrl;
 
       if (steamId) {
-        (anyReq.user as { steamId?: string }).steamId = steamId;
+        user.steamId = steamId;
+        await rememberIdentityProfile(provider, providerUserId, user);
+        await grantAdminForVerifiedEmail(steamId, provider, verifiedEmail);
+        await applyProviderAvatar(steamId, user.avatarUrl);
         setPlayerSteamCookie(req, res, steamId);
 
-        log.success('Keycloak login resolved via existing Steam link', { steamId, sessionId });
-        return res.redirect(302, `${baseUrlResolved}/`);
+        log.success(`${label} login resolved via existing Steam link`, { provider, steamId });
+        return res.redirect(302, `${baseUrl}/`);
       }
 
-      // No existing link – remember this identity so the Steam callback can persist it.
-      if (anyReq.session) {
-        anyReq.session.pendingSteamLink = {
+      // An integrator imported this OpenID Connect login for a player
+      // (players.oidc_subject, e.g. NTLAN's Keycloak sub): link it to that
+      // player and sign in as them, instead of making a new account.
+      if (provider === 'oidc') {
+        const imported = await playerService.findByOidcSubject(providerUserId);
+        if (imported) {
+          const outcome = await authIdentityService.linkIdentityUnlessOwnedElsewhere(
+            provider,
+            providerUserId,
+            imported
+          );
+          if (outcome === 'linked') {
+            user.steamId = imported;
+            await rememberIdentityProfile(provider, providerUserId, user);
+            await grantAdminForVerifiedEmail(imported, provider, verifiedEmail);
+            await applyProviderAvatar(imported, user.avatarUrl);
+            setPlayerSteamCookie(req, res, imported);
+            log.success(`${label} login matched an imported player`, {
+              provider,
+              steamId: imported,
+            });
+            return res.redirect(302, `${baseUrl}/`);
+          }
+          log.warn(`${label} login matched an imported player, but it could not be linked`, {
+            provider,
+            steamId: imported,
+            outcome,
+          });
+        }
+      }
+
+      // An admin entered this account for a player (a game's account, such as
+      // Epic Games for Rocket League; services/gameAccounts.ts): sign in as
+      // that player, link it, and the account counts as proven from now on.
+      const preset = await presetAccounts.findPreset(provider, providerUserId);
+      if (preset) {
+        const outcome = await authIdentityService.linkIdentityUnlessOwnedElsewhere(
           provider,
           providerUserId,
-        };
-        log.info('Keycloak callback: stored pendingSteamLink on session', {
-          sessionId,
-          pendingSteamLink: anyReq.session.pendingSteamLink,
+          preset
+        );
+        if (outcome === 'linked') {
+          await presetAccounts.markVerified(provider, providerUserId);
+          user.steamId = preset;
+          await rememberIdentityProfile(provider, providerUserId, user);
+          await grantAdminForVerifiedEmail(preset, provider, verifiedEmail);
+          await applyProviderAvatar(preset, user.avatarUrl);
+          setPlayerSteamCookie(req, res, preset);
+          log.success(`${label} login matched a player an admin added`, {
+            provider,
+            steamId: preset,
+          });
+          return res.redirect(302, `${baseUrl}/`);
+        }
+        log.warn(`${label} login matched a player an admin added, but it could not be linked`, {
+          provider,
+          steamId: preset,
+          outcome,
+        });
+      }
+
+      // No existing link: a new account of its own (Steam is optional), when
+      // registration is open or this is the very first admin. Otherwise fall
+      // back to "sign in with Steam to finish" as before.
+      const selfRegistrationAllowed = await settingsService.isSelfRegistrationAllowed();
+      const hasAnyAdmin = await playerService.hasAnyAdmin();
+      if (selfRegistrationAllowed || !hasAnyAdmin) {
+        const accountId = `acc_${randomBytes(12).toString('hex')}`;
+        const displayName =
+          (typeof user.displayName === 'string' && user.displayName) ||
+          (typeof user.username === 'string' && user.username) ||
+          `${label} player`;
+        await playerService.getOrCreatePlayer(
+          accountId,
+          displayName,
+          typeof user.avatarUrl === 'string' ? user.avatarUrl : undefined
+        );
+        const outcome = await authIdentityService.linkIdentityUnlessOwnedElsewhere(
+          provider,
+          providerUserId,
+          accountId
+        );
+        if (outcome === 'linked') {
+          user.steamId = accountId;
+          await rememberIdentityProfile(provider, providerUserId, user);
+          await grantAdminForVerifiedEmail(accountId, provider, verifiedEmail);
+          setPlayerSteamCookie(req, res, accountId);
+          log.success(`${label} sign-in created an account without Steam`, { provider, accountId });
+          return res.redirect(302, `${baseUrl}/`);
+        }
+      }
+
+      // No existing link: remember this identity so the Steam callback can persist it.
+      const adminEmail = isAdminEmail(verifiedEmail);
+      if (anyReq.session) {
+        anyReq.session.pendingSteamLink = adminEmail
+          ? { provider, providerUserId, adminEmail: true }
+          : { provider, providerUserId };
+        log.info(`${label} callback: stored pendingSteamLink on session`, {
+          provider,
+          providerUserId: redactProviderUserId(providerUserId),
         });
       }
 
       // Also set a short-lived cookie so that even if the Express session ID
-      // changes between the SSO callback and the Steam callback, we can still
-      // recover the pending identity and persist the link.
-      res.cookie(
-        'pending_steam_link',
-        JSON.stringify({
-          provider,
-          providerUserId,
-        }),
-        {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
-          path: '/',
-          maxAge: 1000 * 60 * 10, // 10 minutes
-        }
-      );
+      // changes between this callback and the Steam callback, we can still
+      // recover the pending identity and persist the link. The cookie is signed
+      // and expires, so the Steam callback only acts on one we wrote.
+      setPendingSteamLinkCookie(res, provider, providerUserId, adminEmail);
 
-      log.success('Keycloak Passport login completed; Steam link required');
+      log.success(`${label} Passport login completed; Steam link required`);
       return sendAdminLoginBridgePage(req, res);
     } catch (err) {
-      log.error('Keycloak callback failed while resolving Steam link', err as Error);
+      log.error(`${label} callback failed while resolving Steam link`, err as Error);
       return sendAdminLoginBridgePage(req, res);
     }
-  }
-);
+  };
+}
+
+/*
+ * Linking a provider to the signed-in account ("Connect" on /me/connections).
+ *
+ *   POST /api/auth/<provider>/link  (form post from /me/connections)
+ *     -> redirect to the provider, with a state cookie that also carries the
+ *        signed intent { purpose: 'link', steamId } (utils/oauthStateCookie)
+ *   GET  /api/auth/<provider>/callback  (the provider's one registered redirect)
+ *     -> ssoCallbackRoute sees the signed intent and runs accountLinkCallback
+ *        instead of the login handler
+ *
+ * Protections:
+ *  - start: same-site POST only (sameSite=lax identity cookies + Origin check),
+ *    signed in, not impersonating;
+ *  - state: signed, expires after 10 minutes, single use (cookie cleared and
+ *    nonce remembered server-side), bound to this browser by the cookie;
+ *  - callback: the browser must still be signed in as the account in the
+ *    state; an identity owned by another account is refused, never re-pointed;
+ *    Passport runs with `session: false`, so the session is never switched to
+ *    the provider login;
+ *  - the user sees only ok / taken / failed; reasons are logged server-side.
+ */
+
+/** Where a link flow ends: /me/connections with an outcome flag. */
+function linkResultRedirect(
+  req: Request,
+  res: Response,
+  provider: AuthProvider | 'steam',
+  outcome: 'ok' | 'taken' | 'failed' | 'reauth' | 'merge'
+) {
+  const query = new URLSearchParams({ link: outcome, provider });
+  return res.redirect(302, `${getFrontendBaseUrl(req)}/me/connections?${query}`);
+}
 
 /**
- * Discord OAuth2 admin login
- *
- * GET /api/auth/discord
- * Redirects to the Discord OAuth2 authorization endpoint.
+ * @openapi
+ * /api/auth/{provider}/link:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Start connecting a sign-in provider to the signed-in account
+ *     description: >
+ *       A same-site form post from /me/connections. Redirects to the provider
+ *       with a signed, single-use, 10-minute state that names this account.
+ *       The provider's callback (/api/auth/{provider}/callback) then links the
+ *       identity to this account, refusing one that belongs to another
+ *       account, and redirects to /me/connections?link=ok|taken|failed.
+ *     parameters:
+ *       - in: path
+ *         name: provider
+ *         required: true
+ *         schema:
+ *           type: string
+ *           enum: [discord, github, google, twitch, epic, oidc]
+ *     responses:
+ *       302:
+ *         description: Redirect to the provider
+ *       401:
+ *         description: Not signed in
+ *       403:
+ *         description: Impersonating, or a cross-site request
+ *       503:
+ *         description: Provider not configured
  */
-router.get(
-  '/discord',
-  // Initial redirect – session will be established on the callback.
-  passport.authenticate('discord')
-);
 
 /**
- * Discord OAuth2 callback
- *
- * GET /api/auth/discord/callback
- * Exchanges the authorization code for tokens and then drops the admin API
- * token into localStorage via a small HTML bridge page.
+ * Start linking `provider` to the signed-in account. Exported for the
+ * test-only fake provider routes.
  */
-router.get(
-  '/discord/callback',
-  passport.authenticate('discord', {
-    failureRedirect: '/login',
-  }),
-  async (req: Request, res: Response) => {
-    const anyReq = req as Request & {
-      user?: {
-        provider?: string;
-        discordId?: string;
-        steamId?: string;
-      };
-      session?: {
-        pendingSteamLink?: { provider: AuthProvider; providerUserId: string };
-      };
-      sessionID?: string;
+export function startAccountLink(strategyName: string, provider: AuthProvider) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!isSameSiteRequest(req)) {
+        log.warn('Account link start refused: cross-site request', { provider });
+        return res.status(403).json({ success: false, error: 'Request refused' });
+      }
+      const identity = await resolveViewerIdentity(req);
+      if (!identity.realSteamId) {
+        return res.status(401).json({ success: false, error: 'Sign in to connect an account' });
+      }
+      if (identity.isImpersonating) {
+        return res.status(403).json({
+          success: false,
+          error: 'You are impersonating a player. Stop impersonating to manage your own account.',
+        });
+      }
+      const player = await playerService.getPlayerById(identity.realSteamId);
+      if (!player) {
+        return res.status(404).json({ success: false, error: 'No player record for this account' });
+      }
+
+      // An account with a local admin login re-confirms its password first.
+      if (
+        (await localAdminService.findByPlayerId(identity.realSteamId)) &&
+        !isLocalReauthFresh(req, identity.realSteamId)
+      ) {
+        log.info('Account link start: password re-confirmation needed', { provider });
+        return linkResultRedirect(req, res, provider, 'reauth');
+      }
+
+      const intent: OAuthLinkIntent = { purpose: 'link', steamId: identity.realSteamId };
+      (req as Request & LinkIntentRequest).oauthLinkIntent = intent;
+      log.info('Account link started', { provider, steamId: identity.realSteamId });
+      return passport.authenticate(strategyName, { session: false })(req, res, next);
+    } catch (error) {
+      log.error('Account link start failed', error as Error);
+      return linkResultRedirect(req, res, provider, 'failed');
+    }
+  };
+}
+
+/**
+ * The callback of a link flow: Passport verifies state (and returns the signed
+ * intent as `info.state`), exchanges the code and loads the profile; then the
+ * identity is linked to the account in the intent, if that is still who is
+ * signed in and nobody else owns the identity.
+ */
+function accountLinkCallback(strategyName: string, provider: AuthProvider) {
+  const label = SSO_PROVIDER_LABEL[provider];
+  return (req: Request, res: Response, next: NextFunction) => {
+    const refuse = (reason: string, outcome: 'taken' | 'failed' = 'failed', extra = {}) => {
+      log.warn(`${label} account link refused`, { provider, reason, ...extra });
+      return linkResultRedirect(req, res, provider, outcome);
     };
 
-    const user = anyReq.user;
-    const provider = user?.provider as AuthProvider | undefined;
-    const providerUserId = user?.discordId;
-    const sessionId = anyReq.sessionID ?? '(unknown)';
+    passport.authenticate(
+      strategyName,
+      { session: false },
+      async (err: Untrusted, user: Untrusted, info: Untrusted) => {
+        try {
+          if (err) return refuse('provider_error', 'failed', { error: (err as Error)?.message });
+          if (!user) {
+            return refuse('passport_failure', 'failed', {
+              message: (info as { message?: string } | undefined)?.message ?? null,
+            });
+          }
+          const intent = (info as { state?: OAuthLinkIntent } | undefined)?.state;
+          if (!intent || intent.purpose !== 'link') return refuse('no_link_intent');
 
-    log.info('Discord callback: resolved Passport user', {
-      sessionId,
-      user,
-      provider,
-      providerUserId,
-    });
+          const identity = await resolveViewerIdentity(req);
+          if (!identity.realSteamId || identity.realSteamId !== intent.steamId) {
+            return refuse('account_mismatch', 'failed', {
+              stateSteamId: intent.steamId,
+              viewerSteamId: identity.realSteamId,
+            });
+          }
+          if (identity.isImpersonating) return refuse('impersonating');
 
-    if (!provider || provider !== 'discord' || !providerUserId) {
-      log.warn('Discord callback missing provider or discordId on user');
-      return sendAdminLoginBridgePage(req, res);
-    }
+          const passportUser = user as Record<string, Untrusted>;
+          const rawId = passportUser[SSO_USER_ID_FIELD[provider]];
+          const providerUserId = typeof rawId === 'string' && rawId.length > 0 ? rawId : null;
+          if (passportUser.provider !== provider || !providerUserId) {
+            return refuse('missing_provider_user_id');
+          }
 
-    try {
-      const baseUrl = getFrontendBaseUrl(req);
+          const result = await authIdentityService.linkIdentityIfUnowned(
+            provider,
+            providerUserId,
+            intent.steamId
+          );
+          if (result !== 'linked') {
+            return refuse(result, result === 'taken' ? 'taken' : 'failed', {
+              providerUserId: redactProviderUserId(providerUserId),
+              steamId: intent.steamId,
+            });
+          }
 
-      const cookieSteamId = getVerifiedPlayerSteamId(req.headers.cookie);
-      log.info('Discord callback: checking for existing player_steam_id cookie', {
-        sessionId,
-        cookieSteamId: cookieSteamId ?? null,
-      });
-      if (cookieSteamId) {
-        await authIdentityService.linkIdentityToSteam(provider, providerUserId, cookieSteamId);
-        (anyReq.user as { steamId?: string }).steamId = cookieSteamId;
-        setPlayerSteamCookie(req, res, cookieSteamId);
-
-        log.success('Discord login auto-linked via existing Steam cookie', {
-          steamId: cookieSteamId,
-          sessionId,
-        });
-        return res.redirect(302, `${baseUrl}/`);
-      }
-
-      const steamId = await authIdentityService.findSteamIdForIdentity(provider, providerUserId);
-
-      log.info('Discord callback: result of auth identity lookup', {
-        sessionId,
-        provider,
-        providerUserId,
-        steamId: steamId ?? null,
-      });
-
-      if (steamId) {
-        (anyReq.user as { steamId?: string }).steamId = steamId;
-        setPlayerSteamCookie(req, res, steamId);
-
-        log.success('Discord login resolved via existing Steam link', { steamId, sessionId });
-        return res.redirect(302, `${baseUrl}/`);
-      }
-
-      if (anyReq.session) {
-        anyReq.session.pendingSteamLink = {
-          provider,
-          providerUserId,
-        };
-        log.info('Discord callback: stored pendingSteamLink on session', {
-          sessionId,
-          pendingSteamLink: anyReq.session.pendingSteamLink,
-        });
-      }
-
-      // Also set a short-lived cookie so that even if the Express session ID
-      // changes between the Discord callback and the Steam callback, we can still
-      // recover the pending identity and persist the link.
-      res.cookie(
-        'pending_steam_link',
-        JSON.stringify({
-          provider,
-          providerUserId,
-        }),
-        {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
-          path: '/',
-          maxAge: 1000 * 60 * 10, // 10 minutes
+          await rememberIdentityProfile(provider, providerUserId, passportUser);
+          await applyProviderAvatar(
+            intent.steamId,
+            (passportUser as { avatarUrl?: Untrusted }).avatarUrl
+          );
+          log.success(`${label} linked to account`, {
+            provider,
+            providerUserId: redactProviderUserId(providerUserId),
+            steamId: intent.steamId,
+          });
+          const linkedEmail = passportUser.verifiedEmail;
+          await grantAdminForVerifiedEmail(
+            intent.steamId,
+            provider,
+            typeof linkedEmail === 'string' ? linkedEmail : undefined
+          );
+          return linkResultRedirect(req, res, provider, 'ok');
+        } catch (error) {
+          log.error(`${label} account link failed`, error as Error);
+          return linkResultRedirect(req, res, provider, 'failed');
         }
-      );
-
-      log.success('Discord Passport login completed; Steam link required');
-      return sendAdminLoginBridgePage(req, res);
-    } catch (err) {
-      log.error('Discord callback failed while resolving Steam link', err as Error);
-      return sendAdminLoginBridgePage(req, res);
-    }
-  }
-);
+      }
+    )(req, res, next);
+  };
+}
 
 /**
- * GitHub OAuth2 admin login
- *
- * GET /api/auth/github
- * Redirects to the GitHub OAuth2 authorization endpoint.
+ * The callback route for one provider: a link flow when the state cookie
+ * carries a signed link intent, else the login flow as before (Passport
+ * login, then ssoCallbackHandler; a failed state check redirects to /login).
+ * `stateProvider` names the state cookie (the strategy's SignedCookieStateStore).
+ * Exported for the test-only fake provider routes.
  */
-router.get(
-  '/github',
-  // Initial redirect – session will be established on the callback.
-  passport.authenticate('github')
-);
+export function ssoCallbackRoute(
+  strategyName: string,
+  stateProvider: string,
+  provider: AuthProvider
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (peekOAuthLinkIntent(stateProvider, req.headers.cookie)) {
+      return accountLinkCallback(strategyName, provider)(req, res, next);
+    }
+    return passport.authenticate(strategyName, { failureRedirect: '/login' })(
+      req,
+      res,
+      (err?: unknown) => {
+        if (err) return next(err);
+        return ssoCallbackHandler(provider)(req, res);
+      }
+    );
+  };
+}
 
 /**
- * GitHub OAuth2 callback
+ * The routes for one SSO provider:
  *
- * GET /api/auth/github/callback
- * Exchanges the authorization code for tokens and then drops the admin API
- * token into localStorage via a small HTML bridge page.
+ *   GET  /api/auth/<provider>           redirects to the provider (login)
+ *   POST /api/auth/<provider>/link      redirects to the provider (link to the signed-in account)
+ *   GET  /api/auth/<provider>/callback  login (ssoCallbackHandler) or link (accountLinkCallback)
+ *
+ * The OAuth state cookie is set and checked by the strategy's
+ * SignedCookieStateStore (utils/oauthStateCookie).
  */
-router.get(
-  '/github/callback',
-  passport.authenticate('github', {
-    failureRedirect: '/login',
-  }),
-  async (req: Request, res: Response) => {
-    const anyReq = req as Request & {
-      user?: {
-        provider?: string;
-        githubId?: string;
-        steamId?: string;
-      };
-      session?: {
-        pendingSteamLink?: { provider: AuthProvider; providerUserId: string };
-      };
-      sessionID?: string;
-    };
+function registerSsoRoutes(provider: AuthProvider) {
+  router.get(`/${provider}`, requireStrategy(provider, provider), passport.authenticate(provider));
+  router.post(
+    `/${provider}/link`,
+    requireStrategy(provider, provider),
+    startAccountLink(provider, provider)
+  );
+  router.get(
+    `/${provider}/callback`,
+    requireStrategy(provider, provider),
+    ssoCallbackRoute(provider, provider, provider)
+  );
+}
 
-    const user = anyReq.user;
-    const provider = user?.provider as AuthProvider | undefined;
-    const providerUserId = user?.githubId;
-    const sessionId = anyReq.sessionID ?? '(unknown)';
+// OpenID Connect: the strategy asks for openid, profile and email itself.
+registerSsoRoutes('oidc');
+registerSsoRoutes('discord');
+registerSsoRoutes('github');
+registerSsoRoutes('google');
+registerSsoRoutes('twitch');
+registerSsoRoutes('epic');
 
-    log.info('GitHub callback: resolved Passport user', {
-      sessionId,
-      user,
-      provider,
-      providerUserId,
+/*
+ * Connecting Steam to a local admin account (services/localAccountSteamLink).
+ *
+ *   POST /api/auth/steam/link  (form post from /me/connections)
+ *     -> checks (same-site, signed in, not impersonating, a local-* account,
+ *        password re-confirmed in the last 10 minutes), remembers the intent
+ *        on the server-side session, redirects to Steam
+ *   GET  /api/auth/steam/callback
+ *     -> with an intent on the session: Passport verifies the assertion with
+ *        `session: false` (the session is not switched to the Steam user),
+ *        then completeSteamLink:
+ *          - no player has the Steam ID: attach (the account becomes that
+ *            Steam player; redirect ?link=ok)
+ *          - a player has it: remember a pending merge on the session and
+ *            redirect ?link=merge; /me/connections asks, and
+ *            POST /api/me/connections/steam/merge does it
+ *          - that player has its own local login: ?link=taken
+ */
+
+const STEAM_LINK_TTL_MS = 10 * 60 * 1000;
+
+interface SteamLinkIntent {
+  playerId: string;
+  at: number;
+}
+
+export interface PendingSteamMerge {
+  playerId: string;
+  steamId: string;
+  at: number;
+}
+
+type SteamLinkSession = {
+  session?: { steamLinkIntent?: SteamLinkIntent; pendingSteamMerge?: PendingSteamMerge };
+};
+
+function readSteamLinkIntent(req: Request): SteamLinkIntent | null {
+  const intent = (req as Request & SteamLinkSession).session?.steamLinkIntent;
+  if (!intent || typeof intent.at !== 'number') return null;
+  return Date.now() - intent.at <= STEAM_LINK_TTL_MS ? intent : null;
+}
+
+function clearSteamLinkIntent(req: Request): void {
+  const session = (req as Request & SteamLinkSession).session;
+  if (session) delete session.steamLinkIntent;
+}
+
+/** The pending "merge this Steam player into your account?" for `playerId`, if still fresh. */
+export function readPendingSteamMerge(req: Request, playerId: string): PendingSteamMerge | null {
+  const pending = (req as Request & SteamLinkSession).session?.pendingSteamMerge;
+  if (!pending || pending.playerId !== playerId || typeof pending.at !== 'number') return null;
+  return Date.now() - pending.at <= STEAM_LINK_TTL_MS ? pending : null;
+}
+
+export function clearPendingSteamMerge(req: Request): void {
+  const session = (req as Request & SteamLinkSession).session;
+  if (session) delete session.pendingSteamMerge;
+}
+
+/**
+ * The signed-in account now lives under `playerId` (after attaching or
+ * merging Steam): sign this browser in as it, keeping the sign-in provider,
+ * and keep the password re-confirmation that allowed the change.
+ */
+export function switchSessionAccount(req: Request, res: Response, playerId: string): Promise<void> {
+  const anyReq = req as Request & {
+    user?: { provider?: string; displayName?: string };
+    login?: (user: Untrusted, cb: (err: Untrusted) => void) => void;
+  };
+  const provider = anyReq.user?.provider ?? 'local';
+  const displayName = anyReq.user?.displayName;
+  return new Promise((resolve, reject) => {
+    if (!anyReq.login) return reject(new Error('Passport is not initialised'));
+    anyReq.login({ provider, steamId: playerId, displayName }, (err) => {
+      if (err) return reject(err);
+      setPlayerSteamCookie(req, res, playerId);
+      markLocalReauth(req, playerId);
+      resolve();
     });
+  });
+}
 
-    if (!provider || provider !== 'github' || !providerUserId) {
-      log.warn('GitHub callback missing provider or githubId on user');
-      return sendAdminLoginBridgePage(req, res);
-    }
-
-    try {
-      const baseUrl = getFrontendBaseUrl(req);
-
-      const cookieSteamId = getVerifiedPlayerSteamId(req.headers.cookie);
-      log.info('GitHub callback: checking for existing player_steam_id cookie', {
-        sessionId,
-        cookieSteamId: cookieSteamId ?? null,
-      });
-      if (cookieSteamId) {
-        await authIdentityService.linkIdentityToSteam(provider, providerUserId, cookieSteamId);
-        (anyReq.user as { steamId?: string }).steamId = cookieSteamId;
-        setPlayerSteamCookie(req, res, cookieSteamId);
-
-        log.success('GitHub login auto-linked via existing Steam cookie', {
-          steamId: cookieSteamId,
-          sessionId,
-        });
-        return res.redirect(302, `${baseUrl}/`);
-      }
-
-      const steamId = await authIdentityService.findSteamIdForIdentity(provider, providerUserId);
-
-      log.info('GitHub callback: result of auth identity lookup', {
-        sessionId,
-        provider,
-        providerUserId,
-        steamId: steamId ?? null,
-      });
-
-      if (steamId) {
-        (anyReq.user as { steamId?: string }).steamId = steamId;
-        setPlayerSteamCookie(req, res, steamId);
-
-        log.success('GitHub login resolved via existing Steam link', { steamId, sessionId });
-        return res.redirect(302, `${baseUrl}/`);
-      }
-
-      if (anyReq.session) {
-        anyReq.session.pendingSteamLink = {
-          provider,
-          providerUserId,
-        };
-        log.info('GitHub callback: stored pendingSteamLink on session', {
-          sessionId,
-          pendingSteamLink: anyReq.session.pendingSteamLink,
-        });
-      }
-
-      // Also set a short-lived cookie so that even if the Express session ID
-      // changes between the GitHub callback and the Steam callback, we can still
-      // recover the pending identity and persist the link.
-      res.cookie(
-        'pending_steam_link',
-        JSON.stringify({
-          provider,
-          providerUserId,
-        }),
-        {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
-          path: '/',
-          maxAge: 1000 * 60 * 10, // 10 minutes
-        }
-      );
-
-      log.success('GitHub Passport login completed; Steam link required');
-      return sendAdminLoginBridgePage(req, res);
-    } catch (err) {
-      log.error('GitHub callback failed while resolving Steam link', err as Error);
-      return sendAdminLoginBridgePage(req, res);
-    }
+/**
+ * Checks for starting a Steam link. Sends the refusal and returns false, or
+ * remembers the intent and returns true. Exported for the test-only twin.
+ */
+export async function beginSteamLink(req: Request, res: Response): Promise<boolean> {
+  if (!isSameSiteRequest(req)) {
+    log.warn('Steam account link start refused: cross-site request');
+    res.status(403).json({ success: false, error: 'Request refused' });
+    return false;
   }
-);
+  const identity = await resolveViewerIdentity(req);
+  if (!identity.realSteamId) {
+    res.status(401).json({ success: false, error: 'Sign in to connect an account' });
+    return false;
+  }
+  if (identity.isImpersonating) {
+    res.status(403).json({
+      success: false,
+      error: 'You are impersonating a player. Stop impersonating to manage your own account.',
+    });
+    return false;
+  }
+  if (
+    !isSteamlessPlayerId(identity.realSteamId) ||
+    !(await playerService.getPlayerById(identity.realSteamId))
+  ) {
+    // Every other account already is a Steam account.
+    res.status(400).json({ success: false, error: 'This account already signs in with Steam' });
+    return false;
+  }
+  // An account with a local admin login re-confirms its password first (one
+  // a sign-in method made, acc_*, has no password to confirm).
+  if (
+    (await localAdminService.findByPlayerId(identity.realSteamId)) &&
+    !isLocalReauthFresh(req, identity.realSteamId)
+  ) {
+    linkResultRedirect(req, res, 'steam', 'reauth');
+    return false;
+  }
+  const session = (req as Request & SteamLinkSession).session;
+  if (!session) {
+    linkResultRedirect(req, res, 'steam', 'failed');
+    return false;
+  }
+  session.steamLinkIntent = { playerId: identity.realSteamId, at: Date.now() };
+  delete session.pendingSteamMerge;
+  log.info('Steam account link started', { playerId: identity.realSteamId });
+  return true;
+}
+
+/**
+ * Steam proved `steamId`: attach it to the local account in the session's
+ * intent, or queue a merge for confirmation. Always answers with a redirect
+ * to /me/connections. Exported for the test-only twin.
+ */
+export async function completeSteamLink(
+  req: Request,
+  res: Response,
+  steamId: string
+): Promise<void> {
+  const intent = readSteamLinkIntent(req);
+  clearSteamLinkIntent(req);
+  const refuse = (reason: string, outcome: 'taken' | 'failed' = 'failed'): void => {
+    log.warn('Steam account link refused', { reason, steamId, playerId: intent?.playerId ?? null });
+    linkResultRedirect(req, res, 'steam', outcome);
+  };
+  try {
+    if (!intent) return refuse('no_link_intent');
+    if (!STEAM_ID_RE.test(steamId)) return refuse('bad_steam_id');
+    const identity = await resolveViewerIdentity(req);
+    if (identity.realSteamId !== intent.playerId) return refuse('account_mismatch');
+    if (identity.isImpersonating) return refuse('impersonating');
+
+    const existing = await playerService.getPlayerById(steamId);
+    if (existing) {
+      if (await localAdminService.findByPlayerId(steamId)) {
+        return refuse('steam_player_has_local_login', 'taken');
+      }
+      const session = (req as Request & SteamLinkSession).session;
+      if (!session) return refuse('no_session');
+      session.pendingSteamMerge = { playerId: intent.playerId, steamId, at: Date.now() };
+      log.info('[AUDIT] Steam account link: existing player, waiting for merge confirmation', {
+        playerId: intent.playerId,
+        steamId,
+      });
+      linkResultRedirect(req, res, 'steam', 'merge');
+      return;
+    }
+
+    let profile: { name?: string; avatarUrl?: string } = {};
+    try {
+      if (await steamService.isAvailable()) {
+        const info = await steamService.getPlayerInfo(steamId);
+        if (info) profile = { name: info.name, avatarUrl: info.avatarUrl };
+      }
+    } catch {
+      // The local account's name and avatar are kept instead.
+    }
+    const result = await connectSteamToLocalAccount(intent.playerId, steamId, 'attach', profile);
+    log.warn(
+      '[AUDIT] Steam connected to a local admin account; it now signs in as the Steam player',
+      {
+        from: intent.playerId,
+        steamId,
+        moved: result.moved,
+      }
+    );
+    await switchSessionAccount(req, res, steamId);
+    linkResultRedirect(req, res, 'steam', 'ok');
+  } catch (error) {
+    if (error instanceof SteamLinkError) {
+      return refuse(error.reason, error.reason === 'taken' ? 'taken' : 'failed');
+    }
+    log.error('Steam account link failed', error as Error);
+    return refuse('error');
+  }
+}
+
+/**
+ * @openapi
+ * /api/auth/steam/link:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Start connecting Steam to the signed-in local admin account
+ *     description: >
+ *       A same-site form post from /me/connections, for accounts created on
+ *       /setup (no Steam identity yet). Needs the local password re-confirmed
+ *       in the last 10 minutes (POST /api/auth/local/reauth), else redirects
+ *       to /me/connections?link=reauth. Redirects to Steam; the callback
+ *       attaches the Steam ID (?link=ok), or, when a player with that Steam
+ *       ID exists, asks to merge (?link=merge, then
+ *       POST /api/me/connections/steam/merge).
+ *     responses:
+ *       302:
+ *         description: Redirect to Steam, or back to /me/connections
+ *       400:
+ *         description: The account already signs in with Steam
+ *       401:
+ *         description: Not signed in
+ *       403:
+ *         description: Impersonating, or a cross-site request
+ *       503:
+ *         description: Steam sign-in is not set up
+ */
+router.post('/steam/link', async (req: Request, res: Response, next: NextFunction) => {
+  if (!isSteamAuthConfigured()) {
+    return res.status(503).json({ success: false, error: 'Steam sign-in is not set up' });
+  }
+  try {
+    if (!(await beginSteamLink(req, res))) return;
+    return passport.authenticate('steam', { session: false })(req, res, next);
+  } catch (error) {
+    log.error('Steam account link start failed', error as Error);
+    return linkResultRedirect(req, res, 'steam', 'failed');
+  }
+});
+
+/**
+ * @openapi
+ * /api/auth/oidc/logo:
+ *   get:
+ *     tags: [Auth]
+ *     summary: The OpenID Connect button's logo (public)
+ *     description: The image the admin uploaded under Settings > Sign-in, as PNG, JPEG, WebP or SVG. An SVG cannot run scripts here (sandboxed). 404 without one.
+ *     responses:
+ *       200: { description: The image }
+ *       404: { description: No logo set }
+ */
+router.get('/oidc/logo', (_req: Request, res: Response) => {
+  const logo = effectiveProviderSettings('oidc').logo;
+  const parsed = logo ? parseLogoDataUrl(logo) : null;
+  if (!parsed) return res.status(404).json({ success: false, error: 'No logo set' });
+  res.setHeader('Content-Type', parsed.type);
+  // An SVG opened on its own runs nothing: no scripts, no requests out.
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+  );
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // The URL carries ?v=<saved at>: a new logo is a new URL.
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  return res.send(parsed.bytes);
+});
 
 /**
  * Public discovery endpoint: returns the list of configured auth providers.
  *
  * This is safe to expose to the frontend and is intended to drive dynamic
- * "Sign in with X" buttons (Steam, Keycloak, Discord, etc.).
+ * "Sign in with X" buttons (Steam, Discord, OpenID Connect, etc.).
  */
 router.get('/providers', async (_req: Request, res: Response) => {
-  const genericUnavailable =
-    'Sign-in is temporarily unavailable. Please contact an administrator.';
+  const genericUnavailable = 'Sign-in is temporarily unavailable. Please contact an administrator.';
 
   try {
     let providers = getAuthProvidersConfig();
@@ -836,34 +1491,74 @@ router.get('/providers', async (_req: Request, res: Response) => {
  */
 router.get('/me', async (req: Request, res: Response) => {
   try {
-    const steamId = getVerifiedPlayerSteamId(req.headers.cookie);
+    // The *effective* identity: normally the signed-in user, but an admin who
+    // started an impersonation session is reported as the impersonated player
+    // so all player-facing UI (veto, team pages, CTAs) matches what the API
+    // will actually authorize.
+    const identity = await resolveViewerIdentity(req);
+    const steamId = identity.effectiveSteamId;
 
-    log.info('/api/auth/me: evaluated cookie state', {
-      rawCookieHeader: req.headers.cookie ?? null,
+    log.debug('/api/auth/me: evaluated cookie state', {
       steamId: steamId ?? null,
+      isImpersonating: identity.isImpersonating,
     });
 
     if (!steamId) {
-      log.info('/api/auth/me: no Steam ID cookie present; returning unauthenticated');
+      log.debug('/api/auth/me: no Steam ID cookie present; returning unauthenticated');
       return res.json({
         authenticated: false,
       });
     }
 
     let hasPlayerRecord = false;
+    let playerName: string | null = null;
     try {
       const player = await playerService.getPlayerById(steamId);
       hasPlayerRecord = !!player;
+      playerName = player?.name ?? null;
     } catch {
       // treat lookup failure as no record
     }
 
-    log.info('/api/auth/me: returning authenticated Steam identity', { steamId, hasPlayerRecord });
+    // The same account by its game-neutral `players.uid`, which is how game
+    // modules name a player (DESIGN-module-client-api.md, decision 5). Null
+    // for a signed-in Steam user with no players row yet.
+    let uid: string | null = null;
+    if (hasPlayerRecord) {
+      try {
+        uid = (await resolveViewerAccount(req)).uid;
+      } catch {
+        // best-effort: the Steam identity above still answers
+      }
+    }
+
+    // Ask the player for their display name (players_choose_name on, never
+    // confirmed). Never while impersonating: /api/me/name answers for the real session.
+    let namePrompt = false;
+    if (hasPlayerRecord && !identity.isImpersonating) {
+      try {
+        namePrompt = (await getOwnNameState(steamId))?.showPrompt ?? false;
+      } catch {
+        // best-effort
+      }
+    }
+
+    log.debug('/api/auth/me: returning authenticated Steam identity', { steamId, hasPlayerRecord });
 
     return res.json({
       authenticated: true,
       steamId,
+      uid,
       hasPlayerRecord,
+      namePrompt,
+      impersonation: identity.isImpersonating
+        ? {
+            active: true,
+            steamId,
+            name: playerName,
+            realSteamId: identity.realSteamId,
+          }
+        : { active: false },
     });
   } catch (error) {
     log.warn('Failed to read player_steam_id cookie', error as Error);
@@ -921,8 +1616,6 @@ router.post('/self-register', async (req: Request, res: Response) => {
     }
 
     await playerService.getOrCreatePlayer(steamId, displayName, avatarUrl);
-    // Maintain the "first admin bootstrap" behaviour when safe.
-    await playerService.ensureFirstAdmin(steamId);
 
     const createdPlayer = await playerService.getPlayerById(steamId);
     return res.json({
@@ -984,14 +1677,13 @@ router.get('/admin-status', async (req: Request, res: Response) => {
     }
 
     const hasAnyAdmin = await playerService.hasAnyAdmin();
-    const hint =
-      !hasPlayerRecord
-        ? 'You are not in the players table. Ask an admin to add you, or enable self-registration.'
-        : !isAdmin && hasAnyAdmin
-          ? 'An admin already exists. Only the first user to sign in (after DB reset) is auto-promoted. Ask an existing admin to grant you access.'
-          : !isAdmin
-            ? 'No admins exist yet. The first user to sign in with Steam is auto-promoted. Ensure you are the only player, then sign in again.'
-            : undefined;
+    const hint = !hasPlayerRecord
+      ? 'You are not in the players table. Ask an admin to add you, or enable self-registration.'
+      : !isAdmin && hasAnyAdmin
+        ? 'An admin already exists. Only the first user to sign in (after DB reset) is auto-promoted. Ask an existing admin to grant you access.'
+        : !isAdmin
+          ? 'No admins exist yet. The first user to sign in with Steam is auto-promoted. Ensure you are the only player, then sign in again.'
+          : undefined;
 
     log.debug('[auth/admin-status]', { steamId, isAdmin, hasPlayerRecord, reason });
 
@@ -1017,7 +1709,7 @@ router.get('/admin-status', async (req: Request, res: Response) => {
  * Returns basic info about the authenticated admin session (if any).
  *
  * We accept two ways to be "admin" (same as requireAuth):
- *  1. Passport session (connect.sid) — Steam/SSO login with session.
+ *  1. Passport session (at.sid) — Steam/SSO login with session.
  *  2. player_steam_id cookie + DB is_admin — used when session cookie is dropped
  *     (e.g. Cloudflare Tunnel, Chrome + OAuth redirect). Same as /admin-status.
  *
@@ -1026,8 +1718,37 @@ router.get('/admin-status', async (req: Request, res: Response) => {
  * - Fallback to the player_steam_id cookie for SSO logins that linked Steam.
  */
 router.get('/admin/me', async (req: Request, res: Response) => {
+  // A service token identifies an integration, not a person, so there is no
+  // Steam ID or profile to return. Answering here anyway gives bots a single
+  // endpoint to check "is my token accepted, and what may it do" against.
+  const tokenAuth = authenticateServiceToken(req);
+  if (tokenAuth) {
+    if (tokenAuth.ok) {
+      return res.json({
+        authenticated: true,
+        provider: 'service-token',
+        steamId: null,
+        serviceToken: {
+          label: tokenAuth.identity.label,
+          scope: tokenAuth.identity.scope,
+          fingerprint: tokenAuth.identity.fingerprint,
+        },
+      });
+    }
+    return res.json({
+      authenticated: false,
+      reason: 'invalid_service_token',
+      message: tokenAuth.reason,
+    });
+  }
+
   if (shouldBlockAdminAsDirectAccess(req)) {
-    return res.json({ authenticated: false });
+    return res.json({
+      authenticated: false,
+      reason: 'direct_access_blocked',
+      message:
+        'Admin access is only allowed through the configured frontend URL. This request did not come through your reverse proxy.',
+    });
   }
 
   const anyReq = req as Request & {
@@ -1060,18 +1781,19 @@ router.get('/admin/me', async (req: Request, res: Response) => {
     } else if (provider === 'discord') {
       profileName = (user as { username?: string }).username ?? null;
       profileAvatarUrl = (user as { avatarUrl?: string }).avatarUrl ?? null;
-    } else if (provider === 'github') {
+    } else if (
+      provider === 'github' ||
+      provider === 'google' ||
+      provider === 'twitch' ||
+      provider === 'epic' ||
+      provider === 'oidc' ||
+      provider === 'local'
+    ) {
       profileName =
         (user as { displayName?: string }).displayName ||
         (user as { username?: string }).username ||
         null;
       profileAvatarUrl = (user as { avatarUrl?: string }).avatarUrl ?? null;
-    } else if (provider === 'keycloak') {
-      profileName =
-        (user as { displayName?: string }).displayName ||
-        (user as { username?: string }).username ||
-        null;
-      profileAvatarUrl = null;
     }
 
     if (steamId) {
@@ -1120,23 +1842,58 @@ router.get('/admin/me', async (req: Request, res: Response) => {
     }
   }
 
+  // Say *why* admin was refused.
+  //
+  // This used to return a bare `authenticated: false`, and the client silently
+  // redirected to the player profile. Three quite different situations —
+  // nobody is signed in, the Steam ID has no player row, and the player exists
+  // but is not an admin — were indistinguishable from the outside, which is
+  // exactly why the reports of "redirected to my player page even though
+  // is_admin = 1" could never be diagnosed: there was nothing to collect.
+  const resolvedSteamId = steamId ?? cookieSteamId ?? null;
+  let reason: 'not_signed_in' | 'no_player_record' | 'not_admin' = 'not_signed_in';
+  let message = 'You are not signed in.';
+
+  if (resolvedSteamId) {
+    let player = null;
+    try {
+      player = await playerService.getPlayerById(resolvedSteamId);
+    } catch (err) {
+      log.warn('Failed to load player while explaining admin denial', err as Error);
+    }
+
+    if (!player) {
+      reason = 'no_player_record';
+      message = `Signed in as ${resolvedSteamId}, but there is no player with that Steam ID.`;
+    } else {
+      reason = 'not_admin';
+      message = `Signed in as ${player.name || resolvedSteamId} (${resolvedSteamId}), but this account is not an admin.`;
+    }
+  }
+
   log.info('/api/auth/admin/me: unauthenticated admin session', {
     hasIsAuthenticated: !!anyReq.isAuthenticated,
     isAuthenticated: anyReq.isAuthenticated ? anyReq.isAuthenticated() : null,
     hasUser: !!anyReq.user,
     hasCookieSteamId: !!cookieSteamId,
+    resolvedSteamId,
+    reason,
   });
-  return res.json({ authenticated: false });
+  return res.json({ authenticated: false, reason, message });
 });
 
 /**
- * Admin logout – destroys the Passport session.
+ * Admin logout – destroys the Passport session and clears the identity cookies.
  */
 router.post('/admin/logout', (req: Request, res: Response) => {
   const anyReq = req as Request & {
     logout?: (cb: (err: unknown) => void) => void;
     session?: { destroy?: (cb: (err: unknown) => void) => void };
   };
+
+  // The signed player_steam_id cookie is itself an admin credential (see
+  // middleware/auth), so destroying only the Passport session is not a logout.
+  clearIdentityCookies(req, res);
 
   if (!anyReq.logout) {
     return res.status(204).end();
@@ -1164,6 +1921,166 @@ router.post('/admin/logout', (req: Request, res: Response) => {
   });
 });
 
+/**
+ * Admin impersonation ("view as player").
+ *
+ * Lets an admin walk through player-facing flows – map veto in particular –
+ * as a specific player, without needing that player's Steam credentials.
+ *
+ * Guarantees:
+ *  - `requireAuth` resolves admin rights from the **real** session/cookie and
+ *    deliberately ignores the impersonation cookie, so an admin impersonating a
+ *    normal player keeps full admin access and can always stop.
+ *  - The impersonation cookie is HMAC-signed and only honoured when the real
+ *    requester is an admin, so it grants nothing if copied to another browser.
+ *  - Admins cannot impersonate another admin: that would let a lower-trust
+ *    admin borrow a peer's identity for audit-visible actions.
+ */
+
+/**
+ * @openapi
+ * /api/auth/impersonate:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Current impersonation state for the signed-in admin
+ *     responses:
+ *       200:
+ *         description: Impersonation state
+ */
+router.get('/impersonate', requireAuth, async (req: Request, res: Response) => {
+  const identity = await resolveViewerIdentity(req);
+
+  if (!identity.isImpersonating || !identity.effectiveSteamId) {
+    return res.json({ success: true, active: false });
+  }
+
+  const player = await playerService.getPlayerById(identity.effectiveSteamId).catch(() => null);
+
+  return res.json({
+    success: true,
+    active: true,
+    steamId: identity.effectiveSteamId,
+    name: player?.name ?? null,
+    avatar: player?.avatar ?? null,
+    realSteamId: identity.realSteamId,
+  });
+});
+
+/**
+ * @openapi
+ * /api/auth/impersonate:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Start impersonating a player (admin only)
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [steamId]
+ *             properties:
+ *               steamId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Impersonation started
+ *       400:
+ *         description: Invalid Steam ID
+ *       403:
+ *         description: Target is an admin, or caller is not an admin
+ *       404:
+ *         description: No such player
+ */
+router.post('/impersonate', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { steamId: raw } = req.body as { steamId?: Untrusted };
+
+    if (typeof raw !== 'string' || raw.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Field "steamId" is required',
+      });
+    }
+
+    const steamId = raw.trim();
+    if (!/^\d{17}$/.test(steamId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Field "steamId" must be a 17-digit Steam ID',
+      });
+    }
+
+    const identity = await resolveViewerIdentity(req);
+    if (identity.realSteamId === steamId) {
+      return res.status(400).json({
+        success: false,
+        error: 'You are already signed in as this player',
+      });
+    }
+
+    const target = await playerService.getPlayerById(steamId);
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        error: 'No player found for that Steam ID',
+      });
+    }
+
+    if (target.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Admins cannot impersonate other admins',
+      });
+    }
+
+    setImpersonationCookie(req, res, steamId);
+
+    log.warn('[IMPERSONATION] Admin started impersonating a player', {
+      adminSteamId: identity.realSteamId,
+      targetSteamId: steamId,
+    });
+
+    return res.json({
+      success: true,
+      active: true,
+      steamId,
+      name: target.name ?? null,
+      avatar: target.avatar ?? null,
+      realSteamId: identity.realSteamId,
+    });
+  } catch (error) {
+    log.error('Failed to start impersonation', error as Error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to start impersonation',
+    });
+  }
+});
+
+/**
+ * @openapi
+ * /api/auth/impersonate/stop:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Stop impersonating and return to your own identity
+ *     responses:
+ *       200:
+ *         description: Impersonation cleared
+ */
+router.post('/impersonate/stop', requireAuth, async (req: Request, res: Response) => {
+  const identity = await resolveViewerIdentity(req);
+
+  clearImpersonationCookie(req, res);
+
+  if (identity.isImpersonating) {
+    log.warn('[IMPERSONATION] Admin stopped impersonating', {
+      adminSteamId: identity.realSteamId,
+      targetSteamId: identity.effectiveSteamId,
+    });
+  }
+
+  return res.json({ success: true, active: false });
+});
+
 export default router;
-
-

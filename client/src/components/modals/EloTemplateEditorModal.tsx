@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -8,8 +8,6 @@ import {
   TextField,
   Box,
   Typography,
-  Switch,
-  FormControlLabel,
   Divider,
   Stack,
   Slider,
@@ -18,7 +16,7 @@ import {
   IconButton,
   CircularProgress,
 } from '@mui/material';
-import { Close as CloseIcon, Info as InfoIcon } from '@mui/icons-material';
+import { InfoIcon, XIcon } from '@phosphor-icons/react';
 import { api } from '../../utils/api';
 import { useSnackbar } from '../../contexts/SnackbarContext';
 import type {
@@ -28,6 +26,8 @@ import type {
   UpdateEloTemplateInput,
 } from '../../types/elo.types';
 import { useTranslation } from 'react-i18next';
+import { SwitchRow } from '../../components/common/ui';
+import { fmtNum } from '../../utils/number';
 
 interface EloTemplateEditorModalProps {
   open: boolean;
@@ -35,34 +35,6 @@ interface EloTemplateEditorModalProps {
   onClose: () => void;
   onSave: () => void;
 }
-
-const STAT_LABELS: Record<keyof EloTemplateWeights, string> = {
-  kills: 'Kills',
-  deaths: 'Deaths',
-  assists: 'Assists',
-  flashAssists: 'Flash Assists',
-  headshotKills: 'Headshot Kills',
-  damage: 'Damage',
-  utilityDamage: 'Utility Damage',
-  kast: 'KAST %',
-  mvps: 'MVPs',
-  score: 'Score',
-  adr: 'ADR',
-};
-
-const STAT_DESCRIPTIONS: Record<keyof EloTemplateWeights, string> = {
-  kills: 'Number of kills per match',
-  deaths: 'Number of deaths per match (typically negative weight)',
-  assists: 'Number of assists per match',
-  flashAssists: 'Number of flash assists per match',
-  headshotKills: 'Number of headshot kills per match',
-  damage: 'Total damage dealt per match',
-  utilityDamage: 'Damage dealt with utility (grenades)',
-  kast: 'Percentage of rounds with Kill, Assist, Survive, or Trade',
-  mvps: 'Number of MVP awards per match',
-  score: 'Match score (combines multiple factors)',
-  adr: 'Average Damage per Round',
-};
 
 export default function EloTemplateEditorModal({
   open,
@@ -129,10 +101,11 @@ export default function EloTemplateEditorModal({
           maxAdjustment,
           minAdjustment,
         };
-        const response = await api.put<{ success: boolean; template: EloCalculationTemplate }>(
-          `/api/elo-templates/${template.id}`,
-          input
-        );
+        const response = await api.put<{
+          success: boolean;
+          template: EloCalculationTemplate;
+          error?: string;
+        }>(`/api/elo-templates/${template.id}`, input);
         if (response.success) {
           showSuccess(t('eloTemplatesPage.editor.update.success', { name }));
           onSave();
@@ -149,10 +122,11 @@ export default function EloTemplateEditorModal({
           maxAdjustment,
           minAdjustment,
         };
-        const response = await api.post<{ success: boolean; template: EloCalculationTemplate }>(
-          '/api/elo-templates',
-          input
-        );
+        const response = await api.post<{
+          success: boolean;
+          template: EloCalculationTemplate;
+          error?: string;
+        }>('/api/elo-templates', input);
         if (response.success) {
           showSuccess(t('eloTemplatesPage.editor.create.success', { name }));
           onSave();
@@ -197,7 +171,7 @@ export default function EloTemplateEditorModal({
               : t('eloTemplatesPage.editor.titleCreate')}
           </Typography>
           <IconButton onClick={onClose} size="small">
-            <CloseIcon />
+            <XIcon />
           </IconButton>
         </Box>
       </DialogTitle>
@@ -205,9 +179,7 @@ export default function EloTemplateEditorModal({
       <DialogContent dividers>
         <Stack spacing={3}>
           <Alert severity="info" icon={<InfoIcon />}>
-            <Typography variant="body2">
-              {t('eloTemplatesPage.editor.info')}
-            </Typography>
+            <Typography variant="body2">{t('eloTemplatesPage.editor.info')}</Typography>
           </Alert>
 
           <TextField
@@ -218,9 +190,7 @@ export default function EloTemplateEditorModal({
             required
             disabled={template?.id === 'pure-win-loss'}
             helperText={
-              template?.id === 'pure-win-loss'
-                ? t('eloTemplatesPage.editor.nameDefaultLocked')
-                : ''
+              template?.id === 'pure-win-loss' ? t('eloTemplatesPage.editor.nameDefaultLocked') : ''
             }
           />
 
@@ -234,9 +204,10 @@ export default function EloTemplateEditorModal({
             placeholder={t('eloTemplatesPage.editor.descriptionPlaceholder')}
           />
 
-          <FormControlLabel
-            control={<Switch checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />}
+          <SwitchRow
             label={t('eloTemplatesPage.editor.enabledLabel')}
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
           />
 
           <Divider />
@@ -256,10 +227,10 @@ export default function EloTemplateEditorModal({
                     <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
                       <Box>
                         <Typography variant="body2" fontWeight={600}>
-                          {STAT_LABELS[stat]}
+                          {t(`eloTemplatesPage.stats.${stat}.label`)}
                         </Typography>
                         <Typography variant="caption" color="text.secondary">
-                          {STAT_DESCRIPTIONS[stat]}
+                          {t(`eloTemplatesPage.stats.${stat}.description`)}
                         </Typography>
                       </Box>
                       <Typography
@@ -269,10 +240,17 @@ export default function EloTemplateEditorModal({
                           textAlign: 'right',
                           fontFamily: 'monospace',
                           fontWeight: 600,
-                          color: weights[stat] && weights[stat]! > 0 ? 'success.main' : weights[stat] && weights[stat]! < 0 ? 'error.main' : 'text.secondary',
+                          color:
+                            weights[stat] && weights[stat]! > 0
+                              ? 'success.main'
+                              : weights[stat] && weights[stat]! < 0
+                                ? 'error.main'
+                                : 'text.secondary',
                         }}
                       >
-                        {weights[stat] !== undefined ? (weights[stat]! > 0 ? '+' : '') + weights[stat] : '0'}
+                        {weights[stat] !== undefined
+                          ? (weights[stat]! > 0 ? '+' : '') + weights[stat]
+                          : '0'}
                       </Typography>
                     </Box>
                     <Slider
@@ -287,7 +265,7 @@ export default function EloTemplateEditorModal({
                         { value: 2, label: '+2' },
                       ]}
                       valueLabelDisplay="auto"
-                      valueLabelFormat={(value) => (value > 0 ? '+' : '') + value.toFixed(1)}
+                      valueLabelFormat={(value) => (value > 0 ? '+' : '') + fmtNum(value, 1)}
                       disabled={template?.id === 'pure-win-loss'}
                     />
                   </Box>
@@ -371,11 +349,10 @@ export default function EloTemplateEditorModal({
           {saving
             ? t('eloTemplatesPage.editor.buttons.saving')
             : template
-            ? t('eloTemplatesPage.editor.buttons.update')
-            : t('eloTemplatesPage.editor.buttons.create')}
+              ? t('eloTemplatesPage.editor.buttons.update')
+              : t('eloTemplatesPage.editor.buttons.create')}
         </Button>
       </DialogActions>
     </Dialog>
   );
 }
-

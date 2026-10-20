@@ -10,14 +10,17 @@ import {
   Stack,
   Divider,
 } from '@mui/material';
-import InfoIcon from '@mui/icons-material/Info';
-import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
-import ExpandLessIcon from '@mui/icons-material/ExpandLess';
-import ScheduleIcon from '@mui/icons-material/Schedule';
-import GroupsIcon from '@mui/icons-material/Groups';
-import SportsEsportsIcon from '@mui/icons-material/SportsEsports';
-import CheckCircleIcon from '@mui/icons-material/CheckCircle';
-import { getStatusColor, getStatusLabel, getStatusExplanation } from '../../utils/matchUtils';
+import {
+  CaretDownIcon,
+  CaretUpIcon,
+  CheckCircleIcon,
+  ClockIcon,
+  GameControllerIcon,
+  InfoIcon,
+  UsersThreeIcon,
+} from '@phosphor-icons/react';
+import { getStatusColor, getStatusLabel } from '../../utils/matchUtils';
+import { useTranslation } from 'react-i18next';
 
 interface StatusInfo {
   status: string;
@@ -26,48 +29,49 @@ interface StatusInfo {
   icon: React.ReactNode;
 }
 
-const statusInfo: StatusInfo[] = [
-  {
-    status: 'pending',
-    label: getStatusLabel('pending'),
-    explanation: getStatusExplanation('pending'),
-    icon: <ScheduleIcon />,
-  },
-  {
-    status: 'loaded',
-    label: getStatusLabel('loaded'),
-    explanation: getStatusExplanation('loaded'),
-    icon: <GroupsIcon />,
-  },
-  {
-    status: 'live',
-    label: getStatusLabel('live'),
-    explanation: getStatusExplanation('live'),
-    icon: <SportsEsportsIcon />,
-  },
-  {
-    status: 'completed',
-    label: getStatusLabel('completed'),
-    explanation: getStatusExplanation('completed'),
-    icon: <CheckCircleIcon />,
-  },
-];
-
 export const StatusLegend: React.FC = () => {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+
+  const statusInfo: StatusInfo[] = [
+    {
+      status: 'pending',
+      label: getStatusLabel('pending'),
+      explanation: t('matchesPage.statusGuide.pending'),
+      icon: <ClockIcon />,
+    },
+    {
+      status: 'loaded',
+      label: getStatusLabel('loaded'),
+      explanation: t('matchesPage.statusGuide.loaded'),
+      icon: <UsersThreeIcon />,
+    },
+    {
+      status: 'live',
+      label: getStatusLabel('live'),
+      explanation: t('matchesPage.statusGuide.live'),
+      icon: <GameControllerIcon />,
+    },
+    {
+      status: 'completed',
+      label: getStatusLabel('completed'),
+      explanation: t('matchesPage.statusGuide.completed'),
+      icon: <CheckCircleIcon />,
+    },
+  ];
 
   return (
     <Card variant="outlined" sx={{ bgcolor: 'background.paper' }}>
       <CardContent>
         <Box display="flex" alignItems="center" justifyContent="space-between">
           <Box display="flex" alignItems="center" gap={1}>
-            <InfoIcon color="primary" />
+            <Box component={InfoIcon} sx={{ color: 'primary.main' }} />
             <Typography variant="subtitle1" fontWeight={600}>
-              Match Status Guide
+              {t('matchesPage.statusGuide.title')}
             </Typography>
           </Box>
           <IconButton size="small" onClick={() => setExpanded(!expanded)}>
-            {expanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+            {expanded ? <CaretUpIcon /> : <CaretDownIcon />}
           </IconButton>
         </Box>
 
@@ -96,12 +100,10 @@ export const StatusLegend: React.FC = () => {
 
           <Box mt={3} p={2} bgcolor="info.dark" borderRadius={1}>
             <Typography variant="caption" color="info.contrastText" fontWeight={600}>
-              💡 Pro Tip:
+              💡 {t('matchesPage.statusGuide.proTipTitle')}
             </Typography>
             <Typography variant="caption" display="block" color="info.contrastText" mt={0.5}>
-              When a match shows "Waiting for players (X/Y)", the server is ready and players should
-              connect. Once all expected players connect and ready up, the match will automatically
-              start.
+              {t('matchesPage.statusGuide.proTip')}
             </Typography>
           </Box>
         </Collapse>

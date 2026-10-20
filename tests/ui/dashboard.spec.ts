@@ -2,8 +2,11 @@ import { test, expect } from '@playwright/test';
 import { ensureSignedIn } from '../helpers/auth';
 
 /**
- * Dashboard UI tests
- * Tests dashboard page functionality
+ * Admin home ("/") smoke test.
+ *
+ * Replaced by the admin home page (see `admin-home.spec.ts` for the richer
+ * Tournaments/Site-grid coverage); this file keeps the basic "loads and has
+ * a title" check under its original name/testid.
  *
  * @tag ui
  * @tag dashboard
@@ -16,21 +19,21 @@ test.describe.serial('Dashboard Page', () => {
     await ensureSignedIn(page);
   });
 
-  test.skip(
-    'should display dashboard',
+  test(
+    'should display admin home',
     {
       tag: ['@ui', '@dashboard'],
     },
     async ({ page }) => {
-      await page.goto('/');
-      await expect(page).toHaveTitle(/Dashboard/i);
+      await page.goto('/manage');
+      await expect(page).toHaveTitle(/ · Auto Tournament$/);
 
-      // Wait for page to load and verify we're on the dashboard
+      // Wait for page to load and verify we're on the admin home page
       await page.waitForLoadState('networkidle');
       expect(page.url()).toContain('/');
 
-      // Verify dashboard page loaded
-      await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: 5000 });
+      // Verify the page loaded
+      await expect(page.getByTestId('dashboard-page')).toBeVisible({ timeout: 15000 });
     }
   );
 });

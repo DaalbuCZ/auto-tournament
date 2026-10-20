@@ -3,6 +3,7 @@
  * Creates balanced teams of players based on their ELO/OpenSkill ratings
  */
 
+import { getGameRatings } from './gameRatings';
 import { ordinal } from 'openskill';
 import { eloToOpenSkill } from './ratingService';
 import { playerService, type PlayerRecord } from './playerService';
@@ -34,10 +35,34 @@ export interface TeamBalanceResult {
  * @param useOptimization - Whether to apply optimization step (default: true)
  * @returns Balanced teams
  */
+/** The players, with their rating fields set to their rating in `game`. */
+async function playersInGame(
+  playerIds: string[],
+  game: string | null | undefined
+): Promise<PlayerRecord[]> {
+  const ratings = await getGameRatings(playerIds, game);
+  return (await playerService.getPlayersByIds(playerIds)).map((p) => {
+    const r = ratings.get(p.id);
+    return r
+      ? {
+          ...p,
+          current_elo: r.elo,
+          openskill_mu: r.mu,
+          openskill_sigma: r.sigma,
+          match_count: r.matchCount,
+        }
+      : p;
+  });
+}
+
 export async function balanceTeams(
   playerIds: string[],
   teamSize: number = 5,
-  useOptimization: boolean = true
+  useOptimization: boolean = true,
+  /** The tournament's game: players are balanced on their rating in it. */
+  game?: string | null,
+  /** This many teams instead of full ones only (bot fill: short teams get bots). */
+  teamCount?: number
 ): Promise<TeamBalanceResult> {
   if (playerIds.length === 0) {
     throw new Error('No players provided for team balancing');
@@ -48,18 +73,20 @@ export async function balanceTeams(
   }
 
   // Fetch all players
-  const players = await playerService.getPlayersByIds(playerIds);
+  const players = await playersInGame(playerIds, game);
   if (players.length !== playerIds.length) {
     const missing = playerIds.filter((id) => !players.find((p) => p.id === id));
     throw new Error(`Some players not found: ${missing.join(', ')}`);
   }
 
   // Calculate number of teams
-  const numTeams = Math.floor(players.length / teamSize);
-  const remainingPlayers = players.length % teamSize;
+  const numTeams = teamCount ?? Math.floor(players.length / teamSize);
+  const remainingPlayers = Math.max(0, players.length - numTeams * teamSize);
 
   if (remainingPlayers > 0) {
-    log.warn(`Odd number of players: ${players.length}. ${remainingPlayers} player(s) will sit out.`);
+    log.warn(
+      `Odd number of players: ${players.length}. ${remainingPlayers} player(s) will sit out.`
+    );
   }
 
   // Initial assignment using greedy algorithm
@@ -175,8 +202,7 @@ function greedyTeamAssignment(
       for (const team of teams) {
         if (team.players.length >= teamSize) continue;
 
-        const currentAvg =
-          team.players.length > 0 ? team.totalOrdinal / team.players.length : 0;
+        const currentAvg = team.players.length > 0 ? team.totalOrdinal / team.players.length : 0;
 
         if (currentAvg < minAvgOrdinal) {
           minAvgOrdinal = currentAvg;
@@ -201,8 +227,7 @@ function greedyTeamAssignment(
       for (const team of teams) {
         if (team.players.length >= teamSize) continue;
 
-        const currentAvg =
-          team.players.length > 0 ? team.totalOrdinal / team.players.length : 0;
+        const currentAvg = team.players.length > 0 ? team.totalOrdinal / team.players.length : 0;
 
         if (currentAvg < minAvgOrdinal) {
           minAvgOrdinal = currentAvg;
@@ -226,7 +251,11 @@ function greedyTeamAssignment(
  * Optimization step: Swap players between teams to improve balance
  * Based on Xwoe matchmaking algorithm approach
  */
-function optimizeTeamBalance(teams: BalancedTeam[], _teamSize: number, maxIterations: number = 10): BalancedTeam[] {
+function optimizeTeamBalance(
+  teams: BalancedTeam[],
+  _teamSize: number,
+  maxIterations: number = 10
+): BalancedTeam[] {
   let iterations = 0;
   let improved = true;
 
@@ -253,10 +282,8 @@ function optimizeTeamBalance(teams: BalancedTeam[], _teamSize: number, maxIterat
             const ordinal1 = ordinal(rating1);
             const ordinal2 = ordinal(rating2);
 
-            const newTeam1Avg =
-              (team1.totalOrdinal - ordinal1 + ordinal2) / team1.players.length;
-            const newTeam2Avg =
-              (team2.totalOrdinal - ordinal2 + ordinal1) / team2.players.length;
+            const newTeam1Avg = (team1.totalOrdinal - ordinal1 + ordinal2) / team1.players.length;
+            const newTeam2Avg = (team2.totalOrdinal - ordinal2 + ordinal1) / team2.players.length;
 
             const newAverages = [...averages];
             newAverages[i] = newTeam1Avg;
@@ -347,7 +374,8 @@ function calculateBalanceQuality(teams: BalancedTeam[]): TeamBalanceResult['bala
  */
 export async function balanceTeamsWithOddPlayers(
   playerIds: string[],
-  teamSize: number = 5
+  teamSize: number = 5,
+  game?: string | null
 ): Promise<{
   teams: BalancedTeam[];
   sittingOut: PlayerRecord[];
@@ -357,7 +385,7 @@ export async function balanceTeamsWithOddPlayers(
   const remaining = playerIds.length % teamSize;
 
   if (remaining === 0) {
-    const result = await balanceTeams(playerIds, teamSize);
+    const result = await balanceTeams(playerIds, teamSize, true, game);
     return {
       teams: result.teams,
       sittingOut: [],
@@ -366,7 +394,7 @@ export async function balanceTeamsWithOddPlayers(
   }
 
   // Get all players
-  const players = await playerService.getPlayersByIds(playerIds);
+  const players = await playersInGame(playerIds, game);
 
   // Sort by ELO and select players to sit out (lowest ELO players)
   const playersWithOrdinal = players.map((p) => {
@@ -382,7 +410,7 @@ export async function balanceTeamsWithOddPlayers(
   const playingIds = playersWithOrdinal.slice(remaining).map((p) => p.player.id);
 
   // Balance remaining players
-  const result = await balanceTeams(playingIds, teamSize);
+  const result = await balanceTeams(playingIds, teamSize, true, game);
 
   return {
     teams: result.teams,
@@ -390,4 +418,3 @@ export async function balanceTeamsWithOddPlayers(
     balanceQuality: result.balanceQuality,
   };
 }
-

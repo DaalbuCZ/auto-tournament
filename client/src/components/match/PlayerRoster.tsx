@@ -1,22 +1,29 @@
 import React from 'react';
 import { Box, Typography, Grid, Paper, Chip, Stack, IconButton, Tooltip } from '@mui/material';
-import CheckCircleIcon from '@mui/icons-material/CheckCircle';
-import CircleIcon from '@mui/icons-material/Circle';
-import PersonOffIcon from '@mui/icons-material/PersonOff';
-import OpenInNewIcon from '@mui/icons-material/OpenInNew';
+import {
+  ArrowSquareOutIcon,
+  CheckCircleIcon,
+  CircleIcon,
+  UserMinusIcon,
+} from '@phosphor-icons/react';
 import type { ConnectedPlayer } from '../../hooks/usePlayerConnections';
 import { normalizeConfigPlayers, type NormalizedPlayer } from '../../utils/playerUtils';
 import { getPlayerPageUrl } from '../../utils/playerLinks';
 import { PlayerAvatar } from '../player/PlayerAvatar';
+import { useTranslation } from 'react-i18next';
 import { PlayerName } from '../player/PlayerName';
+import { radii } from '../../theme/tokens';
+import type { Untrusted } from '../../utils/untrusted';
 
 interface PlayerRosterProps {
   team1Name: string;
   team2Name: string;
-  team1Players: unknown;
-  team2Players: unknown;
+  team1Players: Untrusted;
+  team2Players: Untrusted;
   connectedPlayers: ConnectedPlayer[];
   isTeam1?: boolean; // If viewing from team perspective
+  /** A simulated match: bots play, so nobody is "offline". */
+  simulation?: boolean;
 }
 
 export const PlayerRoster: React.FC<PlayerRosterProps> = ({
@@ -24,9 +31,11 @@ export const PlayerRoster: React.FC<PlayerRosterProps> = ({
   team2Name,
   team1Players: team1PlayersRaw,
   team2Players: team2PlayersRaw,
+  simulation = false,
   connectedPlayers,
   isTeam1,
 }) => {
+  const { t } = useTranslation();
   const team1Players = normalizeConfigPlayers(team1PlayersRaw);
   const team2Players = normalizeConfigPlayers(team2PlayersRaw);
 
@@ -47,10 +56,12 @@ export const PlayerRoster: React.FC<PlayerRosterProps> = ({
     return (
       <Paper variant="outlined" sx={{ p: 2 }}>
         <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-          <Typography variant="h6" fontWeight={600}>
+          <Typography variant="h6" fontWeight={600} color={`${teamColor}.main`}>
             {teamName}
           </Typography>
-          {isYourTeam && <Chip label="Your Team" color="primary" size="small" />}
+          {isYourTeam && (
+            <Chip label={t('matchDetailsModal.roster.yourTeam')} color="primary" size="small" />
+          )}
         </Box>
 
         <Stack spacing={1}>
@@ -62,18 +73,18 @@ export const PlayerRoster: React.FC<PlayerRosterProps> = ({
                 key={player.steamid}
                 sx={{
                   p: 1.5,
-                  borderRadius: 1,
+                  borderRadius: radii.sm,
                   bgcolor: status.isReady
                     ? 'success.dark'
                     : status.isConnected
-                    ? 'action.hover'
-                    : 'action.disabledBackground',
+                      ? 'action.hover'
+                      : 'action.disabledBackground',
                   border: 1,
                   borderColor: status.isReady
                     ? 'success.main'
                     : status.isConnected
-                    ? 'divider'
-                    : 'action.disabled',
+                      ? 'divider'
+                      : 'action.disabled',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 1.5,
@@ -82,11 +93,16 @@ export const PlayerRoster: React.FC<PlayerRosterProps> = ({
               >
                 {/* Status Icon */}
                 {status.isReady ? (
-                  <CheckCircleIcon sx={{ color: 'success.light', fontSize: 20 }} />
+                  <Box component={CheckCircleIcon} size={20} sx={{ color: 'success.light' }} />
                 ) : status.isConnected ? (
-                  <CircleIcon sx={{ color: 'warning.main', fontSize: 20 }} />
+                  <Box
+                    component={CircleIcon}
+                    weight="fill"
+                    size={20}
+                    sx={{ color: 'warning.main' }}
+                  />
                 ) : (
-                  <PersonOffIcon sx={{ color: 'action.disabled', fontSize: 20 }} />
+                  <Box component={UserMinusIcon} size={20} sx={{ color: 'action.disabled' }} />
                 )}
 
                 {/* Avatar */}
@@ -108,14 +124,14 @@ export const PlayerRoster: React.FC<PlayerRosterProps> = ({
                     color: status.isReady
                       ? 'success.contrastText'
                       : status.isConnected
-                      ? 'primary.main'
-                      : 'text.disabled',
+                        ? 'primary.main'
+                        : 'text.disabled',
                     fontWeight: status.isConnected ? 600 : 400,
                   }}
                 />
 
                 {/* Explicit player page action */}
-                <Tooltip title="Open player page">
+                <Tooltip title={t('matchDetailsModal.roster.openPlayerPage')}>
                   <IconButton
                     size="small"
                     component="a"
@@ -129,14 +145,14 @@ export const PlayerRoster: React.FC<PlayerRosterProps> = ({
                           : 'text.secondary',
                     }}
                   >
-                    <OpenInNewIcon fontSize="small" />
+                    <ArrowSquareOutIcon size={20} />
                   </IconButton>
                 </Tooltip>
 
                 {/* Status Badge */}
                 {status.isReady ? (
                   <Chip
-                    label="READY"
+                    label={t('matchDetailsModal.roster.ready')}
                     size="small"
                     sx={{
                       bgcolor: 'success.light',
@@ -147,14 +163,26 @@ export const PlayerRoster: React.FC<PlayerRosterProps> = ({
                   />
                 ) : status.isConnected ? (
                   <Chip
-                    label="CONNECTED"
+                    label={t('matchDetailsModal.roster.connected')}
                     size="small"
                     color="warning"
                     sx={{ fontWeight: 600, fontSize: '0.7rem' }}
                   />
+                ) : simulation ? (
+                  <Chip
+                    label={t('matchDetailsModal.roster.bot')}
+                    size="small"
+                    data-testid="roster-bot"
+                    sx={{
+                      bgcolor: 'action.selected',
+                      color: 'text.secondary',
+                      fontWeight: 600,
+                      fontSize: '0.7rem',
+                    }}
+                  />
                 ) : (
                   <Chip
-                    label="OFFLINE"
+                    label={t('matchDetailsModal.roster.offline')}
                     size="small"
                     sx={{
                       bgcolor: 'action.disabled',

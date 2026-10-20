@@ -8,6 +8,52 @@
  * All API calls should use '/api' prefix (e.g., '/api/servers', '/api/teams')
  */
 
+/**
+ * Which tournament requests are about (the API's `X-Tournament-Id`): the one
+ * the admin picked in the rail, kept across reloads, except on a tournament's
+ * own page, which is about the tournament in its URL.
+ * Without either the API answers for the featured tournament.
+ */
+import type { Untrusted } from './untrusted';
+const ADMIN_SCOPE_KEY = 'at:adminTournamentId';
+function readStoredScope(): number | null {
+  try {
+    const id = Number(window.localStorage.getItem(ADMIN_SCOPE_KEY));
+    return Number.isInteger(id) && id > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+let adminScope: number | null = typeof window === 'undefined' ? null : readStoredScope();
+
+export function getAdminTournamentScope(): number | null {
+  return adminScope;
+}
+
+export function setAdminTournamentScope(id: number | null): void {
+  adminScope = id;
+  try {
+    if (id === null) window.localStorage.removeItem(ADMIN_SCOPE_KEY);
+    else window.localStorage.setItem(ADMIN_SCOPE_KEY, String(id));
+  } catch {
+    // Storage blocked: the pick lasts until the page reloads.
+  }
+}
+
+/** On a tournament's own page (`/tournament/<id>/...`), that tournament. */
+function pageScope(): number | null {
+  if (typeof window === 'undefined') return null;
+  const m = /^\/tournament\/(\d+)(?:\/|$)/.exec(window.location.pathname);
+  return m ? Number(m[1]) : null;
+}
+
+function tournamentScope(): number | null {
+  return pageScope() ?? adminScope;
+}
+
+/** Fired when the API answers `license_expired` (api/src/middleware/licenseExpired.ts); components/license/LicenseGate.tsx shows the page. */
+export const LICENSE_EXPIRED_EVENT = 'at:license-expired';
+
 export const api = {
   /**
    * Make an authenticated API request
@@ -25,13 +71,28 @@ export const api = {
       ...rest,
       headers: {
         'Content-Type': 'application/json',
+        ...(tournamentScope() ? { 'X-Tournament-Id': String(tournamentScope()) } : {}),
         ...(headers || {}),
       },
     });
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(error || `API request failed: ${response.status}`);
+      if (response.status === 503 && error.includes('"license_expired"')) {
+        let reason: string | null = null;
+        try {
+          reason = (JSON.parse(error) as { reason?: string | null }).reason ?? null;
+        } catch {
+          reason = null;
+        }
+        window.dispatchEvent(new CustomEvent(LICENSE_EXPIRED_EVENT, { detail: { reason } }));
+      }
+      // Proxies (Cloudflare, Caddy) answer 502/504 with an HTML page; showing
+      // that raw leaves an empty or unreadable toast.
+      const readable = error && !/^\s*</.test(error) ? error : '';
+      throw new Error(
+        readable || `API request failed: ${response.status} ${response.statusText}`.trim()
+      );
     }
 
     return response.json();
@@ -40,14 +101,14 @@ export const api = {
   /**
    * GET request
    */
-  async get<T = unknown>(endpoint: string): Promise<T> {
+  async get<T = Untrusted>(endpoint: string): Promise<T> {
     return this.fetch(endpoint, { method: 'GET' });
   },
 
   /**
    * POST request
    */
-  async post<T = unknown>(endpoint: string, data?: unknown): Promise<T> {
+  async post<T = Untrusted>(endpoint: string, data?: object): Promise<T> {
     return this.fetch(endpoint, {
       method: 'POST',
       body: data ? JSON.stringify(data) : undefined,
@@ -57,7 +118,7 @@ export const api = {
   /**
    * PUT request
    */
-  async put<T = unknown>(endpoint: string, data?: unknown): Promise<T> {
+  async put<T = Untrusted>(endpoint: string, data?: object): Promise<T> {
     return this.fetch(endpoint, {
       method: 'PUT',
       body: data ? JSON.stringify(data) : undefined,
@@ -67,7 +128,7 @@ export const api = {
   /**
    * PATCH request
    */
-  async patch<T = unknown>(endpoint: string, data?: unknown): Promise<T> {
+  async patch<T = Untrusted>(endpoint: string, data?: object): Promise<T> {
     return this.fetch(endpoint, {
       method: 'PATCH',
       body: data ? JSON.stringify(data) : undefined,
@@ -80,5 +141,21 @@ export const api = {
   async delete(endpoint: string) {
     return this.fetch(endpoint, { method: 'DELETE' });
   },
-
 };
+
+/**
+ * The API answers validation failures with `{ error: string }`, and `api.fetch`
+ * throws the raw body as the message. Pull the readable part out.
+ */
+export function apiErrorMessage(err: unknown, fallback: string): string {
+  const raw = err instanceof Error ? err.message : '';
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw) as { error?: Untrusted; message?: Untrusted };
+    if (typeof parsed.error === 'string' && parsed.error) return parsed.error;
+    if (typeof parsed.message === 'string' && parsed.message) return parsed.message;
+  } catch {
+    // Not JSON: use the text as-is.
+  }
+  return raw;
+}

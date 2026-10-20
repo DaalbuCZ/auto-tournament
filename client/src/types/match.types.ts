@@ -2,14 +2,19 @@
  * Match-related types
  */
 
-import type { Team, MatchMapResult } from './team.types';
+import type { Team, MatchMapResult, MatchLiveStats } from './team.types';
 import type { MatchPhase } from './matchPhase.types';
+import type { Untrusted } from '../utils/untrusted';
 
 export interface Match {
   id: number;
   slug: string;
+  /** Game integration that owns it (API `game`, 'cs2' today). */
+  game?: string;
   round: number;
   matchNumber: number;
+  /** 'WB' | 'LB' | 'GF' | 'GF_RESET' | 'SE' | null (bracket matches only). */
+  bracket?: string | null;
   nextMatchId?: number | null;
   status: 'pending' | 'ready' | 'loaded' | 'live' | 'completed' | 'cancelled';
   team1?: Team;
@@ -20,12 +25,24 @@ export interface Match {
   createdAt?: number;
   loadedAt?: number;
   completedAt?: number;
+  /** Headline score: maps won when completed, current map rounds while in progress. */
   team1Score?: number;
   team2Score?: number;
+  /** Maps won in the series. */
+  team1SeriesScore?: number;
+  team2SeriesScore?: number;
+  /** Rounds on the map being played (null when not in progress, 0-0 during warmup). */
+  team1MapScore?: number | null;
+  team2MapScore?: number | null;
   team1Players?: PlayerStats[];
   team2Players?: PlayerStats[];
   matchPhase?: MatchPhase; // warmup, knife, veto, live, post_match
   currentMap?: string | null; // Current map being played (e.g., de_mirage)
+  /** Both teams are in and it waits on its map veto (public bracket). */
+  vetoing?: boolean;
+  /** Its start time and when its veto opens (unix s; Manage › Schedule), when it has one. */
+  startsAt?: number | null;
+  vetoOpensAt?: number | null;
   mapNumber?: number | null; // Current map number in series (0-indexed)
   demoFilePath?: string;
   config?: MatchConfig;
@@ -33,11 +50,18 @@ export interface Match {
   mapResults?: MatchMapResult[];
   maps?: string[];
   queuePosition?: number | null; // Position in allocation queue (1 = first in queue, null = already allocated)
+  /**
+   * Live scoreboard for an in-progress match, attached by the API from
+   * matchLiveStatsService. Absent once the match is over.
+   */
+  liveStats?: MatchLiveStats | null;
 }
 
 export interface MatchConfigPlayer {
   steamid: string;
   name: string;
+  /** Filled in by the API from the team roster where one is known. */
+  avatar?: string;
 }
 
 export interface MatchConfigTeam {
@@ -53,7 +77,7 @@ export interface MatchConfig {
   num_maps?: number;
   players_per_team?: number;
   /**
-   * Per-map starting sides for MatchZy.
+   * Per-map starting sides for MatchZy Enhanced.
    * Values are plugin-facing tokens:
    * - 'team1_ct'  -> Team 1 starts CT on that map
    * - 'team2_ct'  -> Team 2 starts CT on that map
@@ -63,6 +87,8 @@ export interface MatchConfig {
   expected_players_total?: number;
   expected_players_team1?: number;
   expected_players_team2?: number;
+  /** Bots take the empty seats (cs2 fillTeamsWithBots): nobody else is waited for. */
+  bot_fill?: boolean;
   team1?: MatchConfigTeam;
   team2?: MatchConfigTeam;
   cvars?: {
@@ -74,20 +100,29 @@ export interface MatchConfig {
    */
   vetoDisabled?: boolean;
   /**
-   * MatchZy simulation mode flag.
+   * MatchZy Enhanced simulation mode flag.
    * When true, the plugin runs the match in simulation mode (bots instead of human players).
    */
   simulation?: boolean;
   /**
-   * Optional simulation speed multiplier for MatchZy.
+   * Optional simulation speed multiplier for MatchZy Enhanced.
    * When provided alongside simulation: true, controls how fast the simulated match runs.
    */
   simulation_timescale?: number;
+  /**
+   * Round-limit metadata the config builder writes alongside the cvars, so
+   * consumers do not have to parse `cvars.mp_maxrounds` back out.
+   */
+  maxRounds?: number;
+  overtimeMode?: 'enabled' | 'disabled';
+  overtimeSegments?: number;
 }
 
 export interface PlayerStats {
   name: string;
   steamId: string;
+  /** Filled in by the API from the team roster where one is known. */
+  avatar?: string;
   kills: number;
   deaths: number;
   assists: number;
@@ -103,7 +138,7 @@ export interface MatchEvent {
     params?: {
       team1_score?: number;
       team2_score?: number;
-      [key: string]: unknown;
+      [key: string]: Untrusted;
     };
   };
 }

@@ -15,6 +15,10 @@ export interface DbMatchRow {
   server_id?: string;
   status: 'pending' | 'ready' | 'live' | 'completed';
   config?: string;
+  /** Game integration that owns the match (integrations/registry); 'cs2' by default. */
+  game?: string;
+  /** 'matchmaking' for a matchmaking match; null for tournament and manual matches. */
+  source?: string | null;
   next_match_id?: number;
   team1_from_match_id?: number | null;
   team1_from_outcome?: 'winner' | 'loser' | null | string;
@@ -25,6 +29,10 @@ export interface DbMatchRow {
   created_at?: number;
   loaded_at?: number;
   completed_at?: number;
+  /** An admin's hold (services/matchHolds.ts). */
+  held_until?: number | null;
+  hold_reason?: string | null;
+  countdown_from?: number | null;
   current_map?: string | null;
   map_number?: number | null;
   team1_name?: string | null;
@@ -44,19 +52,23 @@ export interface DbTournamentRow {
   format: string;
   status: string;
   team_ids: string;
-  maps: string;
   created_at: number;
   updated_at?: number;
   started_at?: number;
   completed_at?: number;
   settings?: string;
-  // Shuffle / global round-limit fields
-  map_sequence?: string | null;
+  /** Game integration for the tournament's matches; 'cs2' by default. */
+  game?: string;
   team_size?: number | null;
-  max_rounds?: number | null;
-  overtime_mode?: string | null;
-  overtime_segments?: number | null;
   elo_template_id?: string | null;
+  /** When the banner in `tournament_banner` was last set; null without one. */
+  banner_updated_at?: number | null;
+  /** When a new tournament replaced it (it keeps its matches and results); null for the current one. */
+  archived_at?: number | null;
+  /** An admin paused the bracket (services/matchHolds.ts). */
+  paused_at?: number | null;
+  pause_reason?: string | null;
+  resume_at?: number | null;
 }
 
 export interface DbEventRow {

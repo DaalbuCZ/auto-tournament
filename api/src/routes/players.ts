@@ -1,37 +1,132 @@
+import { logoUrl } from '../services/teamSelfService';
+import { randomBytes } from 'crypto';
+import type { SqlValue } from '../config/database';
+import type { Untrusted } from '../utils/untrusted';
 /**
  * Players API Routes
  * Handles player CRUD operations and bulk import
  */
 
-import { Router, Request, Response } from 'express';
+import type { Request, Response } from 'express';
+import { Router } from 'express';
 import {
   playerService,
+  InvalidDiscordIdError,
+  PlayerExistsError,
   type CreatePlayerInput,
   type UpdatePlayerInput,
 } from '../services/playerService';
+import { abbreviateId, isValidDiscordId, parseDiscordIdEdit } from '../utils/discordId';
 import { getRatingHistory } from '../services/ratingService';
 import { steamService } from '../services/steamService';
-import { requireAuth } from '../middleware/auth';
+import { requireAuth, requireIntegratorAuth, requestActorId } from '../middleware/auth';
+import { bulkRemovesEveryAdmin, removesLastAdmin } from '../utils/adminRules';
 import { log } from '../utils/logger';
 import { db } from '../config/database';
-import { serverStatusService } from '../services/serverStatusService';
 import { playerConnectionService } from '../services/playerConnectionService';
-import { normalizeConfigPlayers, type NormalizedServerPlayer } from '../utils/playerTransform';
+import type { NormalizedServerPlayer } from '../utils/playerTransform';
 import { teamService } from '../services/teamService';
+import { teamMembers } from '../services/teamMembers';
 import { matchLiveStatsService } from '../services/matchLiveStatsService';
-import type { DbMatchRow, DbTournamentRow } from '../types/database.types';
+import type { DbMatchRow } from '../types/database.types';
 import { getMapResults } from '../services/matchMapResultService';
-import { generateMatchConfig } from '../services/matchConfigBuilder';
-import type { TournamentResponse } from '../types/tournament.types';
-import type { MatchConfig } from '../types/match.types';
+import { currentMatchConfig, describeMatch, describedPlayers } from '../utils/matchIntegration';
 import { generateAvatarSvg } from '../generation/avatar';
-import { getVerifiedPlayerSteamId } from '../utils/signedPlayerCookie';
+import { getEffectiveViewerSteamId, resolveViewerIdentity } from '../utils/viewerIdentity';
+import { getIntegration, integrationForMatch } from '../integrations/registry';
+import { DEFAULT_GAME } from '../integrations/types';
+
+import {
+  banPlayer,
+  deletePlayer,
+  ModerationError,
+  moderationOf,
+  unbanPlayer,
+} from '../services/playerModeration';
+import type { Actor } from '../services/matchHolds';
+import { PresetAccountError, presetAccounts } from '../services/gameAccounts';
+import { CURRENT_MATCH_ORDER, CURRENT_MATCH_TOURNAMENT_JOIN } from '../utils/currentMatchOrder';
+
+function actorOf(req: Request): Actor {
+  const id = requestActorId(req) ?? 'admin';
+  return { userId: id, name: id };
+}
 
 const router = Router();
+
+/**
+ * Deleted and banned players: their public pages show only who they are.
+ * GET /:playerId and /summary answer a stub ({ id, name, avatar, deleted |
+ * banned, restricted }); their matches, rating history, team and current
+ * match answer 404 with `restricted`. Admin routes (writes, the admin list)
+ * are not affected.
+ */
+const RESTRICTED_SUBPATHS = new Set([
+  '',
+  'summary',
+  'team',
+  'current-match',
+  'rating-history',
+  'matches',
+]);
+router.param('playerId', async (req: Request, res: Response, next, playerId: string) => {
+  if (req.method !== 'GET') return next();
+  const sub = req.path.split('/').filter(Boolean).slice(1).join('/');
+  if (!RESTRICTED_SUBPATHS.has(sub)) return next();
+  try {
+    const state = await moderationOf(playerId);
+    if (!state.deleted && !state.banned) return next();
+    const player = await playerService.getPlayerById(playerId);
+    if (!player) return next();
+    const stub = {
+      id: player.id,
+      name: player.name,
+      avatar: `/api/players/${encodeURIComponent(player.id)}/avatar.svg`,
+      ...(state.deleted ? { deleted: true } : { banned: true }),
+      restricted: true,
+    };
+    if (sub === '' || sub === 'summary')
+      return res.json({ success: true, player: stub, restricted: true });
+    return res
+      .status(404)
+      .json({ success: false, error: 'Not shown for this player', restricted: true });
+  } catch {
+    return next();
+  }
+});
 
 // ============================================================================
 // PUBLIC ROUTES (no authentication required)
 // ============================================================================
+
+/**
+ * @openapi
+ * /api/players/presence:
+ *   get:
+ *     tags: [Players]
+ *     summary: What players are doing now (online, away, searching, playing)
+ *     description: For player names anywhere on the site. Up to 100 ids, comma-separated.
+ *     parameters:
+ *       - { in: query, name: ids, required: true, schema: { type: string } }
+ *     responses:
+ *       200: { description: "`presence`: { [playerId]: { online, status, activity } }; `status` is online, away or offline. Live changes: socket event `presence:update` { playerId, status } after `presence:subscribe`." }
+ *       400: { description: No ids }
+ */
+router.get('/presence', async (req: Request, res: Response) => {
+  try {
+    const ids = String(req.query.ids ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => /^[A-Za-z0-9_:.-]{1,64}$/.test(s));
+    if (ids.length === 0) return res.status(400).json({ success: false, error: 'ids is required' });
+    const { presenceOf } = await import('../services/presenceService');
+    const presence = Object.fromEntries(await presenceOf(ids));
+    return res.json({ success: true, presence });
+  } catch (error) {
+    log.error('Failed to read presence', error as Error);
+    return res.status(500).json({ success: false, error: 'Failed to read presence' });
+  }
+});
 
 /**
  * GET /api/players/find
@@ -158,6 +253,16 @@ router.get('/find', async (req: Request, res: Response) => {
 router.get('/public-selection', async (_req: Request, res: Response) => {
   try {
     const players = await playerService.getAllPlayers();
+    // Each player's teams (by the teams' rosters), for the Players directory.
+    const teamsOf = new Map<string, Array<{ id: string; name: string }>>();
+    const teams = await db.queryAsync<{ id: string; name: string; players: string | null }>(
+      'SELECT id, name, players FROM teams'
+    );
+    for (const team of teams) {
+      for (const steamId of new Set((team.players ?? '').match(/\d{15,20}/g) ?? [])) {
+        teamsOf.set(steamId, [...(teamsOf.get(steamId) ?? []), { id: team.id, name: team.name }]);
+      }
+    }
 
     // Return only the fields needed for public selection/autocomplete
     const simplifiedPlayers = players.map((p) => ({
@@ -165,7 +270,11 @@ router.get('/public-selection', async (_req: Request, res: Response) => {
       name: p.name,
       avatar: p.avatar,
       currentElo: p.currentElo,
+      // For the public Players page (sort by matches / newest).
+      matchCount: p.matchCount,
+      createdAt: p.createdAt,
       isAdmin: p.isAdmin,
+      teams: teamsOf.get(p.id) ?? [],
     }));
 
     return res.json({
@@ -232,8 +341,9 @@ router.get('/selection', requireAuth, async (req: Request, res: Response) => {
  * GET /api/players/:playerId/team
  * Resolve the team a player belongs to (public).
  *
- * Used by the public player page to show "My Team" even when the player has no
- * current/upcoming match.
+ * Used by the public player page's team chip ("Nordlys · captain") even when
+ * the player has no current/upcoming match. `role` is the player's role in it,
+ * or null when `team_members` has no row for them.
  */
 router.get('/:playerId/team', async (req: Request, res: Response) => {
   try {
@@ -270,7 +380,7 @@ router.get('/:playerId/team', async (req: Request, res: Response) => {
       playersJson: string
     ): Array<{ steamId: string; name: string; avatar?: string }> => {
       try {
-        const parsed = JSON.parse(playersJson) as unknown;
+        const parsed = JSON.parse(playersJson) as Untrusted;
         if (!parsed) return [];
 
         // Canonical format: Player[]
@@ -278,7 +388,7 @@ router.get('/:playerId/team', async (req: Request, res: Response) => {
           return parsed
             .map((p) => {
               if (!p || typeof p !== 'object') return null;
-              const anyP = p as { steamId?: unknown; name?: unknown; avatar?: unknown };
+              const anyP = p as { steamId?: Untrusted; name?: Untrusted; avatar?: Untrusted };
               if (typeof anyP.steamId !== 'string' || typeof anyP.name !== 'string') return null;
               const base: { steamId: string; name: string; avatar?: string } = {
                 steamId: anyP.steamId,
@@ -296,7 +406,7 @@ router.get('/:playerId/team', async (req: Request, res: Response) => {
         // - Object map { idx: { steamId, name, avatar? } }
         // - Object map { steamId: name }
         if (typeof parsed === 'object') {
-          const record = parsed as Record<string, unknown>;
+          const record = parsed as Record<string, Untrusted>;
 
           // Old: { steamId: name }
           const fromEntries = Object.entries(record)
@@ -313,7 +423,7 @@ router.get('/:playerId/team', async (req: Request, res: Response) => {
           return Object.values(record)
             .map((v) => {
               if (!v || typeof v !== 'object') return null;
-              const anyV = v as { steamId?: unknown; name?: unknown; avatar?: unknown };
+              const anyV = v as { steamId?: Untrusted; name?: Untrusted; avatar?: Untrusted };
               if (typeof anyV.steamId !== 'string' || typeof anyV.name !== 'string') return null;
               const base: { steamId: string; name: string; avatar?: string } = {
                 steamId: anyV.steamId,
@@ -344,6 +454,13 @@ router.get('/:playerId/team', async (req: Request, res: Response) => {
       });
     }
 
+    // The player's role in it (captain or member), for the profile's team chip.
+    const account = await db.queryOneAsync<{ uid: string }>(
+      'SELECT uid FROM players WHERE id = ?',
+      [playerId]
+    );
+    const role = account ? await teamMembers.roleFor(matching.id, String(account.uid)) : null;
+
     return res.json({
       success: true,
       team: {
@@ -351,6 +468,7 @@ router.get('/:playerId/team', async (req: Request, res: Response) => {
         name: matching.name,
         tag: matching.tag ?? undefined,
         players: parsePlayers(matching.players),
+        role,
       },
     });
   } catch (error) {
@@ -364,13 +482,89 @@ router.get('/:playerId/team', async (req: Request, res: Response) => {
 });
 
 /**
+ * Where the signed-in player's match lives, for `/match/now`: a tournament or
+ * hand-made match in its match room (`/match/<slug>`), a matchmaking match in
+ * its lobby. With no match coming up, a tournament they are still in (its
+ * Overview says what is next), else nothing.
+ */
+/**
+ * A match's config names its players as `"<steam id>": "<name>"` in each
+ * team's players; the same id elsewhere in it (`admins`, coaches) is not a
+ * player. The queries below match `"<id>":` only (an admin who runs the site
+ * was sent to a bots' match as "your match").
+ */
+export async function matchNowPath(steamId: string): Promise<string | null> {
+  const like = `%${steamId}%`;
+  const match = await db.queryOneAsync<{
+    slug: string;
+    source: string | null;
+    round: number;
+    tournament_id: number | null;
+    team1_id: string | null;
+    team2_id: string | null;
+    in_team2: boolean;
+  }>(
+    `SELECT m.slug, m.source, m.round, m.tournament_id, m.team1_id, m.team2_id,
+            (t2.players LIKE ? ESCAPE '\\') AS in_team2
+       FROM matches m
+       LEFT JOIN teams t1 ON m.team1_id = t1.id
+       LEFT JOIN teams t2 ON m.team2_id = t2.id
+       ${CURRENT_MATCH_TOURNAMENT_JOIN}
+      WHERE m.status IN ('pending', 'ready', 'loaded', 'live')
+        AND ((t1.players LIKE ? ESCAPE '\\') OR (t2.players LIKE ? ESCAPE '\\') OR (m.config LIKE ('%"' || TRIM(BOTH '%' FROM ?) || '":%')))
+      ORDER BY ${CURRENT_MATCH_ORDER}
+      LIMIT 1`,
+    [like, like, like, like]
+  );
+  if (match) {
+    if (match.source === 'matchmaking') {
+      const lobby = await db.queryOneAsync<{ id: string }>(
+        'SELECT id FROM mm_lobbies WHERE match_slug = ?',
+        [match.slug]
+      );
+      return lobby ? `/play/${lobby.id}` : '/play';
+    }
+    return `/match/${encodeURIComponent(match.slug)}`;
+  }
+  // Between matches of a tournament still running: its Overview shows what comes next.
+  const running = await db.queryOneAsync<{ id: number }>(
+    `SELECT DISTINCT t.id FROM tournament t
+       JOIN matches m ON m.tournament_id = t.id
+       LEFT JOIN teams t1 ON m.team1_id = t1.id
+       LEFT JOIN teams t2 ON m.team2_id = t2.id
+      WHERE t.status = 'in_progress' AND m.round > 0
+        AND ((t1.players LIKE ? ESCAPE '\\') OR (t2.players LIKE ? ESCAPE '\\'))
+      ORDER BY t.id DESC LIMIT 1`,
+    [like, like]
+  );
+  return running ? `/tournament/${running.id}` : null;
+}
+
+/**
+ * GET /api/players/me/match-now
+ * Where `/match/now` sends the signed-in player: `{ path }`, null with no match.
+ */
+router.get('/me/match-now', async (req: Request, res: Response) => {
+  try {
+    const steamId = await getEffectiveViewerSteamId(req);
+    if (!steamId) return res.status(401).json({ success: false, error: 'Sign in first' });
+    return res.json({ success: true, path: await matchNowPath(steamId) });
+  } catch (error) {
+    log.error("Failed to find the player's match for /me/match-now", error as Error);
+    return res.status(500).json({ success: false, error: 'Failed to find your match' });
+  }
+});
+
+/**
  * GET /api/players/me/match-status
  * Lightweight status for the navbar CTA: "YOUR TURN IN VETO", "Match ready", etc.
  * Requires player_steam_id cookie (Steam sign-in). Returns status, matchSlug, and a label key.
  */
 router.get('/me/match-status', async (req: Request, res: Response) => {
   try {
-    const steamId = getVerifiedPlayerSteamId(req.headers.cookie);
+    // Honour admin impersonation so the navbar CTA reflects the player being
+    // impersonated, not the admin doing the impersonating.
+    const steamId = await getEffectiveViewerSteamId(req);
     if (!steamId) {
       return res.json({
         success: true,
@@ -395,7 +589,8 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
     let match = await db.queryOneAsync<
       DbMatchRow & { team1_players?: string | null; team2_players?: string | null }
     >(
-      `SELECT m.id, m.slug, m.status, m.config, m.veto_state, m.team1_id, m.team2_id,
+      `SELECT m.id, m.slug, m.status, m.config, m.veto_state, m.held_until, m.team1_id, m.team2_id,
+              m.round, m.tournament_id,
               t1.players as team1_players, t2.players as team2_players
        FROM matches m
        LEFT JOIN teams t1 ON m.team1_id = t1.id
@@ -404,7 +599,7 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
          AND (
            (t1.players LIKE ? ESCAPE '\\')
            OR (t2.players LIKE ? ESCAPE '\\')
-           OR (m.config LIKE ? ESCAPE '\\')
+           OR (m.config LIKE ('%"' || TRIM(BOTH '%' FROM ?) || '":%'))
          )
        ORDER BY m.loaded_at DESC
        LIMIT 1`,
@@ -415,18 +610,20 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       match = await db.queryOneAsync<
         DbMatchRow & { team1_players?: string | null; team2_players?: string | null }
       >(
-        `SELECT m.id, m.slug, m.status, m.config, m.veto_state, m.team1_id, m.team2_id,
+        `SELECT m.id, m.slug, m.status, m.config, m.veto_state, m.held_until, m.team1_id, m.team2_id,
+                m.round, m.tournament_id,
                 t1.players as team1_players, t2.players as team2_players
          FROM matches m
          LEFT JOIN teams t1 ON m.team1_id = t1.id
          LEFT JOIN teams t2 ON m.team2_id = t2.id
+         ${CURRENT_MATCH_TOURNAMENT_JOIN}
          WHERE m.status IN ('pending', 'ready')
            AND (
              (t1.players LIKE ? ESCAPE '\\')
              OR (t2.players LIKE ? ESCAPE '\\')
-             OR (m.config LIKE ? ESCAPE '\\')
+             OR (m.config LIKE ('%"' || TRIM(BOTH '%' FROM ?) || '":%'))
            )
-         ORDER BY m.round ASC, m.match_number ASC
+         ORDER BY ${CURRENT_MATCH_ORDER}
          LIMIT 1`,
         [likeParam, likeParam, likeParam]
       );
@@ -441,14 +638,14 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       });
     }
 
-    const config = match.config
-      ? (JSON.parse(match.config) as {
-          team1?: { players?: Array<{ steamid: string }> };
-          team2?: { players?: Array<{ steamid: string }> };
-        })
-      : {};
-    const t1 = normalizeConfigPlayers(config.team1?.players ?? []);
-    const t2 = normalizeConfigPlayers(config.team2?.players ?? []);
+    const description = describeMatch(match);
+    // "Team A vs Team B" for the navbar toast; null when the config names no teams.
+    const matchName =
+      description.team1.name && description.team2.name
+        ? `${description.team1.name} vs ${description.team2.name}`
+        : null;
+    const t1 = describedPlayers(description.team1);
+    const t2 = describedPlayers(description.team2);
     const in1 = t1.some((p) => p.steamid === steamId);
     const in2 = t2.some((p) => p.steamid === steamId);
     const team1Json = (match.team1_players ?? '') as string;
@@ -456,6 +653,26 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
     const in1Json = team1Json.includes(steamId);
     const in2Json = team2Json.includes(steamId);
     const isTeam1 = in1 || (in1Json && !in2Json) || (!in2 && !in2Json);
+
+    // Your team against theirs, with logos: the next-match dialog shows the matchup.
+    const logos = await db.queryAsync<{ id: string; logo_updated_at: number | null }>(
+      'SELECT id, logo_updated_at FROM teams WHERE id IN (?, ?)',
+      [match.team1_id ?? '', match.team2_id ?? '']
+    );
+    const sideOf = (side: 'team1' | 'team2') => {
+      const id = side === 'team1' ? match!.team1_id : match!.team2_id;
+      const d = side === 'team1' ? description.team1 : description.team2;
+      const row = logos.find((l) => l.id === id);
+      return {
+        name: d.name ?? null,
+        tag: (d as { tag?: string | null }).tag ?? null,
+        logoUrl: id && row ? logoUrl(id, row.logo_updated_at) : null,
+      };
+    };
+    const matchup = {
+      you: sideOf(isTeam1 ? 'team1' : 'team2'),
+      opponent: sideOf(isTeam1 ? 'team2' : 'team1'),
+    };
 
     if (!in1 && !in2 && !in1Json && !in2Json) {
       return res.json({
@@ -466,18 +683,106 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       });
     }
 
+    // A match before its tournament starts, or still waiting for an opponent, has no veto or
+    // server yet: the top bar shows nothing for it (it said "your turn in veto" before start).
+    if (match.status === 'pending' || match.status === 'ready') {
+      const tournament = match.tournament_id
+        ? await db.queryOneAsync<{ status: string }>('SELECT status FROM tournament WHERE id = ?', [
+            match.tournament_id,
+          ])
+        : null;
+      const started = !match.tournament_id || tournament?.status === 'in_progress';
+      if (!started || !match.team1_id || !match.team2_id) {
+        return res.json({ success: true, status: 'none', matchSlug: null, label: null });
+      }
+    }
+
     const vetoState = match.veto_state
-      ? (JSON.parse(match.veto_state) as { status?: string; currentTurn?: string })
+      ? (JSON.parse(match.veto_state) as {
+          status?: string;
+          currentTurn?: string;
+          actions?: Array<{ team?: string }>;
+        })
       : null;
     const vetoCompleted = vetoState?.status === 'completed';
-    const currentTurn = vetoState?.currentTurn ?? null;
+
+    // Do NOT read currentTurn straight off veto_state: that row is only written
+    // once the first action is submitted, so on step 1 it is NULL and the team
+    // that has to act first would be told "waiting for veto" instead of
+    // "your turn". The integration's preMatchTurn derives the opening step
+    // from the configured veto order in that case.
+    const currentTurn = vetoCompleted
+      ? null
+      : ((await integrationForMatch(match).preMatchTurn?.(match)) ?? null);
 
     if (['loaded', 'live'].includes(match.status)) {
+      // On the server, or dropped off it (the site offers to reconnect).
+      const connection = playerConnectionService.connectionOf(match.slug, steamId);
       return res.json({
         success: true,
         status: 'match_ready',
         matchSlug: match.slug,
         label: 'match_ready',
+        connection: connection.state,
+        droppedAt: connection.droppedAt,
+        matchName,
+        matchup,
+      });
+    }
+
+    // A tournament without a veto (2v2, shuffle): the break and the wait are for the match, never
+    // "waiting for veto" (the navbar said "Veto in 3:12" for a veto-off final, 2026-10-15).
+    const tournamentSettings = match.tournament_id
+      ? await db.queryOneAsync<{ settings: string | null }>(
+          'SELECT settings FROM tournament WHERE id = ?',
+          [match.tournament_id]
+        )
+      : null;
+    let vetoOff = false;
+    try {
+      vetoOff = !(
+        integrationForMatch(match).usesPreMatchPhase?.({
+          settings: tournamentSettings?.settings ? JSON.parse(tournamentSettings.settings) : {},
+        }) ?? true
+      );
+    } catch {
+      vetoOff = false;
+    }
+
+    // Held before its veto started (the break between a team's matches, or an
+    // admin's hold): "the veto opens at …", with the time for a countdown.
+    const heldUntil = Number((match as { held_until?: number | null }).held_until ?? 0);
+    const vetoStarted = Array.isArray(vetoState?.actions) && vetoState.actions.length > 0;
+    if (
+      (match.status === 'pending' || match.status === 'ready') &&
+      !vetoCompleted &&
+      !vetoStarted &&
+      heldUntil > Math.floor(Date.now() / 1000)
+    ) {
+      return res.json({
+        success: true,
+        status: 'veto_soon',
+        matchSlug: match.slug,
+        label: 'veto_soon',
+        // No veto: the countdown is to the match itself.
+        vetoOff,
+        matchName,
+        matchup,
+        viewerTeam: isTeam1 ? 'team1' : 'team2',
+        vetoActionCount: 0,
+        lastVetoActionTeam: null,
+        opensAt: new Date(heldUntil * 1000).toISOString(),
+      });
+    }
+
+    if ((match.status === 'pending' || match.status === 'ready') && vetoOff) {
+      return res.json({
+        success: true,
+        status: 'waiting_server',
+        matchSlug: match.slug,
+        label: 'waiting_server',
+        matchName,
+        matchup,
       });
     }
 
@@ -485,11 +790,20 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       const myTurn =
         currentTurn &&
         ((currentTurn === 'team1' && isTeam1) || (currentTurn === 'team2' && !isTeam1));
+      // Who made the most recent veto move, so the navbar can tell "the
+      // opponent made their choice" apart from the viewer's own action.
+      const vetoActions = Array.isArray(vetoState?.actions) ? vetoState.actions : [];
+      const lastTeam = vetoActions[vetoActions.length - 1]?.team;
       return res.json({
         success: true,
         status: myTurn ? 'your_turn_veto' : 'waiting_veto',
         matchSlug: match.slug,
         label: myTurn ? 'your_turn_veto' : 'waiting_veto',
+        matchName,
+        matchup,
+        viewerTeam: isTeam1 ? 'team1' : 'team2',
+        vetoActionCount: vetoActions.length,
+        lastVetoActionTeam: lastTeam === 'team1' || lastTeam === 'team2' ? lastTeam : null,
       });
     }
 
@@ -499,6 +813,8 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
         status: 'waiting_server',
         matchSlug: match.slug,
         label: 'waiting_server',
+        matchName,
+        matchup,
       });
     }
 
@@ -507,6 +823,8 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       status: 'match_ready',
       matchSlug: match.slug,
       label: 'match_ready',
+      matchName,
+      matchup,
     });
   } catch (e) {
     log.error('Failed to compute match status for /me/match-status', e as Error);
@@ -514,6 +832,123 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       success: false,
       error: 'Failed to load match status',
     });
+  }
+});
+
+// ----------------------------------------------------------------------------
+// Player self-service: the signed-in player's own Discord ID
+// ----------------------------------------------------------------------------
+
+/**
+ * Work out whose Discord ID a self-service request may touch, or answer it.
+ *
+ * Deliberately the REAL viewer (Passport session, or the signed
+ * `player_steam_id` cookie), never the effective one, and never a Steam ID from
+ * the URL or body: a player can only ever read or change their own. There is no
+ * parameter to get wrong.
+ *
+ * An admin who is impersonating is refused outright rather than served either
+ * identity. Acting on the impersonated player would let an admin quietly edit a
+ * child's contact details through a page built for the player; acting on the
+ * admin's own row while the UI shows someone else would be worse. Admins have
+ * the Players page for this, which is the edit an audit would expect to find.
+ *
+ * These routes sit above `router.use(requireAuth)` because a normal player is
+ * not an admin; they do their own authentication here. A service token carries
+ * no Steam ID, so it gets 401 like any anonymous caller.
+ */
+async function resolveSelfServiceSteamId(req: Request, res: Response): Promise<string | null> {
+  const identity = await resolveViewerIdentity(req);
+
+  if (!identity.realSteamId) {
+    res.status(401).json({ success: false, error: 'Sign in with Steam to manage your Discord ID' });
+    return null;
+  }
+
+  if (identity.isImpersonating) {
+    res.status(403).json({
+      success: false,
+      error:
+        "You are impersonating a player. Admins edit a player's Discord ID on the Players page; " +
+        'stop impersonating to manage your own.',
+    });
+    return null;
+  }
+
+  return identity.realSteamId;
+}
+
+/**
+ * GET /api/players/me/discord-id
+ * The signed-in player's own Discord ID (player session, not admin).
+ */
+router.get('/me/discord-id', async (req: Request, res: Response) => {
+  try {
+    const steamId = await resolveSelfServiceSteamId(req, res);
+    if (!steamId) return;
+
+    const discordId = await playerService.getDiscordId(steamId);
+    if (discordId === undefined) {
+      return res
+        .status(404)
+        .json({ success: false, error: 'No player record for this Steam account' });
+    }
+
+    const linked = await playerService.hasLinkedDiscord(steamId);
+    return res.json({ success: true, steamId, discordId, linked });
+  } catch (error) {
+    log.error('Error reading own Discord ID', { error });
+    return res.status(500).json({ success: false, error: 'Failed to load Discord ID' });
+  }
+});
+
+/**
+ * PUT /api/players/me/discord-id
+ * Set (string) or clear (null / "") the signed-in player's own Discord ID.
+ *
+ * An explicit edit: it overwrites whatever is stored, including a value an
+ * import filled in. That is the point — the player is the authority on their
+ * own Discord account, and a later re-import will not undo this (imports never
+ * overwrite).
+ */
+router.put('/me/discord-id', async (req: Request, res: Response) => {
+  try {
+    const steamId = await resolveSelfServiceSteamId(req, res);
+    if (!steamId) return;
+
+    const body = (req.body ?? {}) as { discordId?: Untrusted };
+    if (!('discordId' in body)) {
+      return res.status(400).json({
+        success: false,
+        error: 'discordId is required: a Discord user ID string, or null to remove it',
+      });
+    }
+
+    const edit = parseDiscordIdEdit(body.discordId);
+    if (edit.kind === 'invalid') {
+      return res.status(400).json({ success: false, error: edit.error });
+    }
+
+    const updated = await playerService.updatePlayer(steamId, {
+      discordId: edit.kind === 'set' ? edit.value : null,
+    });
+    if (!updated) {
+      return res
+        .status(404)
+        .json({ success: false, error: 'No player record for this Steam account' });
+    }
+
+    const discordId = (await playerService.getDiscordId(steamId)) ?? null;
+    log.info(
+      `Player ${steamId} ${discordId ? `set their Discord ID to ${abbreviateId(discordId)}` : 'cleared their Discord ID'}`
+    );
+    return res.json({ success: true, steamId, discordId });
+  } catch (error) {
+    if (error instanceof InvalidDiscordIdError) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    log.error('Error updating own Discord ID', { error });
+    return res.status(500).json({ success: false, error: 'Failed to save Discord ID' });
   }
 });
 
@@ -559,12 +994,12 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
       FROM matches m
       LEFT JOIN teams t1 ON m.team1_id = t1.id
       LEFT JOIN teams t2 ON m.team2_id = t2.id
-      LEFT JOIN servers s ON m.server_id = s.id
+      LEFT JOIN cs2_servers s ON m.server_id = s.id
       WHERE m.status IN ('loaded', 'live')
         AND (
           (t1.players LIKE ? ESCAPE '\\')
           OR (t2.players LIKE ? ESCAPE '\\')
-          OR (m.config LIKE ? ESCAPE '\\')
+          OR (m.config LIKE ('%"' || TRIM(BOTH '%' FROM ?) || '":%'))
         )
       ORDER BY m.loaded_at DESC
       LIMIT 1`,
@@ -594,14 +1029,15 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
         FROM matches m
         LEFT JOIN teams t1 ON m.team1_id = t1.id
         LEFT JOIN teams t2 ON m.team2_id = t2.id
-        LEFT JOIN servers s ON m.server_id = s.id
+        LEFT JOIN cs2_servers s ON m.server_id = s.id
+        ${CURRENT_MATCH_TOURNAMENT_JOIN}
         WHERE m.status IN ('pending', 'ready')
           AND (
             (t1.players LIKE ? ESCAPE '\\')
             OR (t2.players LIKE ? ESCAPE '\\')
-            OR (m.config LIKE ? ESCAPE '\\')
+            OR (m.config LIKE ('%"' || TRIM(BOTH '%' FROM ?) || '":%'))
           )
-        ORDER BY m.round ASC, m.match_number ASC
+        ORDER BY ${CURRENT_MATCH_ORDER}
         LIMIT 1`,
         [likeParam, likeParam, likeParam]
       );
@@ -624,70 +1060,11 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
     // For bracket-managed matches (round >= 1) we rebuild the config on-demand
     // so team rosters always reflect the latest team membership instead of a
     // stale snapshot from bracket generation.
-    let config: MatchConfig | Record<string, unknown>;
-    if (typeof match.round === 'number' && match.round >= 1 && match.tournament_id) {
-      const t = await db.queryOneAsync<DbTournamentRow>(
-        'SELECT * FROM tournament WHERE id = ?',
-        [match.tournament_id]
-      );
+    // Manual/non-bracket matches keep their stored config as-is.
+    const cfg = describeMatch({ game: match.game, config: await currentMatchConfig(match) });
 
-      if (t) {
-        const tournament: TournamentResponse = {
-          id: t.id,
-          name: t.name,
-          type: t.type as TournamentResponse['type'],
-          format: t.format as TournamentResponse['format'],
-          status: t.status as TournamentResponse['status'],
-          maps: JSON.parse(t.maps),
-          teamIds: JSON.parse(t.team_ids),
-          settings: t.settings ? JSON.parse(t.settings) : {},
-          created_at: t.created_at,
-          updated_at: t.updated_at ?? t.created_at,
-          started_at: t.started_at,
-          completed_at: t.completed_at,
-          teams: [],
-          mapSequence: t.map_sequence ? JSON.parse(t.map_sequence) : undefined,
-          teamSize:
-            t.team_size === null || typeof t.team_size === 'undefined' ? undefined : t.team_size,
-          maxRounds:
-            t.max_rounds === null || typeof t.max_rounds === 'undefined'
-              ? undefined
-              : t.max_rounds,
-          overtimeMode: (t.overtime_mode as 'enabled' | 'disabled' | null) || undefined,
-          overtimeSegments:
-            t.overtime_segments === null || typeof t.overtime_segments === 'undefined'
-              ? undefined
-              : t.overtime_segments,
-          eloTemplateId: t.elo_template_id ?? undefined,
-        };
-
-        const fresh = await generateMatchConfig(
-          tournament,
-          match.team1_id ?? undefined,
-          match.team2_id ?? undefined,
-          match.slug
-        );
-        config = fresh;
-      } else {
-        config = match.config
-          ? (JSON.parse(match.config) as MatchConfig | Record<string, unknown>)
-          : {};
-      }
-    } else {
-      // Manual/non-bracket matches keep their stored config as-is.
-      config = match.config
-        ? (JSON.parse(match.config) as MatchConfig | Record<string, unknown>)
-        : {};
-    }
-
-    const cfg = config as Partial<MatchConfig>;
-
-    const normalizedTeam1Players = cfg.team1
-      ? normalizeConfigPlayers(cfg.team1.players)
-      : [];
-    const normalizedTeam2Players = cfg.team2
-      ? normalizeConfigPlayers(cfg.team2.players)
-      : [];
+    const normalizedTeam1Players = describedPlayers(cfg.team1);
+    const normalizedTeam2Players = describedPlayers(cfg.team2);
 
     const isPlayerInTeam1 = normalizedTeam1Players.some((p) => p.steamid === playerId);
     const isPlayerInTeam2 = normalizedTeam2Players.some((p) => p.steamid === playerId);
@@ -733,10 +1110,10 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
     }
 
     const isManualMatch = match.round === 0 && !match.team1_id && !match.team2_id;
-    const t1Name = match.team1_name ?? cfg.team1?.name;
-    const t2Name = match.team2_name ?? cfg.team2?.name;
-    const t1Tag = match.team1_tag ?? cfg.team1?.tag ?? '';
-    const t2Tag = match.team2_tag ?? cfg.team2?.tag ?? '';
+    const t1Name = match.team1_name ?? (cfg.team1.name || undefined);
+    const t2Name = match.team2_name ?? (cfg.team2.name || undefined);
+    const t1Tag = match.team1_tag ?? cfg.team1.tag ?? '';
+    const t2Tag = match.team2_tag ?? cfg.team2.tag ?? '';
 
     const playerTeam = isTeam1
       ? {
@@ -816,21 +1193,15 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
 
           vetoSummary = {
             status,
-            team1Name:
-              vetoState.team1Name ||
-              match.team1_name ||
-              cfg.team1?.name ||
-              'Team 1',
-            team2Name:
-              vetoState.team2Name ||
-              match.team2_name ||
-              cfg.team2?.name ||
-              'Team 2',
+            team1Name: vetoState.team1Name || match.team1_name || cfg.team1.name || 'Team 1',
+            team2Name: vetoState.team2Name || match.team2_name || cfg.team2.name || 'Team 2',
             pickedMaps: sanitizedPickedMaps,
             actions: Array.isArray(vetoState.actions)
               ? vetoState.actions
                   .filter(
-                    (a): a is {
+                    (
+                      a
+                    ): a is {
                       step: number;
                       team: 'team1' | 'team2';
                       action: string;
@@ -852,10 +1223,11 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
     }
 
     // Get tournament status and format
-    const tournament = await db.queryOneAsync<{ status: string; format: string }>(
-      'SELECT status, format FROM tournament WHERE id = ?',
-      [match.tournament_id]
-    );
+    const tournament = await db.queryOneAsync<{
+      status: string;
+      format: string;
+      settings: Untrusted;
+    }>('SELECT status, format, settings FROM tournament WHERE id = ?', [match.tournament_id]);
 
     // Note: We're NOT exposing RCON password to players
     const serverPassword = null;
@@ -866,26 +1238,20 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
     if (match.server_id) {
       try {
         const statusInfo = await Promise.race([
-          serverStatusService.getServerStatus(match.server_id),
-          new Promise<{ status: null; matchSlug: null; updatedAt: null; online: false }>(
-            (resolve) =>
-              setTimeout(
-                () => resolve({ status: null, matchSlug: null, updatedAt: null, online: false }),
-                2000
-              )
-          ),
+          integrationForMatch(match).resourceStatus?.(match.server_id) ?? Promise.resolve(null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
         ]);
 
-        if (statusInfo.online && statusInfo.status) {
+        if (statusInfo) {
           realServerStatus = statusInfo.status;
-          serverStatusDescription = serverStatusService.getStatusDescription(statusInfo.status);
+          serverStatusDescription = statusInfo.description;
         }
       } catch (error) {
         // Silently fail - server status is nice-to-have, not critical
-        console.debug(
-          '[PlayerMatch] Server status check failed (plugin ConVars may not exist yet):',
-          error
-        );
+        log.debug('[PlayerMatch] Server status check failed (plugin ConVars may not exist yet)', {
+          matchSlug: match.slug,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
@@ -913,10 +1279,7 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
     }));
 
     // Normalize and enrich config players with avatars from team data or players table
-    const enrichPlayers = async (
-      normalizedPlayers: NormalizedServerPlayer[],
-      teamId?: string
-    ) => {
+    const enrichPlayers = async (normalizedPlayers: NormalizedServerPlayer[], teamId?: string) => {
       if (teamId) {
         try {
           const teamData = await teamService.getTeamById(teamId);
@@ -930,15 +1293,18 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
             }));
           }
         } catch (error) {
-          console.debug('[PlayerMatch] Failed to enrich players with avatars:', error);
+          log.debug('[PlayerMatch] Failed to enrich players with avatars', {
+            teamId,
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
       return normalizedPlayers;
     };
 
     let [enrichedTeam1Players, enrichedTeam2Players] = await Promise.all([
-      enrichPlayers(normalizedTeam1Players, cfg.team1?.id),
-      enrichPlayers(normalizedTeam2Players, cfg.team2?.id),
+      enrichPlayers(normalizedTeam1Players, cfg.team1.id),
+      enrichPlayers(normalizedTeam2Players, cfg.team2.id),
     ]);
 
     // Manual matches: no team rows, enrich from players table
@@ -966,7 +1332,10 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
             avatar: p.avatar || avatarMap.get(p.steamid.toLowerCase()),
           }));
         } catch (error) {
-          console.debug('[PlayerMatch] Failed to enrich manual-match players with avatars:', error);
+          log.debug('[PlayerMatch] Failed to enrich manual-match players with avatars', {
+            matchSlug: match.slug,
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
     }
@@ -993,15 +1362,15 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
             ? { id: playerTeam.id, name: playerTeam.name, tag: playerTeam.tag }
             : null
           : opponent.id
-          ? { id: opponent.id, name: opponent.name, tag: opponent.tag }
-          : null,
+            ? { id: opponent.id, name: opponent.name, tag: opponent.tag }
+            : null,
         team2: !isTeam1
           ? playerTeam.id
             ? { id: playerTeam.id, name: playerTeam.name, tag: playerTeam.tag }
             : null
           : opponent.id
-          ? { id: opponent.id, name: opponent.name, tag: opponent.tag }
-          : null,
+            ? { id: opponent.id, name: opponent.name, tag: opponent.tag }
+            : null,
         opponent: opponent.id
           ? {
               id: opponent.id,
@@ -1038,37 +1407,44 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
         veto: vetoSummary,
         matchFormat:
           (tournament?.format as 'bo1' | 'bo3' | 'bo5') ||
-          (cfg.num_maps === 1 ? 'bo1' : cfg.num_maps === 5 ? 'bo5' : 'bo3'),
+          (cfg.seriesLength === 1 ? 'bo1' : cfg.seriesLength === 5 ? 'bo5' : 'bo3'),
         loadedAt: match.loaded_at,
+        // Neutral match summary, kept in the shape the player page reads.
         config: {
-          maplist: cfg.maplist ?? null,
-          num_maps: cfg.num_maps ?? null,
-          players_per_team: typeof cfg.players_per_team === 'number' ? cfg.players_per_team : null,
-          expected_players_total:
-            typeof cfg.players_per_team === 'number' ? cfg.players_per_team * 2 : 10,
-          expected_players_team1:
-            typeof cfg.players_per_team === 'number' ? cfg.players_per_team : 5,
-          expected_players_team2:
-            typeof cfg.players_per_team === 'number' ? cfg.players_per_team : 5,
-          vetoDisabled: cfg.vetoDisabled,
-          team1: cfg.team1
-            ? {
-                id: cfg.team1.id,
-                name: cfg.team1.name,
-                tag: cfg.team1.tag,
-                flag: cfg.team1.flag,
-                players: enrichedTeam1Players,
-              }
-            : undefined,
-          team2: cfg.team2
-            ? {
-                id: cfg.team2.id,
-                name: cfg.team2.name,
-                tag: cfg.team2.tag,
-                flag: cfg.team2.flag,
-                players: enrichedTeam2Players,
-              }
-            : undefined,
+          maplist: cfg.maps.length > 0 ? cfg.maps : null,
+          num_maps: cfg.seriesLength,
+          players_per_team: cfg.playersPerTeam ?? null,
+          expected_players_total: cfg.playersPerTeam !== undefined ? cfg.playersPerTeam * 2 : 10,
+          expected_players_team1: cfg.playersPerTeam ?? 5,
+          expected_players_team2: cfg.playersPerTeam ?? 5,
+          // Before the match has a config (a later round in its break), the tournament says
+          // whether there is a veto: the page showed one for a tournament without (2026-10-15).
+          vetoDisabled:
+            cfg.skipPreMatchPhase ??
+            (tournament
+              ? !(
+                  integrationForMatch(match).usesPreMatchPhase?.({
+                    settings:
+                      typeof tournament.settings === 'string'
+                        ? JSON.parse(tournament.settings)
+                        : tournament.settings,
+                  }) ?? true
+                )
+              : undefined),
+          team1: {
+            id: cfg.team1.id,
+            name: cfg.team1.name,
+            tag: cfg.team1.tag,
+            flag: cfg.team1.flag,
+            players: enrichedTeam1Players,
+          },
+          team2: {
+            id: cfg.team2.id,
+            name: cfg.team2.name,
+            tag: cfg.team2.tag,
+            flag: cfg.team2.flag,
+            players: enrichedTeam2Players,
+          },
         },
       },
     });
@@ -1083,13 +1459,59 @@ router.get('/:playerId/current-match', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/players/:playerId/summary
- * Aggregate player view used by the public player page.
- * Returns:
- *   - player details (with matchesPlayed normalized from stats)
- *   - rating history
- *   - match history (deduplicated by slug)
- *   - basic derived stats (win rate, average ADR, recent form)
+ * @openapi
+ * /api/players/{playerId}/summary:
+ *   get:
+ *     tags: [Players]
+ *     summary: Aggregate player view used by the public player page
+ *     description: >
+ *       Player details (with matchesPlayed normalized from stats), rating
+ *       history, deduplicated match history (each row carries the `game` id
+ *       it was played under), basic derived stats, and the distinct games
+ *       this player has recorded matches in.
+ *     parameters:
+ *       - name: playerId
+ *         in: path
+ *         required: true
+ *         schema: { type: string }
+ *       - name: tournamentId
+ *         in: query
+ *         required: false
+ *         schema: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Player summary
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean }
+ *                 player: { type: object }
+ *                 stats:
+ *                   type: object
+ *                   properties:
+ *                     matchesPlayed: { type: integer }
+ *                     wins: { type: integer }
+ *                     losses: { type: integer }
+ *                     winRate: { type: number }
+ *                     averageAdr: { type: number }
+ *                     recentForm: { type: string }
+ *                 ratingHistory: { type: array, items: { type: object } }
+ *                 matches:
+ *                   type: array
+ *                   description: Deduplicated match history; each row includes `game`.
+ *                   items: { type: object }
+ *                 games:
+ *                   type: array
+ *                   description: Distinct games this player has recorded matches in, newest first.
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id: { type: string, example: 'cs2' }
+ *                       name: { type: string, example: 'Counter-Strike 2' }
+ *       404:
+ *         description: Player not found
  */
 router.get('/:playerId/summary', async (req: Request, res: Response) => {
   try {
@@ -1126,10 +1548,14 @@ router.get('/:playerId/summary', async (req: Request, res: Response) => {
         m.match_number,
         m.status,
         m.completed_at,
-        m.tournament_id as tournamentId,
+        -- Quoted: Postgres folds an unquoted identifier to lower case, so
+        -- without the quotes this came back as tournamentid and every client
+        -- reading tournamentId got undefined.
+        m.tournament_id as "tournamentId",
         m.team1_id,
         m.team2_id,
         m.winner_id,
+        m.game,
         t1.name as team1_name,
         t1.tag as team1_tag,
         t2.name as team2_name,
@@ -1141,14 +1567,17 @@ router.get('/:playerId/summary', async (req: Request, res: Response) => {
         pms.kills,
         pms.deaths,
         pms.assists,
-        pms.headshots
+        pms.headshots,
+        -- Whether there is a demo to download: the profile only offers the
+        -- button for a match that has one.
+        (m.demo_file_path IS NOT NULL) as has_demo
       FROM player_match_stats pms
       JOIN matches m ON pms.match_slug = m.slug
       LEFT JOIN teams t1 ON m.team1_id = t1.id
       LEFT JOIN teams t2 ON m.team2_id = t2.id
       WHERE pms.player_id = ?
     `;
-    const params: unknown[] = [playerId];
+    const params: SqlValue[] = [playerId];
 
     if (tournamentId) {
       query += ' AND m.tournament_id = ?';
@@ -1167,11 +1596,11 @@ router.get('/:playerId/summary', async (req: Request, res: Response) => {
       match_number: number;
       status: string;
       completed_at: number;
-      tournamentid?: number;
       tournamentId?: number;
       team1_id?: string | null;
       team2_id?: string | null;
       winner_id?: string | null;
+      game?: string | null;
       team1_name?: string | null;
       team1_tag?: string | null;
       team2_name?: string | null;
@@ -1184,6 +1613,7 @@ router.get('/:playerId/summary', async (req: Request, res: Response) => {
       deaths?: number | null;
       assists?: number | null;
       headshots?: number | null;
+      has_demo?: boolean;
     };
 
     const rawMatches = await db.queryAsync<RawMatchRow>(query, params);
@@ -1229,13 +1659,44 @@ router.get('/:playerId/summary', async (req: Request, res: Response) => {
       }
     }
 
+    // Rated matches whose match row is gone (the tournament was deleted):
+    // their stats rows went with it, but the rating history keeps them, with
+    // the game they were played under. They are matches this player played,
+    // so they count in `matchCount` and the profile's per-game totals.
+    const matchSlugs = new Set(matches.map((m) => m.slug));
+    const archivedRated = ratingHistory.filter(
+      (entry) => !entry.match_slug || !matchSlugs.has(entry.match_slug)
+    );
+
+    // Distinct games this player has recorded matches in (newest match first),
+    // read from the already-computed integration registry rather than
+    // hard-coding a game name on the client.
+    const gameIds: string[] = [];
+    for (const m of matches) {
+      const id = m.game || DEFAULT_GAME;
+      if (!gameIds.includes(id)) gameIds.push(id);
+    }
+    for (const entry of archivedRated) {
+      const id = entry.game || DEFAULT_GAME;
+      if (!gameIds.includes(id)) gameIds.push(id);
+    }
+    const games = gameIds.map((id) => {
+      try {
+        return { id, name: getIntegration(id).displayName };
+      } catch {
+        return { id, name: id };
+      }
+    });
+
     return res.json({
       success: true,
       player: {
         ...player,
-        // Override matchCount with the normalized distinct match count so UI
-        // doesn't show inflated numbers when history/stat rows are duplicated.
-        matchCount: matchesPlayed,
+        // Distinct matches played: the stats rows (deduplicated by match), plus
+        // the rated matches of deleted tournaments, which only the rating
+        // history still knows. Never the raw counter, which duplicate rows
+        // could inflate.
+        matchCount: matchesPlayed + archivedRated.length,
       },
       stats: {
         matchesPlayed,
@@ -1249,6 +1710,7 @@ router.get('/:playerId/summary', async (req: Request, res: Response) => {
       },
       ratingHistory,
       matches,
+      games,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -1262,7 +1724,7 @@ router.get('/:playerId/summary', async (req: Request, res: Response) => {
 
 /**
  * GET /api/players/:playerId/avatar.svg
- * Deterministic DiceBear avatar for a player, seeded from player ID.
+ * Deterministic placeholder avatar for a player, seeded from player ID.
  * Public endpoint so the frontend can embed SVGs directly.
  */
 router.get('/:playerId/avatar.svg', async (req: Request, res: Response) => {
@@ -1361,7 +1823,10 @@ router.get('/:playerId/matches', async (req: Request, res: Response) => {
         m.match_number,
         m.status,
         m.completed_at,
-        m.tournament_id as tournamentId,
+        -- Quoted: Postgres folds an unquoted identifier to lower case, so
+        -- without the quotes this came back as tournamentid and every client
+        -- reading tournamentId got undefined.
+        m.tournament_id as "tournamentId",
         m.team1_id,
         m.team2_id,
         m.winner_id,
@@ -1382,7 +1847,7 @@ router.get('/:playerId/matches', async (req: Request, res: Response) => {
       LEFT JOIN teams t2 ON m.team2_id = t2.id
       WHERE pms.player_id = ?
     `;
-    const params: unknown[] = [playerId];
+    const params: SqlValue[] = [playerId];
 
     if (tournamentId) {
       query += ' AND m.tournament_id = ?';
@@ -1412,7 +1877,59 @@ router.get('/:playerId/matches', async (req: Request, res: Response) => {
 // ============================================================================
 
 // All player management routes require authentication (admin only)
+// The players import (documented below) takes an integrator token too: an event site sends its
+// players with the same token as its teams (/api/integrations/teams).
+router.post('/import', requireIntegratorAuth, (req: Request, res: Response) =>
+  importPlayers(req, res)
+);
+
 router.use(requireAuth);
+
+/**
+ * @openapi
+ * /api/players/{playerId}/accounts:
+ *   get:
+ *     tags: [Players]
+ *     summary: A player's game accounts other than Steam
+ *     description: |
+ *       Admin. Accounts the games need (Epic Games for Rocket League, ...):
+ *       entered by an admin (`verified: false`, the player lands on this
+ *       player when they first sign in with it) or proven by signing in.
+ *     parameters:
+ *       - in: path
+ *         name: playerId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: "`accounts`: [{ provider, externalId, verified }]"
+ */
+router.get('/:playerId/accounts', async (req: Request, res: Response) => {
+  return res.json({ success: true, accounts: await presetAccounts.list(req.params.playerId) });
+});
+
+/** Set the `accounts` a create or update carried; a refusal is answered and returns false. */
+async function applyAccounts(
+  playerId: string,
+  accounts: Untrusted,
+  res: Response
+): Promise<boolean> {
+  if (accounts === undefined) return true;
+  if (!accounts || typeof accounts !== 'object' || Array.isArray(accounts)) {
+    res.status(400).json({ success: false, error: 'accounts: { provider: account id or null }' });
+    return false;
+  }
+  try {
+    await presetAccounts.set(playerId, accounts as Record<string, Untrusted>);
+    return true;
+  } catch (error) {
+    if (error instanceof PresetAccountError) {
+      res.status(error.status).json({ success: false, error: error.message, code: 'account' });
+      return false;
+    }
+    throw error;
+  }
+}
 
 /**
  * GET /api/players
@@ -1420,7 +1937,8 @@ router.use(requireAuth);
  */
 router.get('/', async (_req: Request, res: Response) => {
   try {
-    const players = await playerService.getAllPlayers();
+    // Admin mapping: includes the Discord ID. Public routes use getAllPlayers.
+    const players = await playerService.getAllPlayersForAdmin();
     return res.json({
       success: true,
       count: players.length,
@@ -1437,6 +1955,36 @@ router.get('/', async (_req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/players/by-discord-id/:discordId
+ * Every player with this Discord ID — how the Discord bot finds a player.
+ *
+ * Admin-guarded (the bot uses a service token; a read-only one is enough). An
+ * ARRAY, and 200 with `[]` when nobody matches: the ID is not unique (a parent
+ * may list theirs on several children), and "not registered" is an ordinary
+ * answer for a bot, not an error it should have to parse.
+ *
+ * Two segments, so no `/:playerId` route can shadow it; the public
+ * `/:playerId/<fixed>` routes above all end in a different literal.
+ */
+router.get('/by-discord-id/:discordId', async (req: Request, res: Response) => {
+  try {
+    const { discordId } = req.params;
+    if (!isValidDiscordId(discordId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'discordId must be a Discord user ID: 17–20 digits',
+      });
+    }
+
+    const players = await playerService.getPlayersByDiscordId(discordId);
+    return res.json({ success: true, players });
+  } catch (error) {
+    log.error('Error looking up players by Discord ID', { error });
+    return res.status(500).json({ success: false, error: 'Failed to look up players' });
+  }
+});
+
+/**
  * POST /api/players
  * Create a new player
  */
@@ -1444,14 +1992,24 @@ router.post('/', async (req: Request, res: Response) => {
   try {
     const input: CreatePlayerInput = req.body;
 
-    if (!input.id || !input.name) {
+    if (!input.name) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: id (Steam ID), name',
+        error: 'Missing required field: name',
       });
     }
+    // Steam is optional: a player without a Steam ID gets an account id of its own.
+    if (!input.id) input.id = `acc_${randomBytes(12).toString('hex')}`;
 
-    const player = await playerService.createPlayer(input);
+    // An explicit edit: an invalid discordId refuses the whole create (400).
+    const created = await playerService.createPlayer(input);
+    // Game accounts (Epic Games, ...): a refused one undoes the create.
+    const accounts = (req.body as { accounts?: Untrusted }).accounts;
+    if (!(await applyAccounts(created.id, accounts, res))) {
+      await playerService.deletePlayer(created.id).catch(() => undefined);
+      return;
+    }
+    const player = (await playerService.getPlayerByIdForAdmin(created.id)) ?? created;
 
     return res.status(201).json({
       success: true,
@@ -1459,6 +2017,17 @@ router.post('/', async (req: Request, res: Response) => {
       player,
     });
   } catch (error) {
+    if (error instanceof InvalidDiscordIdError) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    if (error instanceof PlayerExistsError) {
+      return res.status(409).json({
+        success: false,
+        error: error.message,
+        code: 'player_exists',
+        playerId: error.playerId,
+      });
+    }
     const message = error instanceof Error ? error.message : 'Unknown error';
     const statusCode = message.includes('already exists') ? 409 : 400;
     log.error('Error creating player', { error });
@@ -1468,6 +2037,35 @@ router.post('/', async (req: Request, res: Response) => {
     });
   }
 });
+
+/**
+ * @openapi
+ * /api/players/import:
+ *   post:
+ *     tags: [Players]
+ *     summary: Create or update players without teams (integrators)
+ *     description: |
+ *       For a site that registers its players before teams exist (the same API
+ *       token as the teams API). Body: an array of players, or
+ *       `{ "players": [...] }`. Each player: `steamId`, `name`, and
+ *       optionally `discordId` (string), `oidcSubject` (the `sub` of
+ *       their login on the site's OpenID Connect server) and `rating` (a
+ *       starting rating on this site's scale, 100–5000; new players start at
+ *       1500). Shuffle teams are balanced on it. A rating only applies while
+ *       the player has no rated matches here; after that their results rule
+ *       (`ratingsKept` lists them).
+ *
+ *       A player who already exists keeps their rating, stats and match
+ *       history: only the display name is updated, and a Discord ID or
+ *       OpenID Connect subject they don't have yet is added (one on file is
+ *       never overwritten). Someone who later signs in with OpenID Connect
+ *       with that subject lands on this player.
+ *     responses:
+ *       200:
+ *         description: "`created`, `updated`, `errors` and `warnings` (values not stored)"
+ *       400:
+ *         description: No players, or a player without steamId or name
+ */
 
 /**
  * POST /api/players/bulk-import
@@ -1486,12 +2084,13 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
 
     // Validate each player has required fields
     for (const player of players) {
-      if (!player.id || !player.name) {
+      if (!player.name) {
         return res.status(400).json({
           success: false,
-          error: 'Each player must have id (Steam ID) and name',
+          error: 'Each player must have a name',
         });
       }
+      if (!player.id) player.id = `acc_${randomBytes(12).toString('hex')}`;
     }
 
     const result = await playerService.bulkImportPlayers(players);
@@ -1503,6 +2102,8 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
       created: result.created,
       updated: result.updated,
       errors: result.errors,
+      // Discord IDs follow the import rule: never overwritten, bad ones dropped.
+      ...(result.warnings.length > 0 ? { warnings: result.warnings } : {}),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -1529,12 +2130,23 @@ router.post('/bulk-delete', async (req: Request, res: Response) => {
       });
     }
 
+    // Never delete every admin at once: nobody could get back in.
+    const unique = [...new Set(ids.map(String))];
+    const adminIdsToRemove = (
+      await Promise.all(unique.map((id) => playerService.getPlayerById(id)))
+    ).filter((p) => p?.isAdmin).length;
+    if (
+      bulkRemovesEveryAdmin({ adminIdsToRemove, adminCount: await playerService.countAdmins() })
+    ) {
+      return res.status(409).json({ success: false, error: LAST_ADMIN_ERROR });
+    }
+
     let deletedCount = 0;
     let missingCount = 0;
 
     for (const id of ids) {
       // Reuse existing single-delete semantics so cascades/logging stay consistent
-      const deleted = await playerService.deletePlayer(id);
+      const deleted = await deletePlayer(String(id), actorOf(req));
       if (deleted) {
         deletedCount += 1;
       } else {
@@ -1558,21 +2170,63 @@ router.post('/bulk-delete', async (req: Request, res: Response) => {
   }
 });
 
+/** Why a change that would leave the site without an admin is refused. */
+const LAST_ADMIN_ERROR =
+  'This is the only admin. Make someone else an admin first, so the site is not left without one.';
+
 /**
  * PUT /api/players/:playerId
- * Update a player (admin only)
+ * Update a player (admin only). `isAdmin` grants or removes admin; removing
+ * it from the only admin is refused (409). Admin changes are logged with the
+ * acting admin.
  */
 router.put('/:playerId', async (req: Request, res: Response) => {
   try {
     const { playerId } = req.params;
     const input: UpdatePlayerInput = req.body;
 
-    const player = await playerService.updatePlayer(playerId, input);
+    if (input.isAdmin !== undefined && typeof input.isAdmin !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'isAdmin must be true or false' });
+    }
+    if (input.game !== undefined && (typeof input.game !== 'string' || !input.game.trim())) {
+      return res.status(400).json({ success: false, error: 'game must be a game id, such as cs2' });
+    }
+    const before = await playerService.getPlayerById(playerId);
+    const adminChange =
+      before && input.isAdmin !== undefined && before.isAdmin !== input.isAdmin
+        ? input.isAdmin
+        : undefined;
+    if (
+      adminChange === false &&
+      removesLastAdmin({ targetIsAdmin: true, adminCount: await playerService.countAdmins() })
+    ) {
+      return res.status(409).json({ success: false, error: LAST_ADMIN_ERROR });
+    }
 
-    if (!player) {
+    // An explicit edit: a string overwrites, null/"" clears, an absent key
+    // leaves it alone, and an invalid value refuses the whole update (400).
+    if (
+      before &&
+      !(await applyAccounts(playerId, (req.body as { accounts?: Untrusted }).accounts, res))
+    ) {
+      return;
+    }
+    const updated = await playerService.updatePlayer(playerId, input);
+
+    if (!updated) {
       return res.status(404).json({
         success: false,
         error: `Player '${playerId}' not found`,
+      });
+    }
+
+    const player = (await playerService.getPlayerByIdForAdmin(playerId)) ?? updated;
+
+    if (adminChange !== undefined) {
+      // Audit: who granted or removed admin, from whom.
+      log.info(`[ADMIN] ${adminChange ? 'Granted' : 'Removed'} admin`, {
+        playerId,
+        actor: requestActorId(req),
       });
     }
 
@@ -1582,6 +2236,9 @@ router.put('/:playerId', async (req: Request, res: Response) => {
       player,
     });
   } catch (error) {
+    if (error instanceof InvalidDiscordIdError) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
     const message = error instanceof Error ? error.message : 'Unknown error';
     log.error('Error updating player', { error, playerId: req.params.playerId });
     return res.status(500).json({
@@ -1592,13 +2249,61 @@ router.put('/:playerId', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/players/:playerId/ban
+ * Ban a player (admin only): no sign-in, public pages show only the name and
+ * "Banned", and they leave the lineups of running tournaments. Body: { reason? }.
+ */
+router.post('/:playerId/ban', async (req: Request, res: Response) => {
+  try {
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : null;
+    await banPlayer(req.params.playerId, reason, actorOf(req));
+    return res.json({
+      success: true,
+      player: await playerService.getPlayerById(req.params.playerId),
+    });
+  } catch (error) {
+    if (error instanceof ModerationError) {
+      return res.status(error.status).json({ success: false, error: error.message });
+    }
+    log.error('Error banning player', { error, playerId: req.params.playerId });
+    return res.status(500).json({ success: false, error: 'Could not ban the player' });
+  }
+});
+
+/**
+ * DELETE /api/players/:playerId/ban
+ * Lift a ban (admin only).
+ */
+router.delete('/:playerId/ban', async (req: Request, res: Response) => {
+  try {
+    await unbanPlayer(req.params.playerId, actorOf(req));
+    return res.json({
+      success: true,
+      player: await playerService.getPlayerById(req.params.playerId),
+    });
+  } catch (error) {
+    log.error('Error unbanning player', { error, playerId: req.params.playerId });
+    return res.status(500).json({ success: false, error: 'Could not lift the ban' });
+  }
+});
+
+/**
  * DELETE /api/players/:playerId
- * Delete a player (admin only)
+ * Delete a player (admin only). A tombstone: the row stays, named "Deleted
+ * player", so match stats keep their rows; everything personal is removed
+ * and cannot be undone (services/playerModeration.ts).
  */
 router.delete('/:playerId', async (req: Request, res: Response) => {
   try {
     const { playerId } = req.params;
-    const deleted = await playerService.deletePlayer(playerId);
+    const target = await playerService.getPlayerById(playerId);
+    if (
+      target?.isAdmin &&
+      removesLastAdmin({ targetIsAdmin: true, adminCount: await playerService.countAdmins() })
+    ) {
+      return res.status(409).json({ success: false, error: LAST_ADMIN_ERROR });
+    }
+    const deleted = await deletePlayer(playerId, actorOf(req));
 
     if (!deleted) {
       return res.status(404).json({
@@ -1620,5 +2325,61 @@ router.delete('/:playerId', async (req: Request, res: Response) => {
     });
   }
 });
+
+/** POST /api/players/import (the @openapi block for /api/players/import documents it). */
+async function importPlayers(req: Request, res: Response) {
+  const body = req.body as Untrusted;
+  const list = Array.isArray(body)
+    ? body
+    : body && typeof body === 'object' && Array.isArray((body as { players?: Untrusted }).players)
+      ? (body as { players: Untrusted[] }).players
+      : null;
+  if (!list || list.length === 0) {
+    return res.status(400).json({ success: false, error: 'Send an array of players' });
+  }
+  const players: CreatePlayerInput[] = [];
+  const seeds: Array<{ id: string; rating: number }> = [];
+  for (const raw of list) {
+    const p = (raw ?? {}) as Record<string, Untrusted>;
+    const steamId = typeof p.steamId === 'string' ? p.steamId.trim() : '';
+    const name = typeof p.name === 'string' ? p.name.trim() : '';
+    if (!/^\d{17}$/.test(steamId) || !name) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'Each player needs a steamId (SteamID64) and a name' });
+    }
+    if (p.rating !== undefined) {
+      const rating = Number(p.rating);
+      if (!Number.isFinite(rating) || rating < 100 || rating > 5000) {
+        return res.status(400).json({
+          success: false,
+          error: 'rating must be a number from 100 to 5000 (this site starts players at 1500)',
+        });
+      }
+      seeds.push({ id: steamId, rating: Math.round(rating) });
+    }
+    players.push({
+      id: steamId,
+      name,
+      ...(p.discordId !== undefined ? { discordId: p.discordId } : {}),
+      ...(p.oidcSubject !== undefined ? { oidcSubject: p.oidcSubject } : {}),
+    } as CreatePlayerInput);
+  }
+  try {
+    const result = await playerService.bulkImportPlayers(players);
+    const seeded = await playerService.seedRatings(seeds);
+    return res.status(result.errors.length > 0 ? 207 : 200).json({
+      ...(seeds.length > 0 ? { ratingsSet: seeded.set, ratingsKept: seeded.kept } : {}),
+      success: result.errors.length === 0,
+      created: result.created,
+      updated: result.updated,
+      errors: result.errors.map((e) => ({ steamId: e.player.id, error: e.error })),
+      ...(result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+    });
+  } catch (error) {
+    log.error('Error importing players', { error });
+    return res.status(500).json({ success: false, error: 'Could not import the players' });
+  }
+}
 
 export default router;

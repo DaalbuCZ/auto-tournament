@@ -1,4 +1,5 @@
-import React, { useEffect } from 'react';
+import { pageTitle } from '../utils/pageTitle';
+import { useEffect } from 'react';
 import { Box, Button, Card, CardContent, Container, Typography } from '@mui/material';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
@@ -8,11 +9,11 @@ export default function NotFound() {
   const { t } = useTranslation();
 
   useEffect(() => {
-    document.title = t('notFound.title');
+    document.title = pageTitle(t('notFound.title'));
   }, [t]);
 
   return (
-    <Box minHeight="100vh" bgcolor="background.default" py={6}>
+    <Box minHeight="100vh" bgcolor="transparent" py={6}>
       <Container maxWidth="sm">
         <Card>
           <CardContent sx={{ textAlign: 'center', py: 6 }}>

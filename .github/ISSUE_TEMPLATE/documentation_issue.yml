@@ -29,7 +29,7 @@ body:
     attributes:
       label: 📍 Documentation Location
       description: Where is the problematic documentation? (URL, file path, or page title)
-      placeholder: "e.g., https://docs.sivert.io/docs/mat/user/server-setup or README.md line 45"
+      placeholder: "e.g., https://docs.autotournament.gg/getting-started/connect-server or README.md line 45"
     validations:
       required: true
 
@@ -39,7 +39,7 @@ body:
       label: ❓ What's Wrong?
       description: Clearly describe the documentation issue
       placeholder: |
-        Example: "The server setup guide says to install MatchZy v1.2.0, but the platform requires v1.3.0+ which has breaking changes. Following the current docs results in connection errors."
+        Example: "The server setup guide says to install MatchZy Enhanced v1.4.0, but the platform requires v2.0.0+ which has breaking changes. Following the current docs results in connection errors."
     validations:
       required: true
 
@@ -50,7 +50,7 @@ body:
       description: How should the documentation be improved? (If you know)
       placeholder: |
         Example: 
-        "The guide should specify MatchZy Enhanced v1.3.0+ is required and link to the Enhanced release page. It should also mention the webhook URL configuration that's new in v1.3.0."
+        "The guide should specify MatchZy Enhanced v2.0.0+ is required and link to its release page. It should also mention the new X-Auto-Tournament-Token header."
     validations:
       required: false
 

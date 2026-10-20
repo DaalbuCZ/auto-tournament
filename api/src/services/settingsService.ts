@@ -1,44 +1,62 @@
+import { HIGHLIGHT_SETTINGS, type HighlightSettingKey } from './highlights/settings';
 import { db } from '../config/database';
+import { effectiveProviderSettings } from '../config/signInProviders';
 import { log } from '../utils/logger';
+import { clampSimulationTimescale } from '../utils/simulationTimescale';
+import {
+  booleanRequest,
+  isTruthySetting,
+  normalizeFlag,
+  stringRequest,
+} from '../utils/settingFields';
+import type { SettingDefinition, SettingWriteContext } from '../integrations/types';
+import type { Untrusted } from '../utils/untrusted';
 
-export type AppSettingKey =
-  | 'webhook_url'
-  | 'simulate_matches'
-  | 'simulation_timescale'
-  | 'matchzy_chat_prefix'
-  | 'matchzy_admin_chat_prefix'
-  | 'matchzy_knife_enabled_default'
-  | 'matchzy_debug_chat'
+/**
+ * An `app_settings` key: one of `CoreSettingKey`, or a key an integration
+ * declares in `instanceSettings` (CS2: the `at_*` and simulation keys).
+ * Checked at run time against that union.
+ */
+export type AppSettingKey = CoreSettingKey | (string & {});
+
+/** The keys the core owns. */
+export type CoreSettingKey =
   | 'ratings_enabled'
   | 'allow_self_register'
-  // MatchZy core defaults (persisted convars)
-  | 'matchzy_autostart_mode'
-  | 'matchzy_minimum_ready_required'
-  | 'matchzy_allow_force_ready'
-  | 'matchzy_kick_when_no_match_loaded'
-  | 'matchzy_whitelist_enabled_default'
-  | 'matchzy_pause_after_restore'
-  | 'matchzy_stop_command_available'
-  | 'matchzy_stop_command_no_damage'
-  | 'matchzy_use_pause_command_for_tactical_pause'
-  | 'matchzy_demo_path'
-  | 'matchzy_demo_name_format'
-  | 'matchzy_series_end_kick_delay_no_demo'
-  | 'matchzy_series_end_kick_delay_demo_no_upload'
-  | 'matchzy_series_end_kick_delay_demo_upload'
-  // MatchZy Enhanced v1.3.0 settings
-  | 'matchzy_autoready_enabled'
-  | 'matchzy_both_teams_unpause_required'
-  | 'matchzy_max_pauses_per_team'
-  | 'matchzy_pause_duration'
-  | 'matchzy_side_selection_enabled'
-  | 'matchzy_side_selection_time'
-  | 'matchzy_gg_enabled'
-  | 'matchzy_gg_threshold'
-  | 'matchzy_gg_min_score_diff'
-  | 'matchzy_ffw_enabled'
-  | 'matchzy_ffw_time'
-  | 'matchzy_demo_recording_enabled';
+  // Players choose their own display name (/api/me/name). Off: admins and imports name them.
+  | 'players_choose_name'
+  // The site's own name (the admin home's H1). Unset = DEFAULT_SITE_NAME.
+  | 'site_name'
+  // The Auto Tournament license key (services/license). Set through
+  // /api/license only; never returned by /api/settings or logged.
+  | 'license_key'
+  // Was the public "Licensed" toggle; the line is always shown now. Unread.
+  | 'license_public_badge'
+  // The admin's acceptance of the license terms, JSON (services/license/consent).
+  // Set through /api/license/consent or AT_ACCEPT_LICENSE only.
+  | 'license_consent'
+  // Earlier acceptances, newest first (JSON array), for the record.
+  | 'license_consent_history'
+  // The daily license check-in (services/license/checkin.ts): this
+  // instance's random id, the last check-in's time and answer, where the
+  // counts start next time, and the event-license question's answer and
+  // state (JSON). Written by the check-in service only.
+  | 'license_instance_id'
+  | 'license_checkin_last_at'
+  | 'license_checkin_result'
+  | 'license_checkin_counted_since'
+  | 'license_event_declaration'
+  | 'license_event_prompt'
+  // The license's current terms from the last check-in (a signed lease, services/license/gate.ts).
+  | 'license_lease'
+  // Integrator webhooks may target private / loopback addresses (LAN events).
+  // Off by default: services/webhooks/ssrf.ts.
+  | 'webhooks_allow_private_targets'
+  // Experimental features (services/experimentalFeatures), off by default.
+  // Set through /api/experimental only.
+  | 'experimental_matchmaking'
+  // What every game's highlights follow (services/highlights/settings.ts).
+  | HighlightSettingKey;
 
 export interface AppSetting {
   key: AppSettingKey;
@@ -46,49 +64,125 @@ export interface AppSetting {
   updated_at: number;
 }
 
-const ALLOWED_KEYS: AppSettingKey[] = [
-  'webhook_url',
-  'simulate_matches',
-  'simulation_timescale',
-  'matchzy_chat_prefix',
-  'matchzy_admin_chat_prefix',
-  'matchzy_knife_enabled_default',
-  'matchzy_debug_chat',
-  'ratings_enabled',
-  'allow_self_register',
-  // MatchZy core defaults (persisted convars)
-  'matchzy_autostart_mode',
-  'matchzy_minimum_ready_required',
-  'matchzy_allow_force_ready',
-  'matchzy_kick_when_no_match_loaded',
-  'matchzy_whitelist_enabled_default',
-  'matchzy_pause_after_restore',
-  'matchzy_stop_command_available',
-  'matchzy_stop_command_no_damage',
-  'matchzy_use_pause_command_for_tactical_pause',
-  'matchzy_demo_path',
-  'matchzy_demo_name_format',
-  'matchzy_series_end_kick_delay_no_demo',
-  'matchzy_series_end_kick_delay_demo_no_upload',
-  'matchzy_series_end_kick_delay_demo_upload',
-  // MatchZy Enhanced v1.3.0 settings
-  'matchzy_autoready_enabled',
-  'matchzy_both_teams_unpause_required',
-  'matchzy_max_pauses_per_team',
-  'matchzy_pause_duration',
-  'matchzy_side_selection_enabled',
-  'matchzy_side_selection_time',
-  'matchzy_gg_enabled',
-  'matchzy_gg_threshold',
-  'matchzy_gg_min_score_diff',
-  'matchzy_ffw_enabled',
-  'matchzy_ffw_time',
-  'matchzy_demo_recording_enabled',
+/** What the site is called until an admin names it. */
+export const DEFAULT_SITE_NAME = 'Auto Tournament';
+
+/** Longest site name the store accepts. */
+export const SITE_NAME_MAX_LENGTH = 80;
+
+/**
+ * The core's settings. `order` places the `PUT /api/settings` fields among
+ * the integrations' ones (see `SettingDefinition.order`).
+ */
+export const CORE_SETTINGS: ReadonlyArray<SettingDefinition & { key: CoreSettingKey }> = [
+  {
+    key: 'site_name',
+    field: 'siteName',
+    order: 5,
+    normalize(trimmed) {
+      if (trimmed.length > SITE_NAME_MAX_LENGTH) {
+        throw new Error(`Site name must be at most ${SITE_NAME_MAX_LENGTH} characters`);
+      }
+      return { value: trimmed, message: `Site name updated to ${trimmed}` };
+    },
+    applyRequest: stringRequest('siteName'),
+  },
+  {
+    key: 'ratings_enabled',
+    field: 'ratingsEnabled',
+    order: 70,
+    normalize: normalizeFlag('Player rating updates'),
+    applyRequest: booleanRequest('ratingsEnabled'),
+  },
+  {
+    key: 'allow_self_register',
+    field: 'allowSelfRegister',
+    order: 90,
+    normalize: normalizeFlag('Player self‑registration'),
+    applyRequest: booleanRequest('allowSelfRegister'),
+  },
+  {
+    key: 'players_choose_name',
+    field: 'playersChooseName',
+    order: 92,
+    normalize: normalizeFlag('Players choosing their display name'),
+    applyRequest: booleanRequest('playersChooseName'),
+  },
+  {
+    key: 'webhooks_allow_private_targets',
+    field: 'webhooksAllowPrivateTargets',
+    order: 95,
+    normalize: normalizeFlag('Webhooks to private and local addresses'),
+    applyRequest: booleanRequest('webhooksAllowPrivateTargets'),
+  },
+  // No `field`: /api/license sets these, PUT /api/settings never does.
+  {
+    key: 'license_key',
+    normalize(trimmed) {
+      return { value: trimmed, message: 'License key saved' };
+    },
+  },
+  {
+    // No longer read: the public license line is always shown (licenseService.getPublicBadge). Kept so stored rows stay valid.
+    key: 'license_public_badge',
+    normalize: normalizeFlag('Public license badge'),
+  },
+  {
+    key: 'license_consent',
+    normalize(trimmed) {
+      return { value: trimmed, message: 'License terms acceptance saved' };
+    },
+  },
+  {
+    key: 'experimental_matchmaking',
+    normalize: normalizeFlag('Experimental feature: matchmaking'),
+  },
+  {
+    key: 'license_consent_history',
+    normalize(trimmed) {
+      return { value: trimmed, message: 'License terms history saved' };
+    },
+  },
+  ...(
+    [
+      'license_instance_id',
+      'license_checkin_last_at',
+      'license_checkin_result',
+      'license_checkin_counted_since',
+      'license_event_declaration',
+      'license_event_prompt',
+      'license_lease',
+    ] as const
+  ).map((key) => ({
+    key,
+    normalize(trimmed: string) {
+      return { value: trimmed, message: `License check-in state saved (${key})` };
+    },
+  })),
+  // Highlights: every game's recorders follow these.
+  ...HIGHLIGHT_SETTINGS,
 ];
+
+/**
+ * Every setting the store accepts: the core's, then each registered
+ * integration's. The registry is loaded lazily: integrations import this
+ * service, so a static import would be a cycle.
+ */
+export async function listSettingDefinitions(): Promise<SettingDefinition[]> {
+  const { listIntegrations } = await import('../integrations/registry');
+  return [
+    ...CORE_SETTINGS,
+    ...listIntegrations().flatMap((integration) => integration.instanceSettings ?? []),
+  ];
+}
+
+async function findDefinition(key: string): Promise<SettingDefinition | undefined> {
+  return (await listSettingDefinitions()).find((definition) => definition.key === key);
+}
 
 class SettingsService {
   async getSetting(key: AppSettingKey): Promise<string | null> {
-    if (!ALLOWED_KEYS.includes(key)) {
+    if (!(await findDefinition(key))) {
       throw new Error(`Unknown setting: ${key}`);
     }
 
@@ -97,316 +191,84 @@ class SettingsService {
 
   async getAllSettings(): Promise<AppSetting[]> {
     const rows = await db.getAllAppSettingsAsync();
+    const known = new Set((await listSettingDefinitions()).map((definition) => definition.key));
     return rows
-      .filter((row): row is AppSetting => ALLOWED_KEYS.includes(row.key as AppSettingKey))
+      .filter((row) => known.has(row.key))
       .map((row) => ({
-        key: row.key as AppSettingKey,
+        key: row.key,
         value: row.value,
         updated_at: row.updated_at,
       }));
   }
 
+  /**
+   * Store a setting. `null` clears it. A value is trimmed; "" clears it too,
+   * unless the setting keeps empty values (`keepEmpty`). Otherwise the
+   * setting's `normalize` decides what is stored, or throws.
+   */
   async setSetting(key: AppSettingKey, value: string | null): Promise<void> {
-    if (!ALLOWED_KEYS.includes(key)) {
+    const definition = await findDefinition(key);
+    if (!definition) {
       throw new Error(`Unknown setting: ${key}`);
     }
 
     if (value !== null) {
       const trimmed = value.trim();
-
-      if (!trimmed) {
-        await db.setAppSettingAsync(key, null);
-        return;
-      }
-
-      if (key === 'webhook_url') {
-        this.validateWebhookUrl(trimmed);
-        const normalized = this.normalizeUrl(trimmed);
-        await db.setAppSettingAsync(key, normalized);
-        log.success(`Webhook URL updated to ${normalized}`);
-        return;
-      }
-
-      if (key === 'simulate_matches') {
-        const normalized = trimmed.toLowerCase();
-        const isEnabled = normalized === '1' || normalized === 'true' || normalized === 'yes';
-        await db.setAppSettingAsync(key, isEnabled ? '1' : '0');
-        log.success(`Simulate matches ${isEnabled ? 'enabled' : 'disabled'}`);
-        return;
-      }
-
-      if (key === 'simulation_timescale') {
-        const parsed = Number(trimmed);
-        if (!Number.isFinite(parsed)) {
-          throw new Error('Simulation timescale must be a number');
-        }
-
-        const clamped = Math.min(4, Math.max(0.1, parsed));
-        await db.setAppSettingAsync(key, String(clamped));
-        log.success(`Simulation timescale updated to ${clamped}`);
-        return;
-      }
-
-      if (key === 'matchzy_chat_prefix' || key === 'matchzy_admin_chat_prefix') {
-        await db.setAppSettingAsync(key, trimmed);
-        log.success(
-          `MatchZy ${key === 'matchzy_chat_prefix' ? 'chat prefix' : 'admin chat prefix'} updated`
-        );
-        return;
-      }
-
-      if (key === 'matchzy_knife_enabled_default') {
-        const normalized = trimmed.toLowerCase();
-        const isEnabled =
-          normalized === '1' ||
-          normalized === 'true' ||
-          normalized === 'yes' ||
-          normalized === 'on' ||
-          normalized === 'enabled';
-        await db.setAppSettingAsync(key, isEnabled ? '1' : '0');
-        log.success(`MatchZy knife round default ${isEnabled ? 'enabled' : 'disabled'}`);
-        return;
-      }
-
-      if (key === 'ratings_enabled') {
-        const normalized = trimmed.toLowerCase();
-        const isEnabled =
-          normalized === '1' ||
-          normalized === 'true' ||
-          normalized === 'yes' ||
-          normalized === 'on' ||
-          normalized === 'enabled';
-        await db.setAppSettingAsync(key, isEnabled ? '1' : '0');
-        log.success(`Player rating updates ${isEnabled ? 'enabled' : 'disabled'}`);
-        return;
-      }
-
-      if (key === 'matchzy_debug_chat') {
-        const normalized = trimmed.toLowerCase();
-        const isEnabled =
-          normalized === '1' ||
-          normalized === 'true' ||
-          normalized === 'yes' ||
-          normalized === 'on' ||
-          normalized === 'enabled';
-        await db.setAppSettingAsync(key, isEnabled ? '1' : '0');
-        log.success(`MatchZy debug chat ${isEnabled ? 'enabled' : 'disabled'}`);
-        return;
-      }
-
-      if (key === 'allow_self_register') {
-        const normalized = trimmed.toLowerCase();
-        const isEnabled =
-          normalized === '1' ||
-          normalized === 'true' ||
-          normalized === 'yes' ||
-          normalized === 'on' ||
-          normalized === 'enabled';
-        await db.setAppSettingAsync(key, isEnabled ? '1' : '0');
-        log.success(`Player self‑registration ${isEnabled ? 'enabled' : 'disabled'}`);
-        return;
-      }
-
-      // MatchZy core boolean settings (0/1)
-      if (
-        key === 'matchzy_allow_force_ready' ||
-        key === 'matchzy_kick_when_no_match_loaded' ||
-        key === 'matchzy_whitelist_enabled_default' ||
-        key === 'matchzy_pause_after_restore' ||
-        key === 'matchzy_stop_command_available' ||
-        key === 'matchzy_stop_command_no_damage' ||
-        key === 'matchzy_use_pause_command_for_tactical_pause'
-      ) {
-        const normalized = trimmed.toLowerCase();
-        const isEnabled =
-          normalized === '1' ||
-          normalized === 'true' ||
-          normalized === 'yes' ||
-          normalized === 'on' ||
-          normalized === 'enabled';
-        await db.setAppSettingAsync(key, isEnabled ? '1' : '0');
-        log.success(`${key} ${isEnabled ? 'enabled' : 'disabled'}`);
-        return;
-      }
-
-      // MatchZy core integer settings
-      if (
-        key === 'matchzy_autostart_mode' ||
-        key === 'matchzy_minimum_ready_required' ||
-        key === 'matchzy_series_end_kick_delay_no_demo' ||
-        key === 'matchzy_series_end_kick_delay_demo_no_upload' ||
-        key === 'matchzy_series_end_kick_delay_demo_upload'
-      ) {
-        const parsed = Number(trimmed);
-        if (!Number.isInteger(parsed)) {
-          throw new Error(`${key} must be an integer`);
-        }
-        if (key === 'matchzy_autostart_mode' && (parsed < 0 || parsed > 2)) {
-          throw new Error('matchzy_autostart_mode must be 0, 1, or 2');
-        }
-        if (key === 'matchzy_minimum_ready_required' && (parsed < 0 || parsed > 10)) {
-          throw new Error('matchzy_minimum_ready_required must be 0-10');
-        }
-        if (
-          (key === 'matchzy_series_end_kick_delay_no_demo' ||
-            key === 'matchzy_series_end_kick_delay_demo_no_upload' ||
-            key === 'matchzy_series_end_kick_delay_demo_upload') &&
-          (parsed < 0 || parsed > 600)
-        ) {
-          throw new Error(`${key} must be 0-600 seconds`);
-        }
-        await db.setAppSettingAsync(key, String(parsed));
-        log.success(`${key} updated to ${parsed}`);
-        return;
-      }
-
-      // MatchZy core string settings
-      if (key === 'matchzy_demo_path') {
-        // MatchZy expects a path relative to csgo/ and it must end with "/".
-        const normalized = trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
-        await db.setAppSettingAsync(key, normalized);
-        log.success('matchzy_demo_path updated');
-        return;
-      }
-
-      if (key === 'matchzy_demo_name_format') {
-        await db.setAppSettingAsync(key, trimmed);
-        log.success('matchzy_demo_name_format updated');
-        return;
-      }
-
-      // MatchZy Enhanced v1.3.0 boolean settings (0/1)
-      if (
-        key === 'matchzy_autoready_enabled' ||
-        key === 'matchzy_both_teams_unpause_required' ||
-        key === 'matchzy_side_selection_enabled' ||
-        key === 'matchzy_gg_enabled' ||
-        key === 'matchzy_ffw_enabled' ||
-        key === 'matchzy_demo_recording_enabled'
-      ) {
-        const normalized = trimmed.toLowerCase();
-        const isEnabled =
-          normalized === '1' ||
-          normalized === 'true' ||
-          normalized === 'yes' ||
-          normalized === 'on' ||
-          normalized === 'enabled';
-        await db.setAppSettingAsync(key, isEnabled ? '1' : '0');
-        log.success(`${key} ${isEnabled ? 'enabled' : 'disabled'}`);
-        return;
-      }
-
-      // MatchZy Enhanced integer settings
-      if (
-        key === 'matchzy_max_pauses_per_team' ||
-        key === 'matchzy_pause_duration' ||
-        key === 'matchzy_side_selection_time' ||
-        key === 'matchzy_ffw_time' ||
-        key === 'matchzy_gg_min_score_diff'
-      ) {
-        const parsed = Number(trimmed);
-        if (!Number.isInteger(parsed)) {
-          throw new Error(`${key} must be an integer`);
-        }
-
-        // Validate ranges
-        if (key === 'matchzy_max_pauses_per_team' && (parsed < 0 || parsed > 999)) {
-          throw new Error('matchzy_max_pauses_per_team must be 0-999');
-        }
-        if (key === 'matchzy_pause_duration' && (parsed < 0 || parsed > 999)) {
-          throw new Error('matchzy_pause_duration must be 0-999 seconds');
-        }
-        if (key === 'matchzy_side_selection_time' && (parsed < 1 || parsed > 999)) {
-          throw new Error('matchzy_side_selection_time must be 1-999 seconds');
-        }
-        if (key === 'matchzy_ffw_time' && (parsed < 1 || parsed > 999)) {
-          throw new Error('matchzy_ffw_time must be 1-999 seconds');
-        }
-        if (key === 'matchzy_gg_min_score_diff' && (parsed < 0 || parsed > 16)) {
-          throw new Error('matchzy_gg_min_score_diff must be 0-16');
-        }
-
-        await db.setAppSettingAsync(key, String(parsed));
-        log.success(`${key} updated to ${parsed}`);
-        return;
-      }
-
-      // MatchZy Enhanced float settings
-      if (key === 'matchzy_gg_threshold') {
-        const parsed = Number(trimmed);
-        if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-          throw new Error('matchzy_gg_threshold must be 0.0-1.0');
-        }
-        await db.setAppSettingAsync(key, String(parsed));
-        log.success(`matchzy_gg_threshold updated to ${parsed}`);
+      if (trimmed || definition.keepEmpty) {
+        const normalized = definition.normalize(trimmed);
+        await db.setAppSettingAsync(key, normalized.value);
+        log.success(normalized.message);
         return;
       }
     }
 
     await db.setAppSettingAsync(key, null);
-    log.success(`Setting ${key} cleared`);
-  }
-
-  async getWebhookUrl(): Promise<string | null> {
-    const value = await this.getSetting('webhook_url');
-    if (value) {
-      return this.normalizeUrl(value);
+    if (value === null) {
+      log.success(`Setting ${key} cleared`);
     }
-
-    return null;
   }
 
-  async requireWebhookUrl(): Promise<string> {
-    const webhookUrl = await this.getWebhookUrl();
-    if (!webhookUrl) {
-      throw new Error('Webhook URL is not configured. Update it from the Settings page.');
+  /**
+   * Apply a `PUT /api/settings` body: every field of the core's and the
+   * integrations' settings (`SettingDefinition.field`) that is present, one
+   * at a time in `order`. Returns the error for a 400 from the first field
+   * that rejects its value; the fields before it stay saved. A value the
+   * store rejects throws.
+   */
+  async applyUpdate(
+    body: Record<string, Untrusted>,
+    ctx: Omit<SettingWriteContext, 'set'>
+  ): Promise<string | undefined> {
+    const editable = (await listSettingDefinitions())
+      .filter((definition) => definition.field && definition.applyRequest)
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+    for (const definition of editable) {
+      const value = body[definition.field as string];
+      if (value === undefined) continue;
+
+      const error = await definition.applyRequest!(value, {
+        ...ctx,
+        set: (stored) => this.setSetting(definition.key, stored),
+      });
+      if (error) return error;
     }
-    return webhookUrl;
+    return undefined;
   }
 
+  /** The site's name, or `DEFAULT_SITE_NAME` while none is set. */
+  async getSiteName(): Promise<string> {
+    const value = await this.getSetting('site_name');
+    return value?.trim() || DEFAULT_SITE_NAME;
+  }
+
+  /** The Steam Web API key: STEAM_API_KEY, else the one saved on Settings -> Sign-in. */
   async isSteamApiConfigured(): Promise<boolean> {
-    const value = process.env.STEAM_API_KEY;
-    return Boolean(value && value.trim().length > 0);
+    return (await this.getSteamApiKey()) !== null;
   }
 
   async getSteamApiKey(): Promise<string | null> {
-    const value = process.env.STEAM_API_KEY;
-    return value && value.trim().length > 0 ? value.trim() : null;
-  }
-
-  async getMatchzyChatPrefix(): Promise<string | null> {
-    const value = await this.getSetting('matchzy_chat_prefix');
-    const trimmed = value ? value.trim() : '';
-    // Default to a sensible prefix if none is configured explicitly
-    return trimmed !== '' ? trimmed : '[{Green}MAT{Default}]';
-  }
-
-  async getMatchzyAdminChatPrefix(): Promise<string | null> {
-    const value = await this.getSetting('matchzy_admin_chat_prefix');
-    const trimmed = value ? value.trim() : '';
-    // Default to a sensible admin prefix if none is configured explicitly
-    return trimmed !== '' ? trimmed : '[{Red}ADMIN{Default}]';
-  }
-
-  async isMatchzyDebugChatEnabled(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_debug_chat');
-    if (!value) {
-      // Explicit default: debug chat off unless enabled.
-      return false;
-    }
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async isKnifeRoundEnabledByDefault(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_knife_enabled_default');
-    if (!value) {
-      // Defer to MatchZy plugin defaults when not explicitly configured
-      return true;
-    }
-
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
+    return effectiveProviderSettings('steam').secret;
   }
 
   async areRatingsEnabled(): Promise<boolean> {
@@ -426,6 +288,27 @@ class SettingsService {
    * players will populate the players list, preventing random Steam logins
    * from appearing in private tournaments.
    */
+  /**
+   * Whether integrator webhooks may be sent to private (RFC 1918, CGNAT,
+   * ULA) and loopback addresses. Off by default; a LAN event whose website
+   * runs on the LAN turns it on. Link-local and reserved ranges stay blocked.
+   */
+  async areWebhookPrivateTargetsAllowed(): Promise<boolean> {
+    const value = await this.getSetting('webhooks_allow_private_targets');
+    if (!value) return false;
+    const normalized = value.toLowerCase();
+    return normalized === '1' || normalized === 'true' || normalized === 'yes';
+  }
+
+  /**
+   * Whether players set their own display name (the in-game name too). Off
+   * (default): admins and imports name players, and players cannot change it.
+   */
+  async canPlayersChooseName(): Promise<boolean> {
+    const value = await this.getSetting('players_choose_name');
+    return value ? isTruthySetting(value) : false;
+  }
+
   async isSelfRegistrationAllowed(): Promise<boolean> {
     const value = await this.getSetting('allow_self_register');
     if (!value) {
@@ -437,175 +320,9 @@ class SettingsService {
     return normalized === '1' || normalized === 'true' || normalized === 'yes';
   }
 
-  async getMatchzyMinimumReadyRequired(): Promise<number> {
-    const value = await this.getSetting('matchzy_minimum_ready_required');
-    if (!value) return 0; // MatchZy Enhanced default (0 = everyone connected must ready)
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 0) return 0;
-    return parsed;
-  }
-
-  async getMatchzyAutostartMode(): Promise<0 | 1 | 2> {
-    const value = await this.getSetting('matchzy_autostart_mode');
-    if (!value) return 1; // MatchZy default
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 2) return 1;
-    return parsed as 0 | 1 | 2;
-  }
-
-  async isMatchzyAllowForceReadyEnabled(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_allow_force_ready');
-    if (!value) return true; // MatchZy default
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async isMatchzyKickWhenNoMatchLoadedEnabled(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_kick_when_no_match_loaded');
-    if (!value) return false; // MatchZy default
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async isMatchzyWhitelistEnabledDefault(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_whitelist_enabled_default');
-    if (!value) return false; // MatchZy default
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async isMatchzyPauseAfterRestoreEnabled(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_pause_after_restore');
-    if (!value) return true; // MatchZy default
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async isMatchzyStopCommandAvailable(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_stop_command_available');
-    if (!value) return false; // MatchZy default
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async isMatchzyStopCommandNoDamage(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_stop_command_no_damage');
-    if (!value) return false; // MatchZy default
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async isMatchzyUsePauseCommandForTacticalPause(): Promise<boolean> {
-    const value = await this.getSetting('matchzy_use_pause_command_for_tactical_pause');
-    if (!value) return false; // MatchZy default
-    const normalized = value.toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  async getMatchzyDemoPath(): Promise<string> {
-    const value = await this.getSetting('matchzy_demo_path');
-    if (!value) return 'MatchZy/'; // MatchZy default
-    const trimmed = value.trim();
-    if (!trimmed) return 'MatchZy/';
-    return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
-  }
-
-  async getMatchzyDemoNameFormat(): Promise<string> {
-    const value = await this.getSetting('matchzy_demo_name_format');
-    if (!value) return '{TIME}_{MATCH_ID}_{MAP}_{TEAM1}_vs_{TEAM2}'; // MatchZy default
-    const trimmed = value.trim();
-    return trimmed !== '' ? trimmed : '{TIME}_{MATCH_ID}_{MAP}_{TEAM1}_vs_{TEAM2}';
-  }
-
-  async getMatchzySeriesEndKickDelayNoDemo(): Promise<number> {
-    const value = await this.getSetting('matchzy_series_end_kick_delay_no_demo');
-    if (!value) return 5; // MatchZy default
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 0) return 5;
-    return parsed;
-  }
-
-  async getMatchzySeriesEndKickDelayDemoNoUpload(): Promise<number> {
-    const value = await this.getSetting('matchzy_series_end_kick_delay_demo_no_upload');
-    if (!value) return 10; // MatchZy default
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 0) return 10;
-    return parsed;
-  }
-
-  async getMatchzySeriesEndKickDelayDemoUpload(): Promise<number> {
-    const value = await this.getSetting('matchzy_series_end_kick_delay_demo_upload');
-    if (!value) return 60; // MatchZy default
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 0) return 60;
-    return parsed;
-  }
-
-  async getMatchzyCoreDefaults(): Promise<{
-    autostartMode: 0 | 1 | 2;
-    minimumReadyRequired: number;
-    allowForceReady: boolean;
-    kickWhenNoMatchLoaded: boolean;
-    whitelistEnabledDefault: boolean;
-    pauseAfterRestore: boolean;
-    stopCommandAvailable: boolean;
-    stopCommandNoDamage: boolean;
-    usePauseCommandForTacticalPause: boolean;
-    demoPath: string;
-    demoNameFormat: string;
-    seriesEndKickDelayNoDemo: number;
-    seriesEndKickDelayDemoNoUpload: number;
-    seriesEndKickDelayDemoUpload: number;
-  }> {
-    const [
-      autostartMode,
-      minimumReadyRequired,
-      allowForceReady,
-      kickWhenNoMatchLoaded,
-      whitelistEnabledDefault,
-      pauseAfterRestore,
-      stopCommandAvailable,
-      stopCommandNoDamage,
-      usePauseCommandForTacticalPause,
-      demoPath,
-      demoNameFormat,
-      seriesEndKickDelayNoDemo,
-      seriesEndKickDelayDemoNoUpload,
-      seriesEndKickDelayDemoUpload,
-    ] = await Promise.all([
-      this.getMatchzyAutostartMode(),
-      this.getMatchzyMinimumReadyRequired(),
-      this.isMatchzyAllowForceReadyEnabled(),
-      this.isMatchzyKickWhenNoMatchLoadedEnabled(),
-      this.isMatchzyWhitelistEnabledDefault(),
-      this.isMatchzyPauseAfterRestoreEnabled(),
-      this.isMatchzyStopCommandAvailable(),
-      this.isMatchzyStopCommandNoDamage(),
-      this.isMatchzyUsePauseCommandForTacticalPause(),
-      this.getMatchzyDemoPath(),
-      this.getMatchzyDemoNameFormat(),
-      this.getMatchzySeriesEndKickDelayNoDemo(),
-      this.getMatchzySeriesEndKickDelayDemoNoUpload(),
-      this.getMatchzySeriesEndKickDelayDemoUpload(),
-    ]);
-
-    return {
-      autostartMode,
-      minimumReadyRequired,
-      allowForceReady,
-      kickWhenNoMatchLoaded,
-      whitelistEnabledDefault,
-      pauseAfterRestore,
-      stopCommandAvailable,
-      stopCommandNoDamage,
-      usePauseCommandForTacticalPause,
-      demoPath,
-      demoNameFormat,
-      seriesEndKickDelayNoDemo,
-      seriesEndKickDelayDemoNoUpload,
-      seriesEndKickDelayDemoUpload,
-    };
-  }
+  // The simulation keys are declared by CS2 (its `instanceSettings`), but the
+  // core scheduler and Swiss progression read simulation mode as well, so
+  // these two readers stay here.
 
   /**
    * Returns the simulation timescale factor for simulated matches.
@@ -621,24 +338,22 @@ class SettingsService {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return 1;
 
-    // Clamp to a safe, expected range (0.1 – 4.0) to match the frontend slider.
-    if (parsed < 0.1) return 0.1;
-    if (parsed > 4) return 4;
-    return parsed;
+    // Values stored before the ceiling changed may be out of range.
+    return clampSimulationTimescale(parsed);
   }
 
   /**
-   * Returns true when simulation mode should be enabled for generated MatchZy configs.
+   * Returns true when simulation mode should be enabled for generated MatchZy Enhanced configs.
    *
    * This is intended as a **development-only** helper; in production environments
    * it always returns false unless explicitly overridden via environment.
    */
   async isSimulationModeEnabled(): Promise<boolean> {
     // By default, hard-disable simulation in production for safety. It can be
-    // explicitly enabled by setting MATCHZY_ENABLE_SIMULATION_IN_PROD=true in
+    // explicitly enabled by setting AT_ENABLE_SIMULATION_IN_PROD=true in
     // the API environment (e.g. for test events or lab environments).
     if (process.env.NODE_ENV === 'production') {
-      if (process.env.MATCHZY_ENABLE_SIMULATION_IN_PROD?.toLowerCase() !== 'true') {
+      if (process.env.AT_ENABLE_SIMULATION_IN_PROD?.toLowerCase() !== 'true') {
         return false;
       }
     }
@@ -648,78 +363,6 @@ class SettingsService {
 
     const normalized = value.toLowerCase();
     return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-
-  /**
-   * Get MatchZy Enhanced v1.3.0 global configuration overrides.
-   * Returns null for any setting that is not explicitly configured (use tournament defaults).
-   */
-  async getMatchzyEnhancedSettings(): Promise<{
-    matchzy_autoready_enabled: 0 | 1 | null;
-    matchzy_both_teams_unpause_required: 0 | 1 | null;
-    matchzy_max_pauses_per_team: number | null;
-    matchzy_pause_duration: number | null;
-    matchzy_side_selection_enabled: 0 | 1 | null;
-    matchzy_side_selection_time: number | null;
-    matchzy_gg_enabled: 0 | 1 | null;
-    matchzy_gg_threshold: number | null;
-    matchzy_gg_min_score_diff: number | null;
-    matchzy_ffw_enabled: 0 | 1 | null;
-    matchzy_ffw_time: number | null;
-    matchzy_demo_recording_enabled: 0 | 1 | null;
-  }> {
-    const parseBooleanSetting = async (key: AppSettingKey): Promise<0 | 1 | null> => {
-      const value = await this.getSetting(key);
-      if (!value) return null;
-      const normalized = value.toLowerCase();
-      return normalized === '1' || normalized === 'true' || normalized === 'yes' ? 1 : 0;
-    };
-
-    const parseIntSetting = async (key: AppSettingKey): Promise<number | null> => {
-      const value = await this.getSetting(key);
-      if (!value) return null;
-      const parsed = Number(value);
-      return Number.isInteger(parsed) ? parsed : null;
-    };
-
-    const parseFloatSetting = async (key: AppSettingKey): Promise<number | null> => {
-      const value = await this.getSetting(key);
-      if (!value) return null;
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : null;
-    };
-
-    return {
-      matchzy_autoready_enabled: await parseBooleanSetting('matchzy_autoready_enabled'),
-      matchzy_both_teams_unpause_required: await parseBooleanSetting(
-        'matchzy_both_teams_unpause_required'
-      ),
-      matchzy_max_pauses_per_team: await parseIntSetting('matchzy_max_pauses_per_team'),
-      matchzy_pause_duration: await parseIntSetting('matchzy_pause_duration'),
-      matchzy_side_selection_enabled: await parseBooleanSetting('matchzy_side_selection_enabled'),
-      matchzy_side_selection_time: await parseIntSetting('matchzy_side_selection_time'),
-      matchzy_gg_enabled: await parseBooleanSetting('matchzy_gg_enabled'),
-      matchzy_gg_threshold: await parseFloatSetting('matchzy_gg_threshold'),
-      matchzy_gg_min_score_diff: await parseIntSetting('matchzy_gg_min_score_diff'),
-      matchzy_ffw_enabled: await parseBooleanSetting('matchzy_ffw_enabled'),
-      matchzy_ffw_time: await parseIntSetting('matchzy_ffw_time'),
-      matchzy_demo_recording_enabled: await parseBooleanSetting('matchzy_demo_recording_enabled'),
-    };
-  }
-
-  private normalizeUrl(url: string): string {
-    const normalized = url.replace(/\/+$/, '');
-    return normalized || url;
-  }
-
-  private validateWebhookUrl(url: string): void {
-    try {
-      new URL(url);
-    } catch {
-      throw new Error(
-        'Invalid webhook URL. Please provide a full URL including protocol (e.g., https://example.com)'
-      );
-    }
   }
 }
 

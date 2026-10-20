@@ -1,14 +1,17 @@
 /**
- * Event Logger - Persistent file logging for all MatchZy webhook events
+ * Event Logger - Persistent file logging for all MatchZy Enhanced webhook events
  * Logs are stored in data/logs/events/ for debugging and recovery
  */
 
 import fs from 'fs';
 import path from 'path';
-import { MatchZyEvent } from '../types/matchzy-events.types';
+import type { GameWebhookEvent } from '../types/socket.types';
+import { log } from './logger';
+import { DATA_DIR } from '../config/dataDir';
 
-// Logs live under the api/data directory to keep the repo root clean
-const LOGS_DIR = path.join(__dirname, '..', '..', 'data', 'logs', 'events');
+// Logs live under DATA_DIR to keep the repo root clean, and so they survive
+// container recreates (see config/dataDir.ts / config/migrateLegacyDataDir.ts).
+const LOGS_DIR = path.join(DATA_DIR, 'logs', 'events');
 const ALL_EVENTS_FILE = path.join(LOGS_DIR, 'events-all.txt');
 
 // Ensure logs directory exists
@@ -20,7 +23,7 @@ if (!fs.existsSync(LOGS_DIR)) {
  * Log a webhook event to file
  * Creates daily log files: events-YYYY-MM-DD.log
  */
-export function logWebhookEvent(serverId: string, matchSlug: string, event: MatchZyEvent): void {
+export function logWebhookEvent(serverId: string, matchSlug: string, event: GameWebhookEvent): void {
   try {
     // Get current date for filename
     const date = new Date();
@@ -70,7 +73,7 @@ export function cleanupOldLogs(daysToKeep = 30): void {
       if (fileDate < cutoffDate) {
         const filepath = path.join(LOGS_DIR, file);
         fs.unlinkSync(filepath);
-        console.log(`Deleted old event log: ${file}`);
+        log.info(`Deleted old event log: ${file}`);
       }
     });
   } catch (error) {

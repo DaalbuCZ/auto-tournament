@@ -1,4 +1,4 @@
-export type AuthProviderId = 'steam' | 'keycloak' | 'discord' | 'github';
+export type AuthProviderId = 'steam' | 'discord' | 'github' | 'google' | 'twitch' | 'epic' | 'oidc';
 
 export type AuthProviderKind = 'steam-openid' | 'oidc' | 'oauth2';
 
@@ -23,14 +23,6 @@ export interface BaseAuthProviderConfig {
    * Whether this provider is currently enabled based on configuration.
    */
   enabled: boolean;
-  /**
-   * Optional UI customization for the login button associated with this provider.
-   * These are intentionally non-functional (visual only) and safe to expose to the frontend.
-   */
-  buttonLabel?: string;
-  buttonBgColor?: string;
-  buttonTextColor?: string;
-  buttonHoverBgColor?: string;
 }
 
 export interface SteamAuthProviderConfig extends BaseAuthProviderConfig {
@@ -38,14 +30,17 @@ export interface SteamAuthProviderConfig extends BaseAuthProviderConfig {
   kind: 'steam-openid';
 }
 
-export interface KeycloakAuthProviderConfig extends BaseAuthProviderConfig {
-  id: 'keycloak';
+export interface OidcAuthProviderConfig extends BaseAuthProviderConfig {
+  id: 'oidc';
   kind: 'oidc';
   /**
-   * Public issuer URL of the Keycloak realm (e.g. https://sso.example.com/realms/my-realm).
-   * This is intentionally public metadata; client IDs/secrets remain server-side only.
+   * The OpenID Connect issuer (e.g. https://sso.example.com/realms/my-realm).
+   * Public metadata; the client id and secret stay on the server.
    */
   issuerUrl: string;
+  /** The button's logo (GET /api/auth/oidc/logo) and colour (#rrggbb), when the admin set them. */
+  logoUrl?: string | null;
+  buttonColor?: string | null;
 }
 
 export interface DiscordAuthProviderConfig extends BaseAuthProviderConfig {
@@ -58,10 +53,26 @@ export interface GitHubAuthProviderConfig extends BaseAuthProviderConfig {
   kind: 'oauth2';
 }
 
+export interface GoogleAuthProviderConfig extends BaseAuthProviderConfig {
+  id: 'google';
+  kind: 'oauth2';
+}
+
+export interface TwitchAuthProviderConfig extends BaseAuthProviderConfig {
+  id: 'twitch';
+  kind: 'oauth2';
+}
+
+export interface EpicAuthProviderConfig extends BaseAuthProviderConfig {
+  id: 'epic';
+  kind: 'oauth2';
+}
+
 export type AuthProviderConfig =
   | SteamAuthProviderConfig
-  | KeycloakAuthProviderConfig
+  | OidcAuthProviderConfig
   | DiscordAuthProviderConfig
-  | GitHubAuthProviderConfig;
-
-
+  | GitHubAuthProviderConfig
+  | GoogleAuthProviderConfig
+  | TwitchAuthProviderConfig
+  | EpicAuthProviderConfig;

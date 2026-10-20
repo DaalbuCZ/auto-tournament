@@ -25,7 +25,7 @@ test.describe.serial('Authentication', () => {
     await page.evaluate(() => localStorage.clear());
   });
 
-  test.skip(
+  test(
     'should display login page when not authenticated',
     {
       tag: ['@ui', '@auth', '@login'],
@@ -34,12 +34,44 @@ test.describe.serial('Authentication', () => {
       await page.goto('/login');
       await expect(page).toHaveTitle(/Login/i);
 
-      // Check for login form elements
-      const passwordInput = page.getByTestId('login-api-token-input');
-      await expect(passwordInput).toBeVisible();
+      // Login is provider-based (SSO): one button per *enabled* provider. Which
+      // providers are enabled depends on the environment — Steam, for instance,
+      // only appears when STEAM_API_KEY is configured — so drive the assertion
+      // off what the API actually reports.
+      const providers: Array<{ id: string; enabled?: boolean }> = (
+        await (await page.request.get('/api/auth/providers')).json()
+      ).providers;
+      const enabled = providers.filter((provider) => provider.enabled);
 
-      const loginButton = page.getByTestId('login-sign-in-button');
-      await expect(loginButton).toBeVisible();
+      for (const provider of enabled) {
+        const testId =
+          provider.id === 'steam'
+            ? 'login-steam-sign-in-button'
+            : `login-${provider.id}-sign-in-button`;
+        await expect(page.getByTestId(testId)).toBeVisible();
+      }
+
+      const local = (await (await page.request.get('/api/auth/local/status')).json()) as {
+        setup?: boolean;
+        enabled?: boolean;
+      };
+      // The username + password admin login has a visible link while it is on.
+      if (local.enabled && !local.setup) {
+        const admin = page.getByTestId('login-admin-link');
+        await expect(admin).toBeVisible();
+        await expect(admin).toHaveAttribute('href', '/login/admin');
+      }
+      if (local.setup) {
+        // No admin yet: the page points at /setup instead.
+        await expect(page.getByTestId('login-setup-notice')).toBeVisible();
+      } else if (enabled.length === 0) {
+        // No provider configured: the page must say so rather than look broken.
+        await expect(page.getByText(/sign-in is temporarily unavailable/i)).toBeVisible();
+      }
+
+      // There is no password/API-token field any more; make sure one has not
+      // crept back in, since that would mean a second, unguarded way in.
+      await expect(page.getByTestId('login-api-token-input')).toHaveCount(0);
     }
   );
 
@@ -49,7 +81,7 @@ test.describe.serial('Authentication', () => {
       tag: ['@ui', '@auth', '@login'],
     },
     async ({ page }) => {
-      await page.goto('/teams');
+      await page.goto('/manage/teams');
 
       // Should redirect to login
       await expect(page).toHaveURL(/\/login/);
@@ -116,7 +148,7 @@ test.describe.serial('Authentication', () => {
     }
   );
 
-  test.skip(
+  test(
     'should use ensureSignedIn helper to auto-sign-in',
     {
       tag: ['@ui', '@auth', '@login'],
@@ -146,7 +178,7 @@ test.describe.serial('Normal user cannot access admin', () => {
   });
 
   test(
-    'redirects normal user to player page when visiting admin routes',
+    'normal user gets Home at / and is sent to their player page from admin routes',
     { tag: ['@ui', '@auth', '@admin'] },
     async ({ page }) => {
       const ok = await signInAsPlayer(page, nonAdminSteamId);
@@ -154,13 +186,15 @@ test.describe.serial('Normal user cannot access admin', () => {
 
       const playerUrl = new RegExp(`/player/${nonAdminSteamId}`);
 
+      // Signed-in players land on Home at "/" (not the admin dashboard, not login).
       await page.goto('/');
+      await expect(page).toHaveURL(/\/$/, { timeout: 10000 });
+      await expect(page.getByTestId('home-page')).toBeVisible({ timeout: 10000 });
+
+      await page.goto('/manage/system');
       await expect(page).toHaveURL(playerUrl, { timeout: 10000 });
 
-      await page.goto('/admin');
-      await expect(page).toHaveURL(playerUrl, { timeout: 10000 });
-
-      await page.goto('/teams');
+      await page.goto('/manage/teams');
       await expect(page).toHaveURL(playerUrl, { timeout: 10000 });
     }
   );

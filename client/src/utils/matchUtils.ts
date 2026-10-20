@@ -2,11 +2,16 @@
  * Utility functions for match-related data formatting and calculations
  */
 
+import i18n from '../i18n';
+import { bareSlug, isGrandFinalSlug, isLosersBracketSlug } from './matchSlug';
+import { fmtDateTime } from './time';
+import type { Untrusted } from './untrusted';
+
 /**
  * Format a Unix timestamp to a localized date string
  */
 export const formatDate = (timestamp: number): string => {
-  return new Date(timestamp * 1000).toLocaleString();
+  return fmtDateTime(timestamp);
 };
 
 /**
@@ -49,6 +54,25 @@ export const calculateOvertimeNumber = (
 };
 
 /**
+ * A Swiss match for a round that has not been paired yet. Its teams are picked
+ * from the standings once the previous round is complete, so it is waiting for
+ * pairing rather than for a veto.
+ */
+export const isUnpairedSwissMatch = (match: {
+  slug?: string;
+  status: string;
+  team1?: Untrusted;
+  team2?: Untrusted;
+}): boolean =>
+  match.status === 'pending' &&
+  !match.team1 &&
+  !match.team2 &&
+  /^swiss-r\d+m\d+$/.test(bareSlug(match.slug));
+
+export const waitingForPairingLabel = (): string =>
+  i18n.t('matchesPage.statusLabel.waitingForPairing');
+
+/**
  * Get a human-readable label for a match status
  */
 export const getStatusLabel = (
@@ -62,30 +86,30 @@ export const getStatusLabel = (
   maxRounds?: number,
   overtimeRoundsPerSegment?: number
 ): string => {
-  if (walkover) return 'WALKOVER';
+  const label = (key: string, options?: Record<string, Untrusted>) =>
+    i18n.t(`matchesPage.statusLabel.${key}`, options);
+
+  if (walkover) return label('walkover');
 
   switch (status) {
     case 'pending':
-      if (tournamentStarted === false) return 'WAITING FOR TOURNAMENT TO START';
+      if (tournamentStarted === false) return label('waitingForTournament');
       // If veto is completed but no server, show waiting for server
-      if (vetoCompleted === true && hasServer === false) return 'WAITING FOR SERVER';
-      return 'VETO PENDING';
+      if (vetoCompleted === true && hasServer === false) return label('waitingForServer');
+      return label('vetoPending');
     case 'ready':
-      if (tournamentStarted === false) return 'WAITING FOR TOURNAMENT START';
-      if (vetoCompleted === false) return 'MAP VETO';
-      // If veto is completed but no server, show waiting for server
-      if (vetoCompleted === true && hasServer === false) return 'WAITING FOR SERVER';
+      if (tournamentStarted === false) return label('waitingForTournament');
+      if (vetoCompleted === false) return label('mapVeto');
+      // Only a match that actually has a server is "server allocated"; a
+      // waiting match without one used to show it in the bracket list view.
+      if (hasServer !== true) return label('waitingForServer');
       // Veto complete and server assigned – match is queued to be loaded on the server.
-      return 'SERVER ALLOCATED';
+      return label('serverAllocated');
     case 'loaded':
-      return 'WARMUP';
+      return label('warmup');
     case 'live':
       // Check if in overtime
-      if (
-        typeof team1Score === 'number' &&
-        typeof team2Score === 'number' &&
-        maxRounds
-      ) {
+      if (typeof team1Score === 'number' && typeof team2Score === 'number' && maxRounds) {
         const overtimeNumber = calculateOvertimeNumber(
           team1Score,
           team2Score,
@@ -93,14 +117,16 @@ export const getStatusLabel = (
           overtimeRoundsPerSegment
         );
         if (overtimeNumber !== null) {
-          return `OVERTIME #${overtimeNumber}`;
+          return label('overtime', { n: overtimeNumber });
         }
       }
-      return 'LIVE';
+      return label('live');
     case 'completed':
-      return 'COMPLETED';
+      return label('completed');
     case 'cancelled':
-      return 'CANCELLED';
+      return label('cancelled');
+    case 'needs_decision':
+      return label('needsDecision');
     default:
       return status.toUpperCase();
   }
@@ -174,11 +200,7 @@ export const getDetailedStatusLabel = (
       return 'Server ready - Waiting for players';
     case 'live':
       // Check if in overtime
-      if (
-        typeof team1Score === 'number' &&
-        typeof team2Score === 'number' &&
-        maxRounds
-      ) {
+      if (typeof team1Score === 'number' && typeof team2Score === 'number' && maxRounds) {
         const overtimeNumber = calculateOvertimeNumber(
           team1Score,
           team2Score,
@@ -236,6 +258,8 @@ export const getStatusExplanation = (
       return '';
     case 'completed':
       return 'Match has finished. Winner has been determined and bracket has been updated.';
+    case 'needs_decision':
+      return 'Every map has been played but the series is level. An admin has to set the winner.';
     default:
       return '';
   }
@@ -247,24 +271,36 @@ export const getStatusExplanation = (
 export const getStatusColor = (
   status: string,
   walkover: boolean = false
-): 'error' | 'warning' | 'info' | 'success' | 'default' => {
+): 'error' | 'warning' | 'info' | 'success' | 'primary' | 'default' => {
   if (walkover) return 'warning';
 
+  // Colours follow the homepage cards: live is green, finished is the solid
+  // brand orange chip.
   switch (status) {
     case 'live':
-      return 'error'; // Red - match is live
+      return 'success'; // Green - match is live
     case 'loaded':
       return 'info'; // Blue - server loaded, waiting for players
     case 'ready':
-      return 'warning'; // Yellow/Orange - ready to start
+      return 'warning'; // Amber - ready to start
     case 'completed':
-      return 'success'; // Green - match finished
+      return 'primary'; // Orange - match finished
     case 'cancelled':
       return 'error'; // Red - match was cancelled
+    case 'needs_decision':
+      return 'warning'; // Maps are over, an admin has to set the winner
     default:
       return 'default'; // Gray - pending or unknown
   }
 };
+
+/**
+ * Rounds in a single-elimination bracket of `teamCount` teams (8 → 3), the
+ * count `getRoundLabel` needs to name the last rounds. Undefined for other
+ * formats: their rounds have no stage names.
+ */
+export const eliminationRoundCount = (teamCount: number, type?: string): number | undefined =>
+  type === 'single_elimination' && teamCount >= 2 ? Math.ceil(Math.log2(teamCount)) : undefined;
 
 /**
  * Get a human-readable label for a tournament round
@@ -273,11 +309,88 @@ export const getStatusColor = (
  */
 export const getRoundLabel = (round: number, totalRounds?: number): string => {
   if (totalRounds) {
-    if (round === totalRounds) return 'Finals';
-    if (round === totalRounds - 1) return 'Semi-Finals';
-    if (round === totalRounds - 2) return 'Quarter-Finals';
+    if (round === totalRounds) return i18n.t('rounds.finals');
+    if (round === totalRounds - 1) return i18n.t('rounds.semifinals');
+    if (round === totalRounds - 2) return i18n.t('rounds.quarterfinals');
   }
 
-  if (round === 1) return 'Round 1';
-  return `Round ${round}`;
+  return i18n.t('rounds.roundN', { n: round });
+};
+
+type BracketMatchRef = {
+  id: number;
+  slug: string;
+  round: number;
+  matchNumber: number;
+  bracket?: string | null;
+};
+
+/** 'WB' | 'LB' | 'GF' | 'GF_RESET' | 'SE' | null, falling back to the slug. */
+export const getMatchBracket = (
+  match: Pick<BracketMatchRef, 'slug' | 'bracket'>
+): string | null => {
+  if (match.bracket) return match.bracket;
+  if (isGrandFinalSlug(match.slug)) return 'GF';
+  if (isLosersBracketSlug(match.slug)) return 'LB';
+  return null;
+};
+
+/** Chronological stage; mirrors queueStage in api/src/core/allocationQueue.ts. */
+const matchStage = (match: BracketMatchRef): number => {
+  if (match.round <= 0) return -1;
+  const bracket = getMatchBracket(match);
+  if (bracket === 'GF') return 100000;
+  if (bracket === 'GF_RESET') return 100001;
+  if (bracket === 'LB') return match.round + 1;
+  return 2 * match.round - 1;
+};
+
+const bracketRank = (match: BracketMatchRef): number => {
+  const bracket = getMatchBracket(match);
+  return bracket === 'LB' ? 1 : bracket === 'GF' ? 2 : bracket === 'GF_RESET' ? 3 : 0;
+};
+
+/**
+ * Display / queue order: stage, upper before lower bracket, round, match
+ * number, id. Double elimination numbers upper and lower rounds separately and
+ * the grand final is round 1 match 1, so plain round order numbered it #3.
+ */
+export const compareMatchOrder = (a: BracketMatchRef, b: BracketMatchRef): number =>
+  matchStage(a) - matchStage(b) ||
+  bracketRank(a) - bracketRank(b) ||
+  a.round - b.round ||
+  a.matchNumber - b.matchNumber ||
+  a.id - b.id;
+
+/** 1-based position of `match` among `all` in display order. */
+export const getGlobalMatchNumber = (match: BracketMatchRef, all: BracketMatchRef[]): number =>
+  [...all].sort(compareMatchOrder).findIndex((m) => m.id === match.id) + 1;
+
+/**
+ * Bracket-aware label for double-elimination matches: "UB R1 M1", "LB R2 M1",
+ * "Grand Final". Null for every other match, which keeps "Match #n".
+ */
+export const getBracketMatchLabel = (
+  match: Pick<BracketMatchRef, 'slug' | 'bracket' | 'round' | 'matchNumber'>
+): string | null => {
+  const bracket = getMatchBracket(match);
+  const params = { round: match.round, match: match.matchNumber };
+  switch (bracket) {
+    case 'WB':
+      return i18n.t('matchesPage.matchLabel.upper', params);
+    case 'LB':
+      return i18n.t('matchesPage.matchLabel.lower', params);
+    case 'GF':
+      return i18n.t('matchesPage.matchLabel.grandFinal');
+    case 'GF_RESET':
+      return i18n.t('matchesPage.matchLabel.grandFinalReset');
+    // Groups, then playoffs: a group's match ("Group A · Round 2").
+    case 'GA':
+    case 'GB':
+    case 'GC':
+    case 'GD':
+      return i18n.t('matchesPage.matchLabel.group', { group: bracket[1], round: match.round });
+    default:
+      return null;
+  }
 };

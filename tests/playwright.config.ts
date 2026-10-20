@@ -9,6 +9,11 @@ import { defineConfig, devices } from '@playwright/test';
 /**
  * See https://playwright.dev/docs/test-configuration.
  */
+// Specs that import the DB layer directly (e.g. tests/api/settings.spec.ts) must
+// be pointed at a database explicitly: never fall back to 127.0.0.1:5432 on a
+// developer machine. CI sets its own env and is left alone.
+if (!process.env.CI) process.env.AT_REQUIRE_EXPLICIT_DB = '1';
+
 export default defineConfig({
   // When the config file is inside tests/, point at the current dir
   testDir: './',
@@ -26,11 +31,21 @@ export default defineConfig({
     ['html', { outputFolder: '../playwright-report', open: 'never' }],
     ['list'],
   ],
+  /* CI runners are markedly slower than a dev machine. Every E2E failure in the
+     first CI run was a 5s assertion timeout (Playwright's default) rather than a
+     logic error — 13 more tests only passed on retry. Give CI real headroom;
+     keep local runs snappy so a genuine hang still surfaces quickly. */
+  expect: {
+    timeout: process.env.CI ? 15_000 : 5_000,
+  },
+
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
     /* Base URL to use in actions like `await page.goto('/')`. */
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:3069',
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
+    actionTimeout: process.env.CI ? 15_000 : 0,
+    navigationTimeout: process.env.CI ? 30_000 : 0,
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
@@ -55,11 +70,12 @@ export default defineConfig({
 
   /* Run your local dev server before starting the tests */
   /* Disabled when using Docker Compose (test script handles server startup) */
-  webServer: process.env.SKIP_WEBSERVER ? undefined : {
-    command: 'yarn start',
-    url: 'http://localhost:3069',
-    reuseExistingServer: !process.env.CI,
-    timeout: 120 * 1000,
-  },
+  webServer: process.env.SKIP_WEBSERVER
+    ? undefined
+    : {
+        command: 'yarn start',
+        url: 'http://localhost:3069',
+        reuseExistingServer: !process.env.CI,
+        timeout: 120 * 1000,
+      },
 });
-

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Box,
   Typography,
@@ -10,8 +10,7 @@ import {
   Tooltip,
   IconButton,
 } from '@mui/material';
-import PersonAddIcon from '@mui/icons-material/PersonAdd';
-import InfoIcon from '@mui/icons-material/Info';
+import { InfoIcon, UserPlusIcon } from '@phosphor-icons/react';
 import { api } from '../../utils/api';
 import PlayerSelectionModal from '../modals/PlayerSelectionModal';
 // RegisteredPlayer matches the PlayerRecord type from the API
@@ -122,7 +121,7 @@ export function ShufflePlayerRegistration({
 
   return (
     <>
-      <Card sx={{ width: '33%', display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
+      <Card sx={{ width: '100%', display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
         <CardContent
           sx={{
             display: 'flex',
@@ -147,7 +146,7 @@ export function ShufflePlayerRegistration({
               enterDelay={500}
             >
               <IconButton size="small" sx={{ p: 0.5 }}>
-                <InfoIcon fontSize="small" color="action" />
+                <Box component={InfoIcon} size={20} sx={{ color: 'action.active' }} />
               </IconButton>
             </Tooltip>
           </Box>
@@ -189,7 +188,7 @@ export function ShufflePlayerRegistration({
 
               <Button
                 variant={registeredPlayers.length >= teamSize * 2 ? 'outlined' : 'contained'}
-                startIcon={<PersonAddIcon />}
+                startIcon={<UserPlusIcon />}
                 onClick={() => setPlayerSelectionOpen(true)}
                 disabled={registering}
                 sx={{ width: '100%' }}

@@ -6,22 +6,19 @@
 
 import { db } from '../config/database';
 import { log } from '../utils/logger';
-import { refreshConnectionsFromServer, fetchMatchReport, applyMatchReport } from './connectionSnapshotService';
-import { settingsService } from './settingsService';
+import { integrationForMatch } from '../integrations/registry';
 import type { DbMatchRow } from '../types/database.types';
 
 export interface RecoveryResult {
   matchSlug: string;
   success: boolean;
   stateSynced: boolean;
-  webhookReconfigured: boolean;
-  demoUploadReconfigured: boolean;
   error?: string;
 }
 
 /**
  * Recover all active matches on startup
- * Syncs match state from servers and reconfigures webhooks/demos
+ * Syncs match state from servers and refreshes player connections
  */
 export async function recoverActiveMatches(): Promise<RecoveryResult[]> {
   log.info('[Recovery] Starting match recovery on startup...');
@@ -44,12 +41,8 @@ export async function recoverActiveMatches(): Promise<RecoveryResult[]> {
 
     const results: RecoveryResult[] = [];
 
-    // Get webhook base URL for reconfiguration
-    const baseUrl = await settingsService.getSetting('webhook_url');
-    const serverToken = process.env.SERVER_TOKEN || '';
-
     for (const match of activeMatches) {
-      const result = await recoverMatch(match, baseUrl, serverToken);
+      const result = await recoverMatch(match);
       results.push(result);
     }
 
@@ -68,17 +61,11 @@ export async function recoverActiveMatches(): Promise<RecoveryResult[]> {
 /**
  * Recover a single match
  */
-async function recoverMatch(
-  match: DbMatchRow,
-  baseUrl: string | null,
-  serverToken: string
-): Promise<RecoveryResult> {
+async function recoverMatch(match: DbMatchRow): Promise<RecoveryResult> {
   const result: RecoveryResult = {
     matchSlug: match.slug,
     success: false,
     stateSynced: false,
-    webhookReconfigured: false,
-    demoUploadReconfigured: false,
   };
 
   try {
@@ -92,17 +79,14 @@ async function recoverMatch(
 
     // 1. Sync match state from server (fetch match report)
     try {
-      const report = await fetchMatchReport(match.server_id);
-      if (report) {
-        await applyMatchReport(match.slug, report);
+      const synced = await integrationForMatch(match).syncMatchState?.(match.slug, {
+        resourceId: match.server_id,
+      });
+      if (synced) {
         result.stateSynced = true;
-        log.success(`[Recovery] Synced match state for ${match.slug}`, {
-          map: report.match?.map?.name,
-          phase: report.match?.phase,
-          score: report.match?.score,
-        });
+        log.success(`[Recovery] Synced match state for ${match.slug}`, synced);
       } else {
-        log.warn(`[Recovery] Could not fetch match report for ${match.slug}`, {
+        log.info(`[Recovery] No match report from server for ${match.slug} (yet)`, {
           serverId: match.server_id,
         });
       }
@@ -112,28 +96,9 @@ async function recoverMatch(
       });
     }
 
-    // 2. Ensure persistent configuration is initialized (webhook and demo upload)
-    // Note: With persistent configuration, the server stores webhook/demo URLs in its database.
-    // We just need to make sure it's been initialized once. This is idempotent.
-    if (baseUrl && serverToken) {
-      try {
-        const { serverInitializationService } = await import('./serverInitializationService');
-        await serverInitializationService.initializeServer(match.server_id, false);
-        result.webhookReconfigured = true;
-        result.demoUploadReconfigured = true;
-        log.success(`[Recovery] Verified persistent config for ${match.slug} on server ${match.server_id}`);
-      } catch (error) {
-        log.warn(`[Recovery] Failed to verify persistent config for ${match.slug}`, { error });
-      }
-    } else {
-      log.warn(`[Recovery] Skipping persistent config verification for ${match.slug}`, {
-        reason: !baseUrl ? 'Webhook URL not configured' : 'SERVER_TOKEN not set',
-      });
-    }
-
-    // 3. Refresh player connections
+    // 2. Refresh player connections
     try {
-      await refreshConnectionsFromServer(match.slug, { force: true });
+      await integrationForMatch(match).refreshPresence?.(match.slug, { force: true });
       log.debug(`[Recovery] Refreshed player connections for ${match.slug}`);
     } catch (connError) {
       log.warn(`[Recovery] Failed to refresh connections for ${match.slug}`, {
@@ -144,8 +109,6 @@ async function recoverMatch(
     result.success = true;
     log.success(`[Recovery] Successfully recovered match ${match.slug}`, {
       stateSynced: result.stateSynced,
-      webhookReconfigured: result.webhookReconfigured,
-      demoUploadReconfigured: result.demoUploadReconfigured,
     });
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error);
@@ -159,7 +122,10 @@ async function recoverMatch(
  * Replay recent events from database for a match
  * Useful for catching up on events that occurred during downtime
  */
-export async function replayRecentEvents(matchSlug: string, sinceTimestamp?: number): Promise<void> {
+export async function replayRecentEvents(
+  matchSlug: string,
+  sinceTimestamp?: number
+): Promise<void> {
   try {
     const since = sinceTimestamp || Math.floor(Date.now() / 1000) - 3600; // Default: last hour
 
@@ -171,7 +137,7 @@ export async function replayRecentEvents(matchSlug: string, sinceTimestamp?: num
       `SELECT event_type, event_data, received_at 
        FROM match_events 
        WHERE match_slug = ? AND received_at >= ?
-       ORDER BY received_at ASC`,
+       ORDER BY received_at ASC, id ASC`,
       [matchSlug, since]
     );
 
@@ -182,13 +148,21 @@ export async function replayRecentEvents(matchSlug: string, sinceTimestamp?: num
 
     log.info(`[Recovery] Replaying ${events.length} recent event(s) for ${matchSlug}`);
 
-    // Import handler dynamically to avoid circular dependencies
-    const { handleMatchEvent } = await import('./matchEventHandler');
+    // The stored events are the game's own payloads; its integration applies them.
+    const matchRow = await db.queryOneAsync<{ game?: string | null }>(
+      'SELECT game FROM matches WHERE slug = ?',
+      [matchSlug]
+    );
+    const integration = integrationForMatch(matchRow ?? {});
+    if (!integration.replayEvent) {
+      log.debug(`[Recovery] ${integration.id} cannot replay events; skipping ${matchSlug}`);
+      return;
+    }
 
     for (const eventRow of events) {
       try {
-        const event = JSON.parse(eventRow.event_data);
-        await handleMatchEvent(event);
+        const event = JSON.parse(eventRow.event_data) as object;
+        await integration.replayEvent(event);
         log.debug(`[Recovery] Replayed event: ${eventRow.event_type}`, {
           matchSlug,
           timestamp: eventRow.received_at,
@@ -206,4 +180,3 @@ export async function replayRecentEvents(matchSlug: string, sinceTimestamp?: num
     log.error(`[Recovery] Failed to replay events for ${matchSlug}`, error as Error);
   }
 }
-

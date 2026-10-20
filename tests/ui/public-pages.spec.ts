@@ -1,11 +1,14 @@
 import { test, expect } from '@playwright/test';
 import { setupShuffleTournament } from '../helpers/shuffleTournament';
 import { createPlayer, type Player } from '../helpers/players';
-import { getAuthHeader } from '../helpers/auth';
+import { setupTestContext } from '../helpers/setup';
 
 /**
  * Public Pages UI tests
- * Tests public pages that don't require authentication
+ *
+ * Player profile and find-player pages are reachable by any signed-in identity
+ * (they are `adminOnly={false}` routes), not just admins. Seeding the players
+ * they display still needs an admin session on the `request` context.
  *
  * @tag ui
  * @tag public
@@ -15,8 +18,13 @@ import { getAuthHeader } from '../helpers/auth';
  */
 
 test.describe.serial('Public Pages UI', () => {
-  test.skip(
-    'should display player page without authentication',
+  test.beforeEach(async ({ page, request }) => {
+    // Creating the players below is admin-only; the pages themselves are not.
+    await setupTestContext(page, request);
+  });
+
+  test(
+    'should display a player profile page',
     {
       tag: ['@ui', '@public', '@players'],
     },
@@ -51,8 +59,8 @@ test.describe.serial('Public Pages UI', () => {
     }
   );
 
-  test.skip(
-    'should allow finding player by Steam URL',
+  test(
+    'should find a player by Steam ID from the Players directory',
     {
       tag: ['@ui', '@public', '@players', '@search'],
     },
@@ -65,22 +73,15 @@ test.describe.serial('Public Pages UI', () => {
       });
       expect(player).toBeTruthy();
 
-      // Navigate to public page directly
+      // The old Find player address lands on the Players directory, which finds anyone.
       await page.goto('/player', { waitUntil: 'domcontentloaded' });
-      try {
-        await page.waitForLoadState('networkidle', { timeout: 10000 });
-      } catch (error) {
-        await page.waitForLoadState('domcontentloaded');
-        await page.waitForTimeout(1000);
-      }
+      await expect(page).toHaveURL(/\/community\/players$/);
+      const input = page.getByTestId('players-directory-search').locator('input');
+      await expect(input).toBeVisible({ timeout: 15000 });
 
-      // Wait for find player form
-      await expect(page.getByTestId('find-player-form')).toBeVisible({ timeout: 5000 });
-
-      // Enter Steam ID
-      const input = page.getByTestId('find-player-input');
+      // A Steam ID: the one match opens on Enter.
       await input.fill(player.id);
-      // Trigger search via keyboard to avoid autocomplete "no options" popper intercepting button clicks
+      await expect(page.getByTestId('players-directory-row')).toHaveCount(1);
       await input.press('Enter');
 
       // Should redirect to player page
@@ -103,10 +104,7 @@ test.describe.serial('Public Pages UI', () => {
         initialELO: 1500,
       });
 
-      if (!player) {
-        test.skip();
-        return;
-      }
+      expect(player, 'test player should have been created').toBeTruthy();
 
       // Navigate to public page directly (no need to clear localStorage)
       await page.goto(`/player/${player.id}`, { waitUntil: 'domcontentloaded' });
@@ -119,7 +117,7 @@ test.describe.serial('Public Pages UI', () => {
       await page.waitForTimeout(1000);
 
       // Verify public player page loaded
-      await expect(page.getByTestId('public-player-page')).toBeVisible({ timeout: 5000 });
+      await expect(page.getByTestId('public-player-page')).toBeVisible({ timeout: 15000 });
       expect(page.url()).toContain(`/player/${player.id}`);
     }
   );
@@ -138,7 +136,7 @@ test.describe.serial('Public Pages UI', () => {
 
       // Look for error message
       const errorMessage = page.getByTestId('player-not-found-error');
-      await expect(errorMessage).toBeVisible({ timeout: 5000 });
+      await expect(errorMessage).toBeVisible({ timeout: 15000 });
     }
   );
 });

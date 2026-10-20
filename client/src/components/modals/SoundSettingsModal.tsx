@@ -1,4 +1,4 @@
-import React from 'react';
+import type { SelectChangeEvent } from '@mui/material';
 import {
   Dialog,
   DialogTitle,
@@ -13,11 +13,8 @@ import {
   Stack,
   FormControl,
   InputLabel,
-  SelectChangeEvent,
 } from '@mui/material';
-import CloseIcon from '@mui/icons-material/Close';
-import VolumeUpIcon from '@mui/icons-material/VolumeUp';
-import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import { PlayIcon, SpeakerHighIcon, XIcon } from '@phosphor-icons/react';
 import { NOTIFICATION_SOUNDS } from '../../utils/soundNotification';
 import { useTranslation } from 'react-i18next';
 
@@ -47,13 +44,11 @@ export function SoundSettingsModal({
       <DialogTitle>
         <Box display="flex" alignItems="center" justifyContent="space-between">
           <Box display="flex" alignItems="center" gap={1}>
-            <VolumeUpIcon color="primary" />
-            <Typography variant="h6">
-              {t('soundSettingsModal.title')}
-            </Typography>
+            <Box component={SpeakerHighIcon} sx={{ color: 'primary.main' }} />
+            <Typography variant="h6">{t('soundSettingsModal.title')}</Typography>
           </Box>
           <IconButton onClick={onClose} size="small">
-            <CloseIcon />
+            <XIcon />
           </IconButton>
         </Box>
       </DialogTitle>
@@ -102,12 +97,7 @@ export function SoundSettingsModal({
           </Box>
 
           {/* Test Sound Button */}
-          <Button
-            variant="outlined"
-            startIcon={<PlayArrowIcon />}
-            onClick={onPreviewSound}
-            fullWidth
-          >
+          <Button variant="outlined" startIcon={<PlayIcon />} onClick={onPreviewSound} fullWidth>
             {t('soundSettingsModal.testButton')}
           </Button>
 

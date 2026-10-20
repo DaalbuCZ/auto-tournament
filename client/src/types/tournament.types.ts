@@ -2,10 +2,14 @@
  * Tournament-related types
  */
 
+import type { Untrusted } from '../utils/untrusted';
 export interface Tournament {
   id: number;
   name: string;
-  type: 'single_elimination' | 'double_elimination' | 'round_robin' | 'swiss' | 'shuffle';
+  /** Game integration that owns it (API `game`, 'cs2' today). */
+  game?: string;
+  type:
+    'single_elimination' | 'double_elimination' | 'round_robin' | 'swiss' | 'shuffle' | 'groups';
   format: 'bo1' | 'bo3' | 'bo5';
   status: 'setup' | 'ready' | 'in_progress' | 'completed';
   maps: string[];
@@ -23,12 +27,21 @@ export interface Tournament {
   updated_at?: number;
   started_at?: number | null;
   completed_at?: number | null;
+  /** Archived: a new tournament replaced it; it keeps its results at its id. */
+  archived_at?: number | null;
   // Shuffle tournament specific fields
   teamSize?: number;
   maxRounds?: number;
   overtimeMode?: 'enabled' | 'disabled';
   overtimeSegments?: number;
   eloTemplateId?: string;
+  /**
+   * Champion once completed. Null for shuffle tournaments, and for round robin
+   * / swiss when the top spot is shared.
+   */
+  winner?: { id: string; name: string; tag?: string } | null;
+  /** The page banner (`/api/tournament/1/banner?v=…`), or null without one. */
+  bannerUrl?: string | null;
 }
 
 export interface TournamentSettings {
@@ -42,19 +55,85 @@ export interface TournamentSettings {
   maxRounds?: number;
   overtimeMode?: 'enabled' | 'disabled';
   overtimeSegments?: number;
+  /** Custom veto step order, keyed by series format. Presence implies a non-default veto. */
+  customVetoOrder?: Record<string, Untrusted>;
+
+  // Organizer-written event page content (public "Overview" tab). All
+  // optional; a page section hides when its data is empty.
+  description?: string;
+  location?: string;
+  /** Who runs it, shown in the page header. */
+  organizer?: string;
+  rules?: string[];
+  rulebookUrl?: string;
+  prizes?: EventPagePrize[];
+  schedule?: EventPageScheduleItem[];
+  /** When the tournament starts (ISO 8601): shown with a countdown; reminders go out before it. */
+  startsAt?: string;
+  /** Start the tournament at startsAt by itself. */
+  autoStart?: boolean;
+  /** Minutes before startsAt that players are reminded (default 60, 30, 5). */
+  startReminders?: number[];
+
+  // Sign-up and check-in (tournament sign-up). Times are ISO 8601.
+  registrationOpen?: boolean;
+  registrationClosesAt?: string;
+  /** Team spots; sign-up stops once this many teams are in. */
+  maxTeams?: number | null;
+  checkInOpensAt?: string;
+  checkInClosesAt?: string;
+  /** Virtual skin rewards for the top three; on unless turned off here. */
+}
+
+export interface EventPagePrize {
+  place: string;
+  prize: string;
+}
+
+export interface EventPageScheduleItem {
+  /** ISO 8601 datetime string. */
+  at: string;
+  label: string;
+  /** Client-derived items only (the check-in window): when it ends, and what it is. */
+  end?: string;
+  kind?: 'checkin';
+}
+
+/** Swiss standings row from the API, in the order the round pairing uses. */
+export interface SwissStanding {
+  rank: number;
+  teamId: string;
+  wins: number;
+  losses: number;
+  buchholz: number;
+  roundDiff: number;
+  byes: number;
+}
+
+/** Round robin standings from the server: wins, head-to-head, round difference, rounds won, seed. */
+export interface RoundRobinStanding {
+  rank: number;
+  teamId: string;
+  wins: number;
+  losses: number;
+  roundDiff: number;
+  roundsWon: number;
 }
 
 export interface BracketData {
   tournament: Tournament;
-  matches: unknown[]; // Avoid circular dependency, use Match type in actual usage
+  matches: Untrusted[]; // Avoid circular dependency, use Match type in actual usage
   totalRounds: number;
+  swissStandings?: SwissStanding[];
+  roundRobinStandings?: RoundRobinStanding[];
 }
 
 export interface TournamentTemplate {
   id: number;
   name: string;
   description?: string;
-  type: 'single_elimination' | 'double_elimination' | 'round_robin' | 'swiss' | 'shuffle';
+  type:
+    'single_elimination' | 'double_elimination' | 'round_robin' | 'swiss' | 'shuffle' | 'groups';
   format: 'bo1' | 'bo3' | 'bo5';
   mapPoolId?: number | null;
   maps: string[];

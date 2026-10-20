@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { Box, useTheme } from '@mui/material';
-import { alpha } from '@mui/material/styles';
+import { useTranslation } from 'react-i18next';
+import { tokens } from '../../theme/tokens';
 import {
   TransformWrapper,
   TransformComponent,
@@ -12,21 +13,53 @@ import type { Id, Stage, ParticipantResult } from 'brackets-model';
 import type { Group, Round, Match as ViewerMatch, Participant } from 'brackets-viewer';
 import '../../brackets-viewer/style.scss';
 import { deriveSeriesScore } from '../../utils/matchScoreDisplay';
+import { getRoundLabel } from '../../utils/matchUtils';
+import { bareSlug, isGrandFinalSlug, isLosersBracketSlug } from '../../utils/matchSlug';
 
 interface BracketsViewerVisualizationProps {
   matches: Array<Match & { liveStats?: MatchLiveStats | null }>;
   tournamentType: string;
+  /** Round robin: team ids best first from the server standings (#225). */
+  rankingTeamIds?: string[];
   isFullscreen?: boolean;
   onMatchClick?: (match: Match) => void;
+}
+
+interface SlotSource {
+  match: Match;
+  outcome: 'winner' | 'loser';
+}
+
+/** Upper bracket final and lower bracket final, in grand final slot order. */
+function grandFinalParents(matches: Match[]): SlotSource[] {
+  const last = (list: Match[]) =>
+    [...list].sort((a, b) => b.round - a.round || a.matchNumber - b.matchNumber)[0];
+  const upperFinal = last(matches.filter((m) => /^r\d+m\d+$/.test(bareSlug(m.slug))));
+  const lowerFinal = last(matches.filter((m) => isLosersBracketSlug(m.slug)));
+  if (!upperFinal) return [];
+  // Two teams have no losers bracket at all: the upper final's loser wins that
+  // empty bracket unopposed and takes the grand final's second slot.
+  if (!lowerFinal) {
+    return [
+      { match: upperFinal, outcome: 'winner' },
+      { match: upperFinal, outcome: 'loser' },
+    ];
+  }
+  return [
+    { match: upperFinal, outcome: 'winner' },
+    { match: lowerFinal, outcome: 'winner' },
+  ];
 }
 
 export default function BracketsViewerVisualization({
   matches,
   tournamentType,
+  rankingTeamIds,
   isFullscreen = false,
   onMatchClick,
 }: BracketsViewerVisualizationProps) {
   const theme = useTheme();
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const matchLookupRef = useRef<Map<Id, Match>>(new Map());
   const transformRef = useRef<ReactZoomPanPinchRef | null>(null);
@@ -140,18 +173,11 @@ export default function BracketsViewerVisualization({
       return null;
     }
 
-    const getStageName = () => {
-      switch (tournamentType) {
-        case 'single_elimination':
-          return 'Single Elimination';
-        case 'double_elimination':
-          return 'Double Elimination';
-        case 'round_robin':
-          return 'Round Robin';
-        default:
-          return 'Tournament';
-      }
-    };
+    // Same translated label as the page header (tournament type selector).
+    const getStageName = () =>
+      t(`tournament.typeSelector.types.${tournamentType}.label`, {
+        defaultValue: t('nav.tournament'),
+      });
 
     // Group matches into their respective groups
     const groups: Group[] = [];
@@ -174,8 +200,8 @@ export default function BracketsViewerVisualization({
         matchWithTeam?.team1?.id === teamId
           ? matchWithTeam.team1.tag || matchWithTeam.team1.name
           : matchWithTeam?.team2?.id === teamId
-          ? matchWithTeam.team2?.tag || matchWithTeam.team2?.name
-          : teamId;
+            ? matchWithTeam.team2?.tag || matchWithTeam.team2?.name
+            : teamId;
 
       participants.push({
         id: index,
@@ -186,8 +212,19 @@ export default function BracketsViewerVisualization({
     });
 
     // Detect tournament structure
-    const hasLosersBracket = matches.some((m) => m.slug.startsWith('lb-'));
-    const hasGrandFinals = matches.some((m) => m.slug === 'gf');
+    const hasLosersBracket = matches.some((m) => isLosersBracketSlug(m.slug));
+    const hasGrandFinals = matches.some((m) => isGrandFinalSlug(m.slug));
+
+    // brackets-viewer addresses groups by position, not by id: the first group
+    // with matches is the winners bracket, the second the losers bracket and
+    // the third the final group. A two-team double elimination has a grand
+    // final but no losers-bracket matches, so giving the grand final a group of
+    // its own would land it in the losers-bracket slot and it would render
+    // under that heading. Fold it into the winners bracket as a trailing round
+    // instead — which is what it is when both finalists come out of the one
+    // winners match.
+    const foldGrandFinalIntoWinners = hasGrandFinals && !hasLosersBracket;
+    const grandFinalGroupId = foldGrandFinalIntoWinners ? 1 : 3;
 
     if (hasLosersBracket) {
       // Double elimination: Winners, Losers, Grand Finals
@@ -197,7 +234,7 @@ export default function BracketsViewerVisualization({
         { id: 3, stage_id: 1, number: 3 } // Grand Finals
       );
     } else {
-      // Single elimination: Just main bracket
+      // Single elimination, and two-team double elimination: one bracket
       groups.push({ id: 1, stage_id: 1, number: 1 });
     }
 
@@ -205,9 +242,9 @@ export default function BracketsViewerVisualization({
     const matchesByRound: Record<string, Match[]> = {};
     matches.forEach((m) => {
       let key: string;
-      if (m.slug === 'gf') {
+      if (isGrandFinalSlug(m.slug)) {
         key = 'gf';
-      } else if (m.slug.startsWith('lb-')) {
+      } else if (isLosersBracketSlug(m.slug)) {
         key = `lb-${m.round}`;
       } else {
         key = `wb-${m.round}`;
@@ -216,6 +253,56 @@ export default function BracketsViewerVisualization({
       if (!matchesByRound[key]) matchesByRound[key] = [];
       matchesByRound[key].push(m);
     });
+
+    // Byes (a team count that isn't a power of two): the server leaves out the
+    // matches that can't be played, but the viewer lays a bracket out by
+    // position. Put a BYE in each gap: in the winners bracket the team that
+    // skips the match (already seated in the next round) against a BYE, in the
+    // losers bracket an empty one. Slugs keep their positions (r1m2, lb-r1m2).
+    const byeKeys = new Set<string>();
+    if (tournamentType === 'single_elimination' || tournamentType === 'double_elimination') {
+      const wbRoundNumbers = Object.keys(matchesByRound)
+        .filter((k) => k.startsWith('wb-'))
+        .map((k) => Number(k.split('-')[1]));
+      const k = wbRoundNumbers.length ? Math.max(...wbRoundNumbers) : 0;
+      const size = 2 ** k;
+      const prefix = matches[0]?.slug.match(/^t\d+-/)?.[0] ?? '';
+      const seatOf = (round: number, num: number): Match['team1'] | null => {
+        const next = (matchesByRound[`wb-${round + 1}`] ?? []).find(
+          (n) => n.matchNumber === Math.ceil(num / 2)
+        );
+        return (num % 2 === 1 ? next?.team1 : next?.team2) ?? null;
+      };
+      const fill = (key: string, round: number, count: number, lb: boolean) => {
+        const list = matchesByRound[key] ?? [];
+        // A losers-bracket round can be all byes; a winners round never is.
+        if ((!lb && list.length === 0) || list.length >= count) return;
+        for (let num = 1; num <= count; num++) {
+          if (list.some((m) => m.matchNumber === num)) continue;
+          const slug = `${prefix}${lb ? 'lb-' : ''}r${round}m${num}`;
+          byeKeys.add(slug);
+          /* eslint-disable no-restricted-syntax -- a bye seat: only the fields the viewer draws */
+          list.push({
+            id: -(byeKeys.size + 1000),
+            slug,
+            round,
+            matchNumber: num,
+            status: 'completed',
+            team1: lb ? null : seatOf(round, num),
+            team2: null,
+          } as unknown as Match);
+          /* eslint-enable no-restricted-syntax */
+        }
+        list.sort((x, y) => x.matchNumber - y.matchNumber);
+        matchesByRound[key] = list;
+      };
+      for (let r = 1; r < k; r++) fill(`wb-${r}`, r, size / 2 ** r, false);
+      const lbRounds = Math.max(0, 2 * k - 2);
+      if (hasLosersBracket)
+        for (let r = 1; r <= lbRounds; r++)
+          fill(`lb-${r}`, r, size / 2 ** (Math.floor((r + 1) / 2) + 1), true);
+    }
+    const isBye = (m: Match) => byeKeys.has(m.slug);
 
     // Create rounds and matches
     let roundCounter = 0;
@@ -259,7 +346,9 @@ export default function BracketsViewerVisualization({
       }
     };
 
-    const getBracketScores = (match: BracketMatch): { team1Score?: number; team2Score?: number } => {
+    const getBracketScores = (
+      match: BracketMatch
+    ): { team1Score?: number; team2Score?: number } => {
       // Bracket view should always display SERIES score (maps won),
       // never current-map round score.
       const series = deriveSeriesScore(match, match.liveStats ?? null);
@@ -273,12 +362,7 @@ export default function BracketsViewerVisualization({
       }
 
       // For not-started matches, keep dashes unless we have a real series score source.
-      if (
-        isNotStarted &&
-        series.source === 'default' &&
-        series.team1 === 0 &&
-        series.team2 === 0
-      ) {
+      if (isNotStarted && series.source === 'default' && series.team1 === 0 && series.team2 === 0) {
         return { team1Score: undefined, team2Score: undefined };
       }
 
@@ -351,6 +435,20 @@ export default function BracketsViewerVisualization({
       });
 
       roundMatches.forEach((m) => {
+        if (isBye(m)) {
+          viewerMatches.push({
+            id: m.id,
+            number: m.matchNumber,
+            stage_id: 1,
+            group_id: 1,
+            round_id: roundCounter,
+            child_count: 0,
+            status: 4,
+            opponent1: m.team1?.id ? { id: teamIdMap.get(m.team1.id), result: 'win' } : null,
+            opponent2: null,
+          });
+          return;
+        }
         const { team1Score, team2Score } = getBracketScores(m);
         const viewerMatchId = m.id ?? fallbackMatchId++;
         const parentPositions = parentMatchPositions.get((m.id ?? viewerMatchId) as Id) ?? [];
@@ -390,6 +488,20 @@ export default function BracketsViewerVisualization({
       });
 
       roundMatches.forEach((m) => {
+        if (isBye(m)) {
+          viewerMatches.push({
+            id: m.id,
+            number: m.matchNumber,
+            stage_id: 1,
+            group_id: 2,
+            round_id: roundCounter,
+            child_count: 0,
+            status: 4,
+            opponent1: m.team1?.id ? { id: teamIdMap.get(m.team1.id), result: 'win' } : null,
+            opponent2: null,
+          });
+          return;
+        }
         const { team1Score, team2Score } = getBracketScores(m);
         const viewerMatchId = m.id ?? fallbackMatchId++;
         const parentPositions = parentMatchPositions.get((m.id ?? viewerMatchId) as Id) ?? [];
@@ -416,13 +528,13 @@ export default function BracketsViewerVisualization({
 
     // Grand finals
     if (hasGrandFinals) {
-      const gfMatch = matches.find((m) => m.slug === 'gf');
+      const gfMatch = matches.find((m) => isGrandFinalSlug(m.slug));
       if (gfMatch) {
         rounds.push({
           id: roundCounter,
-          number: 1,
+          number: foldGrandFinalIntoWinners ? wbRounds.length + 1 : 1,
           stage_id: 1,
-          group_id: 3,
+          group_id: grandFinalGroupId,
         });
 
         const viewerMatchId = gfMatch.id ?? fallbackMatchId++;
@@ -438,7 +550,7 @@ export default function BracketsViewerVisualization({
           id: viewerMatchId,
           number: 1,
           stage_id: 1,
-          group_id: 3,
+          group_id: grandFinalGroupId,
           round_id: roundCounter,
           child_count: 0,
           status: gfMatch.status === 'completed' ? 2 : gfMatch.status === 'live' ? 1 : 0,
@@ -451,7 +563,9 @@ export default function BracketsViewerVisualization({
 
     const stageSettings: Stage['settings'] = {
       skipFirstRound: false,
-      grandFinal: hasGrandFinals ? 'simple' : 'none',
+      // Only a grand final in its own group is one as far as the viewer is
+      // concerned; a folded one is just the last winners round.
+      grandFinal: hasGrandFinals && !foldGrandFinalIntoWinners ? 'simple' : 'none',
       size: participants.length || undefined,
     };
 
@@ -478,8 +592,81 @@ export default function BracketsViewerVisualization({
         rounds,
       },
       matchLookup,
+      teamIdMap,
     };
-  }, [matches, tournamentType]);
+  }, [matches, tournamentType, t]);
+
+  // Stable across refetches that return the same order.
+  const rankingKey = (rankingTeamIds ?? []).join('|');
+
+  /**
+   * Labels empty slots in later rounds as "Winner of <match>".
+   *
+   * The viewer only knows numeric slot positions, which it renders as "#1"/"#2"
+   * in front of names and reads like a seed. We turn those origins off
+   * (participantOriginPlacement: 'none') and instead name the feeder match,
+   * using the label the viewer rendered for it so the two always agree.
+   * Lower-bracket slots keep the viewer's own "Loser of …" hints.
+   */
+  const updateSlotHints = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const parentsByChildId = new Map<string, Match[]>();
+    matches.forEach((m) => {
+      if (m.nextMatchId === undefined || m.nextMatchId === null) return;
+      const key = String(m.nextMatchId);
+      const list = parentsByChildId.get(key) ?? [];
+      list.push(m);
+      parentsByChildId.set(key, list);
+    });
+
+    const matchElements = container.querySelectorAll<HTMLElement>('.match[data-match-id]');
+    matchElements.forEach((element) => {
+      const matchId = element.getAttribute('data-match-id');
+      if (!matchId) return;
+
+      const originalMatch = findOriginalMatch(matchId as Id);
+      if (!originalMatch || originalMatch.status === 'completed') return;
+      if (isLosersBracketSlug(originalMatch.slug)) return;
+
+      // The grand final's slots are fixed: upper bracket final winner first,
+      // lower bracket final winner second. Its parents cannot be ordered by
+      // match number (both finals are match 1), and the viewer's own hint names
+      // the lower bracket final for both slots.
+      const parents: SlotSource[] = isGrandFinalSlug(originalMatch.slug)
+        ? grandFinalParents(matches)
+        : [...(parentsByChildId.get(String(originalMatch.id)) ?? [])]
+            .sort((a, b) => a.matchNumber - b.matchNumber)
+            .map((m) => ({ match: m, outcome: 'winner' as const }));
+      if (parents.length < 2) return;
+
+      const slots = element.querySelectorAll<HTMLElement>(':scope > .opponents > .participant');
+      slots.forEach((slot, index) => {
+        if (slot.hasAttribute('data-participant-id')) return;
+        const parent = parents[index];
+        const nameEl = slot.querySelector<HTMLElement>('.name');
+        if (!parent || !nameEl) return;
+
+        const parentLabel = container
+          .querySelector<HTMLElement>(
+            `.match[data-match-id="${parent.match.id}"] > .opponents > span`
+          )
+          ?.innerText?.trim();
+        const hint = t(
+          parent.outcome === 'loser' ? 'bracket.slotHint.loserOf' : 'bracket.slotHint.winnerOf',
+          {
+            match:
+              parentLabel ||
+              t('bracket.slotHint.matchNumber', { number: parent.match.matchNumber }),
+          }
+        );
+        nameEl.classList.add('hint');
+        nameEl.innerText = hint;
+        nameEl.title = hint;
+      });
+    });
+  }, [findOriginalMatch, matches, t]);
 
   const updateMatchStatusStyles = useCallback(() => {
     const container = containerRef.current;
@@ -516,8 +703,14 @@ export default function BracketsViewerVisualization({
     const container = containerRef.current;
     if (!container || !viewerData) return;
 
-    const { data, matchLookup } = viewerData;
+    const { data, matchLookup, teamIdMap } = viewerData;
     matchLookupRef.current = matchLookup;
+    const rankingOrder = rankingKey
+      ? rankingKey
+          .split('|')
+          .map((teamId) => teamIdMap.get(teamId))
+          .filter((id): id is number => id !== undefined)
+      : undefined;
 
     // Render the bracket
     let cancelled = false;
@@ -525,11 +718,23 @@ export default function BracketsViewerVisualization({
     const run = async () => {
       try {
         await render(data, {
-          participantOriginPlacement: 'before',
+          // Slot positions are not seeds (MAT seeds randomly); don't print "#1"
+          // in front of team names. Empty slots get "Winner of …" instead.
+          participantOriginPlacement: 'none',
           separatedChildCountLabel: true,
           showSlotsOrigin: true,
           showLowerBracketSlotsOrigin: true,
           highlightParticipantOnHover: true,
+          // Round robin table in the server's tiebreak order, strict ranks.
+          rankingOrder,
+          // Single-elimination columns carry the same names as the rest of
+          // the app ("Quarterfinals", "Semifinals", "Finals"), not the
+          // viewer's own "Round 1 … Final Round". '' falls back to the
+          // viewer's names for the other bracket kinds.
+          customRoundName: (info) =>
+            info.groupType === 'single-bracket'
+              ? getRoundLabel(info.roundNumber, info.roundCount)
+              : '',
           onMatchClick: (match) => {
             // Find the original match by ID
             const originalMatch = findOriginalMatch(match.id);
@@ -546,50 +751,34 @@ export default function BracketsViewerVisualization({
 
         if (cancelled) return;
 
-        // Apply custom styles based on theme
+        // Bracket colours come from the design tokens: matches on paper3,
+        // the winner row filled orange, a live match outlined in orange.
         if (container) {
-          const primaryBackground = theme.palette.background.default;
-          const secondaryBackground =
-            theme.palette.mode === 'dark'
-              ? alpha(theme.palette.background.default, 0.8)
-              : alpha(theme.palette.background.default, 0.95);
-          const matchBackground =
-            theme.palette.mode === 'dark'
-              ? alpha(theme.palette.background.paper, 0.6)
-              : theme.palette.background.paper;
-
-          container.style.setProperty('--primary-background', primaryBackground);
-          container.style.setProperty('--secondary-background', secondaryBackground);
-          container.style.setProperty('--match-background', matchBackground);
-          container.style.setProperty('--font-color', theme.palette.text.primary);
-          container.style.setProperty('--label-color', theme.palette.text.secondary);
-          container.style.setProperty('--hint-color', theme.palette.text.secondary);
-          container.style.setProperty('--connector-color', theme.palette.divider);
-          container.style.setProperty('--border-color', theme.palette.divider);
-          container.style.setProperty(
-            '--border-hover-color',
-            alpha(theme.palette.text.primary, 0.4)
-          );
-          container.style.setProperty('--border-selected-color', theme.palette.primary.main);
-          // Bracket participants: show winners in green and losers in a neutral grey,
-          // with corresponding subtle backgrounds so the winner row stands out.
-          container.style.setProperty('--win-color', theme.palette.success.main);
-          container.style.setProperty('--loss-color', theme.palette.text.secondary);
-          container.style.setProperty(
-            '--winner-background',
-            alpha(theme.palette.text.secondary, 0.16)
-          );
-          container.style.setProperty(
-            '--loser-background',
-            alpha(theme.palette.text.secondary, theme.palette.mode === 'dark' ? 0.08 : 0.04)
-          );
-          container.style.setProperty('--live-border-color', theme.palette.primary.main);
-          container.style.setProperty('--status-live-border-color', theme.palette.error.main);
-          container.style.setProperty('--status-loaded-border-color', theme.palette.info.main);
-          container.style.setProperty(
-            '--status-allocated-border-color',
-            theme.palette.warning.main
-          );
+          const c = tokens.color;
+          const vars: Record<string, string> = {
+            '--primary-background': c.paper2,
+            '--secondary-background': c.paper3,
+            '--match-background': c.paper3,
+            '--font-color': c.ink,
+            '--label-color': c.muted,
+            '--hint-color': c.muted,
+            '--connector-color': c.rule,
+            '--border-color': 'transparent',
+            '--border-hover-color': c.muted,
+            '--border-selected-color': c.accent,
+            '--win-color': c.accentInk,
+            '--loss-color': c.muted,
+            '--winner-background': c.accent,
+            '--loser-background': 'transparent',
+            '--live-border-color': c.accent,
+            '--status-live-border-color': c.accent,
+            '--status-loaded-border-color': c.info,
+            '--status-allocated-border-color': c.warning,
+            '--match-border-radius': `${tokens.radius.sm}px`,
+            '--text-size': '13px',
+            '--match-width': '172px',
+          };
+          Object.entries(vars).forEach(([name, value]) => container.style.setProperty(name, value));
         }
 
         const transformInstance = transformRef.current;
@@ -603,6 +792,7 @@ export default function BracketsViewerVisualization({
         updateMatchClickTargets();
         updateLiveRoundStyles();
         updateMatchStatusStyles();
+        updateSlotHints();
       } catch (error) {
         console.error('Error rendering bracket:', error);
       }
@@ -619,6 +809,7 @@ export default function BracketsViewerVisualization({
     };
   }, [
     viewerData,
+    rankingKey,
     theme,
     onMatchClick,
     centerMatch,
@@ -626,6 +817,7 @@ export default function BracketsViewerVisualization({
     updateMatchClickTargets,
     updateLiveRoundStyles,
     updateMatchStatusStyles,
+    updateSlotHints,
   ]);
 
   return (
@@ -635,9 +827,9 @@ export default function BracketsViewerVisualization({
         height: isFullscreen ? '100%' : '70vh',
         border: isFullscreen ? 0 : 1,
         borderColor: 'divider',
-        borderRadius: isFullscreen ? 0 : 2,
+        borderRadius: isFullscreen ? 0 : `${tokens.radius.lg}px`,
         overflow: 'hidden',
-        bgcolor: 'background.default',
+        bgcolor: 'background.paper',
         p: 0,
       }}
     >
@@ -662,7 +854,7 @@ export default function BracketsViewerVisualization({
             height: '100%',
             padding: theme.spacing(3),
             overflow: 'hidden',
-            background: theme.palette.background.default,
+            background: theme.palette.background.paper,
             boxSizing: 'border-box',
           }}
           contentStyle={{ width: 'auto', height: 'auto' }}

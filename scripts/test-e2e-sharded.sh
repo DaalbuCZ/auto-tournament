@@ -8,18 +8,21 @@ set -euo pipefail
 NUM_SHARDS="${1:-4}"
 # Store all aggregated test and Docker logs under the central logs directory
 RESULTS_DIR="logs/test-results"
-IMAGE_TAG="matchzy-test:sharded"
-NETWORK_NAME="matchzy-test-network"
-PG_CONTAINER="matchzy-test-postgres"
-API_PREFIX="matchzy-tournament-dev-shard"
+IMAGE_TAG="auto-tournament-test:sharded"
+NETWORK_NAME="auto-tournament-test-network"
+PG_CONTAINER="auto-tournament-test-postgres"
+API_PREFIX="auto-tournament-dev-shard"
 BASE_PORT=3123
 PG_PORT=5433
 
 # Basic env (override via env if needed)
 SERVER_TOKEN="${SERVER_TOKEN:-server123}"
+API_TOKENS="${API_TOKENS:-ci-admin:ci-admin-token-0123456789abcdef}"
+API_TOKENS_READONLY="${API_TOKENS_READONLY:-ci-readonly:ci-readonly-token-0123456789abcdef}"
+COMPAT_INGEST_TOKEN="${COMPAT_INGEST_TOKEN:-ci-compat-token-0123456789abcdef}"
 DB_USER="${DB_USER:-postgres}"
 DB_PASSWORD="${DB_PASSWORD:-postgres}"
-DB_NAME_BASE="${DB_NAME:-matchzy_tournament}"
+DB_NAME_BASE="${DB_NAME:-auto_tournament}"
 
 echo "▶ Sharded E2E tests"
 echo "  Shards      : $NUM_SHARDS"
@@ -81,8 +84,8 @@ echo "▶ Building Docker image: ${IMAGE_TAG}"
 docker build -f docker/Dockerfile \
   --build-arg VITE_ENABLE_DEV_PAGE="true" \
   -t "${IMAGE_TAG}" \
-  . >/tmp/matchzy-build.log 2>&1 || {
-    echo "❌ Docker build failed. See /tmp/matchzy-build.log"
+  . >/tmp/auto-tournament-build.log 2>&1 || {
+    echo "❌ Docker build failed. See /tmp/auto-tournament-build.log"
     exit 1
   }
 
@@ -140,6 +143,10 @@ start_api_container() {
     -e NODE_ENV=test \
     -e PORT=3000 \
     -e SERVER_TOKEN="${SERVER_TOKEN}" \
+    -e API_TOKENS="${API_TOKENS}" \
+    -e API_TOKENS_READONLY="${API_TOKENS_READONLY}" \
+    -e COMPAT_INGEST_TOKEN="${COMPAT_INGEST_TOKEN}" \
+    -e FLEET_AUTOSCALE_INTERVAL_MS=0 \
     -e LOG_LEVEL=debug \
     -e DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${PG_CONTAINER}:5432/${db_name}" \
     -e DB_HOST="${PG_CONTAINER}" \
@@ -148,6 +155,7 @@ start_api_container() {
     -e DB_PASSWORD="${DB_PASSWORD}" \
     -e DB_NAME="${db_name}" \
     -e VITE_ENABLE_DEV_PAGE=true \
+    -e AT_ACCEPT_LICENSE=noncommercial -e AT_VETO_TURN_SECONDS_DEFAULT=0 -e AT_UPDATE_CHECK=off -e CS2_IMAGE_PREFETCH=off -e LICENSE_CHECKIN_URL=off \
     -v "$(pwd)/docker/data:/app/data" \
     "${IMAGE_TAG}" >/dev/null
 

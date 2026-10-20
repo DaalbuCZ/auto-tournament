@@ -1,100 +1,8 @@
 {
-  "mapsPage": {
-    "title": "Mapas e pools de mapas",
-    "tabs": {
-      "maps": "Mapas",
-      "mapPools": "Pools de mapas"
-    },
-    "headerActions": {
-      "addMap": "Adicionar mapa",
-      "createMapPool": "Criar pool de mapas"
-    },
-    "errors": {
-      "loadMaps": "Não foi possível carregar os mapas",
-      "loadPools": "Não foi possível carregar os pools de mapas",
-      "defaultPoolCannotDelete": "O pool de mapas predefinido não pode ser eliminado.",
-      "setDefaultPool": "Não foi possível definir o pool de mapas predefinido",
-      "togglePool": "Não foi possível alterar o estado do pool de mapas",
-      "deleteMap": "Não foi possível eliminar o mapa",
-      "deletePool": "Não foi possível eliminar o pool de mapas"
-    },
-    "success": {
-      "mapDeleted": "Mapa eliminado com sucesso"
-    },
-    "confirmDeleteMap": {
-      "title": "Eliminar mapa",
-      "message": "Tem a certeza de que pretende eliminar \"{{name}}\"? Esta ação não pode ser anulada."
-    },
-    "confirmDeletePool": {
-      "title": "Eliminar pool de mapas",
-      "message": "Tem a certeza de que pretende eliminar \"{{name}}\"? Esta ação não pode ser anulada."
-    }
-  },
-  "mapModal": {
-    "titleCreate": "Adicionar mapa",
-    "titleEdit": "Editar mapa",
-    "mapIdLabel": "ID do mapa",
-    "mapIdPlaceholder": "de_dust2",
-    "mapIdHelper": "Apenas letras minúsculas, números e sublinhados (de_dust2)",
-    "displayNameLabel": "Nome de apresentação",
-    "displayNamePlaceholder": "Dust II",
-    "mapImageLabel": "Imagem do mapa",
-    "uploadButton": "Carregar imagem",
-    "fetchFromGitHub": "Obter do GitHub",
-    "uploadHelper": "Carregue uma imagem PNG, JPG, GIF ou WebP (máx. 5 MB)",
-    "previewLabel": "Pré-visualização:",
-    "removeImage": "Remover imagem",
-    "errors": {
-      "mapIdRequired": "O ID do mapa é obrigatório",
-      "displayNameRequired": "O nome de apresentação é obrigatório",
-      "mapIdInvalid": "O ID do mapa só pode conter letras minúsculas, números e sublinhados",
-      "invalidFileType": "Tipo de ficheiro inválido. Selecione uma imagem PNG, JPG, GIF ou WebP.",
-      "fileTooLarge": "Ficheiro demasiado grande. Selecione uma imagem com menos de 5 MB.",
-      "readFileFailed": "Não foi possível ler o ficheiro de imagem",
-      "fetchImageIdRequired": "Introduza primeiro um ID de mapa",
-      "fetchImageFailed": "Não foi possível obter a imagem. Pode carregar uma imagem em alternativa.",
-      "imageNotFound": "Não foi encontrada uma imagem para {{id}}. Pode carregar uma imagem em alternativa.",
-      "uploadFailed": "Não foi possível carregar a imagem",
-      "saveFailed": "Não foi possível guardar o mapa"
-    },
-    "success": {
-      "mapUpdated": "Mapa atualizado com sucesso",
-      "mapCreated": "Mapa criado com sucesso"
-    },
-    "buttons": {
-      "cancel": "Cancelar",
-      "saving": "A guardar...",
-      "update": "Atualizar",
-      "create": "Criar"
-    }
-  },
-  "mapActionsModal": {
-    "mapId": "ID do mapa",
-    "preview": "Pré-visualizar",
-    "edit": "Editar"
-  },
-  "mapPoolActionsModal": {
-    "defaultChip": "Predefinido",
-    "status": {
-      "label": "Estado",
-      "enabled": "Ativo",
-      "disabled": "Inativo"
-    },
-    "maps": {
-      "label": "Mapas ({{count}})"
-    },
-    "actions": {
-      "edit": "Editar",
-      "enable": "Ativar",
-      "disable": "Desativar",
-      "setDefault": "Definir como predefinido"
-    }
-  },
   "templatesPage": {
     "header": {
       "createFromTournament": "Criar modelo a partir do torneio"
     },
-    "empty": "Ainda não existem modelos. Crie o seu primeiro modelo a partir da página Torneio.",
     "errors": {
       "load": "Não foi possível carregar os modelos"
     },
@@ -112,7 +20,8 @@
       "errors": {
         "inProgressOrCompleted": "Não é possível criar um torneio a partir de um modelo enquanto um torneio estiver em curso ou concluído. Elimine ou redefina primeiro o torneio atual.",
         "alreadyExists": "Já existe um torneio. Elimine ou redefina o torneio atual antes de criar um novo a partir de um modelo."
-      }
+      },
+      "button": "Create Tournament from Template"
     },
     "edit": {
       "title": "Editar modelo",
@@ -125,10 +34,13 @@
         "selectLabel": "Escolha um pool de mapas",
         "customOption": "Personalizado",
         "selectedLabel": "Mapas selecionados ({{count}}):",
-        "vetoWarning": "Os formatos com veto (BO1/BO3/BO5) exigem exatamente 7 mapas. Atualmente selecionados: {{count}}"
+        "vetoWarning": "Os formatos com veto (BO1/BO3/BO5) exigem exatamente 7 mapas. Atualmente selecionados: {{count}}",
+        "chooseMaps": "Choose maps..."
       },
       "save": "Guardar"
-    }
+    },
+    "emptyTitle": "No templates yet",
+    "emptyDescription": "Save a tournament's setup as a template from the Tournament page, then start new tournaments from it here."
   },
   "saveTemplateModal": {
     "title": "Guardar como modelo",
@@ -140,96 +52,6 @@
     "errors": {
       "nameRequired": "O nome do modelo é obrigatório",
       "saveFailed": "Não foi possível guardar o modelo"
-    }
-  },
-  "saveMapPoolModal": {
-    "title": "Guardar pool de mapas",
-    "nameLabel": "Nome do pool de mapas",
-    "namePlaceholder": "O meu pool personalizado",
-    "info": "Isto irá guardar um pool de mapas com {{count}} mapa{{count, plural, one {} other {s}}}.",
-    "saveButton": "Guardar",
-    "errors": {
-      "nameRequired": "O nome do pool de mapas é obrigatório",
-      "noMaps": "Selecione pelo menos um mapa",
-      "saveFailed": "Não foi possível guardar o pool de mapas"
-    }
-  },
-  "batchServerModal": {
-    "title": "Criar servidores em lote",
-    "info": "Crie vários servidores com portas a aumentar de 10 em 10 (27015, 27025, 27035...). Perfeito para configurações LAN com servidores na mesma máquina.",
-    "sections": {
-      "identification": {
-        "title": "Identificação do servidor"
-      },
-      "connection": {
-        "title": "Definições de ligação"
-      },
-      "configuration": {
-        "title": "Configuração do servidor"
-      }
-    },
-    "baseId": {
-      "label": "ID base",
-      "placeholder": "server",
-      "helper": "Os IDs dos servidores serão: base_1, base_2, base_3..."
-    },
-    "baseName": {
-      "label": "Nome base",
-      "placeholder": "MAT",
-      "helper": "Os nomes dos servidores serão: Base #1, Base #2, Base #3..."
-    },
-    "host": {
-      "label": "Host / endereço IP",
-      "placeholder": "192.168.1.100"
-    },
-    "rconPassword": {
-      "label": "Palavra-passe RCON",
-      "placeholder": "shared-rcon-password",
-      "helper": "A mesma palavra-passe para todos os servidores"
-    },
-    "numServers": {
-      "label": "Número de servidores",
-      "placeholder": "3",
-      "helper": "Máx.: 50"
-    },
-    "assignPorts": {
-      "label": "Atribuir portas",
-      "helper": "API → Servidor (teste RCON)"
-    },
-    "serverPortLabel": "Servidor #{{index}}",
-    "portPlaceholder": "27015",
-    "enabled": {
-      "label": "Servidores ativados",
-      "helper": "Todos os servidores serão criados como ativados/desativados"
-    },
-    "preview": {
-      "title": "Pré-visualização ({{showingFirst10, boolean, true {a mostrar os primeiros 10} false {todos}}})",
-      "more": "...e mais {{count}}"
-    },
-    "checkServersButton": {
-      "default": "Verificar servidores",
-      "checking": "A verificar..."
-    },
-    "createServersButton": {
-      "default": "Criar {{count}} servidor{{count, plural, one {} other {es}}}",
-      "creating": "A criar..."
-    },
-    "warnings": {
-      "notAllVerified": "Alguns servidores não passaram nas verificações de conectividade. Serão guardados, mas poderão aparecer offline até RCON e webhook estarem configurados."
-    },
-    "success": {
-      "createdAll": "Criados {{count}} servidor(es) com sucesso"
-    },
-    "errors": {
-      "baseNameRequired": "O nome base é obrigatório",
-      "baseIdRequired": "O ID base é obrigatório",
-      "hostRequired": "O host é obrigatório",
-      "countRange": "O número de servidores tem de estar entre 1 e 50",
-      "passwordRequired": "A palavra-passe RCON é obrigatória",
-      "portRange": "A porta do servidor #{{index}} tem de estar entre 1 e 65535",
-      "connectionFailed": "A ligação falhou",
-      "createFailed": "Não foi possível criar os servidores",
-      "partialCreate": "Criados {{created}}/{{total}} servidores. Erros:\n{{details}}"
     }
   },
   "eloTemplatesPage": {
@@ -253,7 +75,8 @@
       "defaultProtected": "O modelo predefinido \"pure-win-loss\" não pode ser eliminado."
     },
     "import": {
-      "success": "Importados {{count}} modelo(s) de ELO com sucesso"
+      "success_one": "{{count}} modelo de ELO importado",
+      "success_other": "{{count}} modelos de ELO importados"
     },
     "weights": {
       "noAdjustmentsPure": "Sem ajustes por estatísticas (vitória/derrota pura)"
@@ -274,7 +97,9 @@
         "delete": "Eliminar modelo"
       },
       "weightsTitle": "Pesos das estatísticas:",
-      "limitsTitle": "Limites de ajuste:"
+      "limitsTitle": "Limites de ajuste:",
+      "minAdjustment": "Min: {{value}}",
+      "maxAdjustment": "Max: {{value}}"
     },
     "importModal": {
       "title": "Importar modelos de ELO a partir de JSON",
@@ -282,10 +107,11 @@
       "introBody": "Formato esperado: array de modelos com name, description (opcional), enabled, weights, maxAdjustment e minAdjustment. Se omitir id, será gerado a partir do nome.",
       "jsonLabel": "Dados JSON",
       "validJsonTitle": "✓ JSON válido!",
-      "validJsonBody": "Encontrado(s) {{count}} modelo(s).",
       "previewTitle": "Pré-visualização:",
       "previewButton": "Pré-visualizar",
-      "importButton": "Importar modelos"
+      "importButton": "Importar modelos",
+      "validJsonBody_one": "Encontrado {{count}} modelo.",
+      "validJsonBody_other": "Encontrados {{count}} modelos."
     },
     "editor": {
       "titleEdit": "Editar modelo de ELO",
@@ -323,6 +149,52 @@
         "saving": "A guardar...",
         "update": "Atualizar",
         "create": "Criar"
+      }
+    },
+    "stats": {
+      "kills": {
+        "label": "Kills",
+        "description": "Number of kills per match"
+      },
+      "deaths": {
+        "label": "Deaths",
+        "description": "Number of deaths per match (typically negative weight)"
+      },
+      "assists": {
+        "label": "Assists",
+        "description": "Number of assists per match"
+      },
+      "flashAssists": {
+        "label": "Flash Assists",
+        "description": "Number of flash assists per match"
+      },
+      "headshotKills": {
+        "label": "Headshot Kills",
+        "description": "Number of headshot kills per match"
+      },
+      "damage": {
+        "label": "Damage",
+        "description": "Total damage dealt per match"
+      },
+      "utilityDamage": {
+        "label": "Utility Damage",
+        "description": "Damage dealt with utility (grenades)"
+      },
+      "kast": {
+        "label": "KAST %",
+        "description": "Percentage of rounds with Kill, Assist, Survive, or Trade"
+      },
+      "mvps": {
+        "label": "MVPs",
+        "description": "Number of MVP awards per match"
+      },
+      "score": {
+        "label": "Score",
+        "description": "Match score (combines multiple factors)"
+      },
+      "adr": {
+        "label": "ADR",
+        "description": "Average Damage per Round"
       }
     }
   }

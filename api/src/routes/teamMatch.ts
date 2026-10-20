@@ -1,26 +1,59 @@
-import { Router, Request, Response } from 'express';
+import { logoUrl } from '../services/teamSelfService';
+import type { Request, Response } from 'express';
+import { Router } from 'express';
+import { RATING_ELO, ratingGame, ratingJoin } from '../services/gameRatings';
 import { db } from '../config/database';
-import { serverStatusService } from '../services/serverStatusService';
+import { matchTimeFields } from '../services/matchTimes';
 import { playerConnectionService } from '../services/playerConnectionService';
-import { refreshConnectionsFromServer } from '../services/connectionSnapshotService';
-import { normalizeConfigPlayers } from '../utils/playerTransform';
+import { integrationForMatch } from '../integrations/registry';
+import { DEFAULT_GAME } from '../integrations/types';
+import { describeMatch, describedPlayers } from '../utils/matchIntegration';
+import { teamPlayers } from '../services/matchViewer';
 import { teamService } from '../services/teamService';
+import { teamMembers, type TeamMemberRole } from '../services/teamMembers';
 import { matchLiveStatsService, type MatchLiveStats } from '../services/matchLiveStatsService';
 import type { DbMatchRow } from '../types/database.types';
 import { getMapResults } from '../services/matchMapResultService';
-import { getVerifiedPlayerSteamId } from '../utils/signedPlayerCookie';
+import { resolveViewerIdentity } from '../utils/viewerIdentity';
+import { log } from '../utils/logger';
+import { resolveTournamentId } from '../utils/tournamentRow';
+import { NEEDS_DECISION_STATUS } from '../utils/matchStatusHelpers';
+import { CURRENT_MATCH_ORDER, CURRENT_MATCH_TOURNAMENT_JOIN } from '../utils/currentMatchOrder';
+import type { Untrusted } from '../utils/untrusted';
 
 const router = Router();
 
-function getViewerSteamId(req: Request): string | null {
-  const cookieSteamId = getVerifiedPlayerSteamId(req.headers.cookie);
-  if (cookieSteamId) return cookieSteamId;
+type TeamMatchRow = DbMatchRow & {
+  team1_name?: string;
+  team1_tag?: string;
+  team2_name?: string;
+  team2_tag?: string;
+  team1_logo?: number | null;
+  team2_logo?: number | null;
+  server_name?: string;
+  server_host?: string;
+  server_port?: number;
+};
 
-  const anyReq = req as Request & { user?: { steamId?: string } };
-  if (anyReq.user?.steamId && anyReq.user.steamId.trim().length > 0) {
-    return anyReq.user.steamId.trim();
-  }
-  return null;
+/** A match with both teams' names and logos and its server, for the team's match. */
+const TEAM_MATCH_SELECT = `SELECT
+        m.*,
+        t1.name as team1_name, t1.tag as team1_tag,
+        t2.name as team2_name, t2.tag as team2_tag,
+        t1.logo_updated_at as team1_logo, t2.logo_updated_at as team2_logo,
+        s.name as server_name, s.host as server_host, s.port as server_port
+      FROM matches m
+      LEFT JOIN teams t1 ON m.team1_id = t1.id
+      LEFT JOIN teams t2 ON m.team2_id = t2.id
+      LEFT JOIN cs2_servers s ON m.server_id = s.id
+      ${CURRENT_MATCH_TOURNAMENT_JOIN}`;
+
+/**
+ * Steam ID this request should be treated as (admin impersonation applied).
+ */
+async function getViewerSteamId(req: Request): Promise<string | null> {
+  const { effectiveSteamId } = await resolveViewerIdentity(req);
+  return effectiveSteamId;
 }
 
 /**
@@ -30,33 +63,38 @@ function getViewerSteamId(req: Request): string | null {
  */
 router.get('/:teamId/match', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     const { teamId } = req.params;
 
-    console.log(`[TeamMatch] Looking for matches for team: ${teamId}`);
-
     // Check if team exists and get players
-    const team = await db.queryOneAsync<{ id: string; name: string; tag: string; players: string }>(
-      'SELECT id, name, tag, players FROM teams WHERE id = ?',
-      [teamId]
-    );
+    const team = await db.queryOneAsync<{
+      id: string;
+      name: string;
+      tag: string;
+      players: string;
+      game: string | null;
+    }>('SELECT id, name, tag, players, game FROM teams WHERE id = ?', [teamId]);
 
     if (!team) {
-      console.log(`[TeamMatch] Team not found: ${teamId}`);
       return res.status(404).json({
         success: false,
         error: 'Team not found',
       });
     }
 
-    console.log(`[TeamMatch] Team found: ${team.name}`);
-
     // Parse players JSON (preserve avatar field)
-    let parsedPlayers: Array<{ steamId: string; name: string; avatar?: string }> = [];
+    let parsedPlayers: Array<{
+      steamId: string;
+      name: string;
+      avatar?: string;
+      elo?: number;
+      role?: TeamMemberRole;
+    }> = [];
     if (team.players) {
       try {
         const playersObj = JSON.parse(team.players);
         // Convert {index: {name, steamId, avatar}} to [{steamId, name, avatar}]
-        parsedPlayers = Object.values(playersObj).map((playerData: unknown) => {
+        parsedPlayers = Object.values(playersObj).map((playerData: Untrusted) => {
           if (typeof playerData === 'string') {
             // Old format: {steamId: name}
             return { steamId: 'unknown', name: playerData };
@@ -82,89 +120,93 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
       }
     }
 
-    // Find active match (loaded or live)
-    let match = await db.queryOneAsync<
-      DbMatchRow & {
-        team1_name?: string;
-        team1_tag?: string;
-        team2_name?: string;
-        team2_tag?: string;
-        server_name?: string;
-        server_host?: string;
-        server_port?: number;
-      }
-    >(
-      `SELECT 
-        m.*,
-        t1.name as team1_name, t1.tag as team1_tag,
-        t2.name as team2_name, t2.tag as team2_tag,
-        s.name as server_name, s.host as server_host, s.port as server_port
-      FROM matches m
-      LEFT JOIN teams t1 ON m.team1_id = t1.id
-      LEFT JOIN teams t2 ON m.team2_id = t2.id
-      LEFT JOIN servers s ON m.server_id = s.id
-      WHERE (m.team1_id = ? OR m.team2_id = ?)
-        AND m.status IN ('loaded', 'live')
-      ORDER BY m.loaded_at DESC
-      LIMIT 1`,
-      [teamId, teamId]
-    );
+    // Roster ratings: the page sorted and labelled players by `elo`, which this
+    // response never carried, so everyone read 1500.
+    const rosterIds = parsedPlayers.map((p) => p.steamId).filter((id) => id && id !== 'unknown');
+    if (rosterIds.length > 0) {
+      // In the team's game: a rating is per game.
+      const ratings = await db.queryAsync<{ id: string; current_elo: number; uid: string }>(
+        `SELECT p.id, ${RATING_ELO} AS current_elo, p.uid FROM players p ${ratingJoin('p')}
+          WHERE p.id IN (${rosterIds.map(() => '?').join(', ')})`,
+        [ratingGame(team.game), ...rosterIds]
+      );
+      const eloById = new Map(ratings.map((r) => [r.id, r.current_elo]));
+      // The member's role (captain or member) from `team_members`, which is
+      // keyed on the account, for the team page's roster.
+      const roleByUid = new Map(
+        (await teamMembers.list(teamId)).map((m) => [m.accountUid, m.role])
+      );
+      const roleById = new Map(
+        ratings
+          .filter((r) => roleByUid.has(String(r.uid)))
+          .map((r) => [r.id, roleByUid.get(String(r.uid)) as TeamMemberRole])
+      );
+      parsedPlayers = parsedPlayers.map((p) => ({
+        ...p,
+        ...(eloById.has(p.steamId) ? { elo: eloById.get(p.steamId) } : {}),
+        ...(roleById.has(p.steamId) ? { role: roleById.get(p.steamId) } : {}),
+      }));
+    }
 
-    if (match) {
-      console.log(`[TeamMatch] Found active match: ${match.slug} (status: ${match.status})`);
+    // The match room asks for its own match (`?match=<slug>`). A team (or a
+    // player's two teams) can play in two tournaments at once, a 2v2 and a
+    // 5v5 at a LAN: "the team's current match" is then one of the two, and
+    // the room of the other showed no veto at all (Vikunja 2180). The match
+    // named here wins while the team plays in it and it is still open.
+    const requestedSlug = typeof req.query.match === 'string' ? req.query.match.trim() : '';
+    let match: TeamMatchRow | undefined;
+    if (requestedSlug) {
+      match = await db.queryOneAsync<TeamMatchRow>(
+        `${TEAM_MATCH_SELECT}
+        WHERE m.slug = ? AND (m.team1_id = ? OR m.team2_id = ?)
+          AND m.status IN ('loaded', 'live', ?, 'pending', 'ready')
+        LIMIT 1`,
+        [requestedSlug, teamId, teamId, NEEDS_DECISION_STATUS]
+      );
+    }
+
+    // Find active match (loaded, live, or played but not yet settled).
+    //
+    // `needs_decision` belongs here (3.0 phase D, PR D8). It is a match that
+    // has been *played* and is waiting for somebody to say what the result
+    // was — a CS2 series that ran out of maps level, or a manually reported
+    // result the opponent disputed. Leaving it out of both queries meant a
+    // fresh page load answered `hasMatch: false`, so the team page told two
+    // captains staring at an open dispute that they had no match, and the
+    // report panel had no slug to render against. Ordered ahead of the
+    // pending/ready query below on purpose: the match you have just played
+    // and cannot get a result for is more current than the one you have not
+    // started. A live or loaded match still wins over it, which the `ORDER BY`
+    // says outright rather than leaving to `loaded_at` — both statuses carry
+    // one.
+    if (!match) {
+      match = await db.queryOneAsync<TeamMatchRow>(
+        `${TEAM_MATCH_SELECT}
+        WHERE (m.team1_id = ? OR m.team2_id = ?)
+          AND m.status IN ('loaded', 'live', ?)
+        ORDER BY (m.status = ?) ASC, m.loaded_at DESC
+        LIMIT 1`,
+        [teamId, teamId, NEEDS_DECISION_STATUS, NEEDS_DECISION_STATUS]
+      );
     }
 
     // If no active match, find next pending/ready match
     if (!match) {
-      console.log(`[TeamMatch] No active match, looking for pending/ready matches...`);
-      match = await db.queryOneAsync<
-        DbMatchRow & {
-          team1_name?: string;
-          team1_tag?: string;
-          team2_name?: string;
-          team2_tag?: string;
-          server_name?: string;
-          server_host?: string;
-          server_port?: number;
-        }
-      >(
-        `SELECT 
-          m.*,
-          t1.name as team1_name, t1.tag as team1_tag,
-          t2.name as team2_name, t2.tag as team2_tag,
-          s.name as server_name, s.host as server_host, s.port as server_port
-        FROM matches m
-        LEFT JOIN teams t1 ON m.team1_id = t1.id
-        LEFT JOIN teams t2 ON m.team2_id = t2.id
-        LEFT JOIN servers s ON m.server_id = s.id
+      match = await db.queryOneAsync<TeamMatchRow>(
+        `${TEAM_MATCH_SELECT}
         WHERE (m.team1_id = ? OR m.team2_id = ?)
           AND m.status IN ('pending', 'ready')
-        ORDER BY m.round ASC, m.match_number ASC
+        ORDER BY ${CURRENT_MATCH_ORDER}
         LIMIT 1`,
         [teamId, teamId]
       );
-
-      if (match) {
-        console.log(
-          `[TeamMatch] Found pending/ready match: ${match.slug} (status: ${match.status})`
-        );
-      }
     }
 
-    // Check all matches for this team for debugging
-    const allMatches = await db.queryAsync<DbMatchRow>(
-      `SELECT slug, status, round, match_number FROM matches 
-       WHERE team1_id = ? OR team2_id = ?
-       ORDER BY round, match_number`,
-      [teamId, teamId]
-    );
-    console.log(
-      `[TeamMatch] All matches for team ${team.name}:`,
-      allMatches.map((m) => `${m.slug} (${m.status})`).join(', ') || 'none'
-    );
-
     if (!match) {
-      console.log(`[TeamMatch] No matches found for team ${team.name}`);
+      const currentTournament = await db.queryOneAsync<{ status: string }>(
+        'SELECT status FROM tournament WHERE id = ?',
+        [tournamentId]
+      );
       return res.json({
         success: true,
         team: {
@@ -174,6 +216,9 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
           players: parsedPlayers,
         },
         hasMatch: false,
+        // Without this the page fell back to "setup" and told a finished
+        // tournament's teams it hadn't started.
+        tournamentStatus: currentTournament?.status || 'setup',
         message: 'No upcoming matches found',
       });
     }
@@ -184,14 +229,16 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
       ? { id: match.team2_id, name: match.team2_name, tag: match.team2_tag }
       : { id: match.team1_id, name: match.team1_name, tag: match.team1_tag };
 
-    console.log(
-      `[TeamMatch] Returning match ${match.slug} for team ${team.name} (opponent: ${
-        opponent.name || 'TBD'
-      }, server: ${match.server_name || 'not assigned'})`
-    );
+    log.debug('[TeamMatch] Returning match for team', {
+      teamId,
+      matchSlug: match.slug,
+      status: match.status,
+      opponent: opponent.name || 'TBD',
+      server: match.server_name || 'not assigned',
+    });
 
-    // Get match config for map pool
-    const config = match.config ? JSON.parse(match.config) : {};
+    // Neutral view of the match config (rosters, maps) from its integration
+    const description = describeMatch(match);
 
     // Get veto state to determine actual picked maps
     let pickedMaps: string[] = [];
@@ -248,10 +295,14 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
     }
 
     // Get tournament status and format
-    const tournament = await db.queryOneAsync<{ status: string; format: string }>(
-      'SELECT status, format FROM tournament WHERE id = ?',
-      [match.tournament_id]
-    );
+    const tournament = await db.queryOneAsync<{
+      status: string;
+      format: string;
+      settings: string | Record<string, Untrusted> | null;
+      team_size: number | null;
+    }>('SELECT status, format, settings, team_size FROM tournament WHERE id = ?', [
+      match.tournament_id,
+    ]);
 
     // Note: We're NOT exposing RCON password to teams
     // CS2 servers typically don't have a join password by default
@@ -266,30 +317,24 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
       try {
         // 2 second timeout - fail fast if server is unreachable or ConVars don't exist yet
         const statusInfo = await Promise.race([
-          serverStatusService.getServerStatus(match.server_id),
-          new Promise<{ status: null; matchSlug: null; updatedAt: null; online: false }>(
-            (resolve) =>
-              setTimeout(
-                () => resolve({ status: null, matchSlug: null, updatedAt: null, online: false }),
-                2000
-              )
-          ),
+          integrationForMatch(match).resourceStatus?.(match.server_id) ?? Promise.resolve(null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
         ]);
 
-        if (statusInfo.online && statusInfo.status) {
+        if (statusInfo) {
           realServerStatus = statusInfo.status;
-          serverStatusDescription = serverStatusService.getStatusDescription(statusInfo.status);
+          serverStatusDescription = statusInfo.description;
         }
       } catch (error) {
         // Silently fail - server status is nice-to-have, not critical
-        console.debug(
-          '[TeamMatch] Server status check failed (plugin ConVars may not exist yet):',
-          error
-        );
+        log.debug('[TeamMatch] Server status check failed (plugin ConVars may not exist yet)', {
+          matchSlug: match.slug,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
-    await refreshConnectionsFromServer(match.slug);
+    await integrationForMatch(match).refreshPresence?.(match.slug);
     const connectionStatus = playerConnectionService.getStatus(match.slug);
     const liveStats = matchLiveStatsService.getStats(match.slug);
 
@@ -305,28 +350,41 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
       winner: isTeam1
         ? result.winnerTeam
         : result.winnerTeam === 'team1'
-        ? 'team2'
-        : result.winnerTeam === 'team2'
-        ? 'team1'
-        : result.winnerTeam,
+          ? 'team2'
+          : result.winnerTeam === 'team2'
+            ? 'team1'
+            : result.winnerTeam,
       demoFilePath: result.demoFilePath,
       completedAt: result.completedAt,
     }));
 
     // Normalize and enrich config players with avatars from team data
-    const normalizedTeam1Players = config.team1
-      ? normalizeConfigPlayers(config.team1.players)
-      : [];
-    const normalizedTeam2Players = config.team2
-      ? normalizeConfigPlayers(config.team2.players)
-      : [];
+    const normalizedTeam1Players = describedPlayers(description.team1);
+    const normalizedTeam2Players = describedPlayers(description.team2);
 
     // Determine whether the current viewer is actually on THIS team.
     // We intentionally scope this to the team whose page is being viewed
     // (teamId route param), not just "any team in the match", so opponents
     // cannot use the other team's link to see server or veto controls.
-    const viewerSteamId = getViewerSteamId(req);
-    const playersForThisTeam = isTeam1 ? normalizedTeam1Players : normalizedTeam2Players;
+    //
+    // The team's own roster decides this, not the match config. `config` is a
+    // snapshot taken when the match was created, and it goes stale the moment
+    // an admin edits the team — in both directions, both wrong:
+    //
+    //  - someone removed from the roster kept seeing the match server, because
+    //    the snapshot still listed them;
+    //  - someone added after the snapshot could not see their own server,
+    //    which is the reported "the server shows on my player page but not on
+    //    the team page".
+    //
+    // `veto.ts` already resolves membership this way, and for the same reason:
+    // an admin correcting a roster should take effect immediately. The snapshot
+    // is still the fallback for a team row that has no usable roster.
+    const viewerSteamId = await getViewerSteamId(req);
+    const playersForThisTeam = teamPlayers(
+      team.players,
+      isTeam1 ? normalizedTeam1Players : normalizedTeam2Players
+    );
     const viewerIsTeamMember =
       !!viewerSteamId && playersForThisTeam.some((p) => p.steamid === viewerSteamId);
 
@@ -338,6 +396,16 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
       if (!teamId) return normalizedPlayers;
       try {
         const teamData = await teamService.getTeamById(teamId);
+        // A later round's config has no players until its server is assigned (the
+        // config is made then): the team's roster stands in, so the waiting room
+        // lists who plays instead of nobody.
+        if (normalizedPlayers.length === 0 && teamData?.players?.length) {
+          return teamData.players.map((p) => ({
+            steamid: p.steamId,
+            name: p.name,
+            avatar: p.avatar,
+          }));
+        }
         if (teamData?.players) {
           const avatarMap = new Map(
             teamData.players.map((p) => [p.steamId.toLowerCase(), p.avatar])
@@ -348,16 +416,33 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
           }));
         }
       } catch (error) {
-        console.debug('Failed to enrich players with avatars:', error);
+        log.debug('[TeamMatch] Failed to enrich players with avatars', {
+          teamId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
       return normalizedPlayers;
     };
 
     // Enrich both teams in parallel
     const [enrichedTeam1Players, enrichedTeam2Players] = await Promise.all([
-      enrichPlayers(normalizedTeam1Players, config.team1?.id),
-      enrichPlayers(normalizedTeam2Players, config.team2?.id),
+      // A config made before both teams were known still says TBD: the match row has the ids.
+      enrichPlayers(normalizedTeam1Players, description.team1.id || match.team1_id || undefined),
+      enrichPlayers(normalizedTeam2Players, description.team2.id || match.team2_id || undefined),
     ]);
+
+    // Players per team: the config's, unless it has no roster yet (then it counts 1): the
+    // tournament's team size.
+    const perTeam =
+      normalizedTeam1Players.length || normalizedTeam2Players.length
+        ? description.playersPerTeam
+        : (tournament?.team_size ?? description.playersPerTeam);
+
+    // Both crests for the match room's header (it showed initials only).
+    const ourLogoUrl = logoUrl(team.id, isTeam1 ? match.team1_logo : match.team2_logo);
+    const theirLogoUrl = opponent.id
+      ? logoUrl(opponent.id, isTeam1 ? match.team2_logo : match.team1_logo)
+      : null;
 
     return res.json({
       success: true,
@@ -369,8 +454,9 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
       },
       hasMatch: true,
       tournamentStatus: tournament?.status || 'setup',
-        match: {
+      match: {
         slug: match.slug,
+        game: match.game || DEFAULT_GAME,
         round: match.round,
         matchNumber: match.match_number,
         status: match.status,
@@ -378,20 +464,21 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
         currentMap: match.current_map ?? null,
         mapNumber: match.map_number ?? null,
         team1: isTeam1
-          ? { id: team.id, name: team.name, tag: team.tag }
+          ? { id: team.id, name: team.name, tag: team.tag, logoUrl: ourLogoUrl }
           : opponent.id
-          ? { id: opponent.id, name: opponent.name, tag: opponent.tag }
-          : null,
+            ? { id: opponent.id, name: opponent.name, tag: opponent.tag, logoUrl: theirLogoUrl }
+            : null,
         team2: !isTeam1
-          ? { id: team.id, name: team.name, tag: team.tag }
+          ? { id: team.id, name: team.name, tag: team.tag, logoUrl: ourLogoUrl }
           : opponent.id
-          ? { id: opponent.id, name: opponent.name, tag: opponent.tag }
-          : null,
+            ? { id: opponent.id, name: opponent.name, tag: opponent.tag, logoUrl: theirLogoUrl }
+            : null,
         opponent: opponent.id
           ? {
               id: opponent.id,
               name: opponent.name,
               tag: opponent.tag,
+              logoUrl: theirLogoUrl,
             }
           : null,
         server:
@@ -427,31 +514,61 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
         veto: vetoSummary,
         matchFormat: (tournament?.format as 'bo1' | 'bo3' | 'bo5') || 'bo3',
         loadedAt: match.loaded_at,
+        // Held until then (the break between matches, or an admin's hold): its veto opens then.
+        heldUntil:
+          match.held_until && match.held_until > Math.floor(Date.now() / 1000)
+            ? match.held_until
+            : null,
+        // Its start time and when its veto opens (Manage › Schedule), when it has one.
+        ...matchTimeFields(
+          { round: match.round, starts_at: (match as { starts_at?: number | null }).starts_at },
+          (() => {
+            const raw = tournament?.settings ?? {};
+            if (typeof raw !== 'string') return raw;
+            try {
+              return JSON.parse(raw);
+            } catch {
+              return {};
+            }
+          })()
+        ),
+        // Neutral match summary, kept in the shape the team page reads.
         config: {
-          maplist: config.maplist,
-          num_maps: config.num_maps,
-          players_per_team: config.players_per_team,
-          expected_players_total: config.players_per_team ? config.players_per_team * 2 : 10,
-          expected_players_team1: config.players_per_team || 5,
-          expected_players_team2: config.players_per_team || 5,
-          team1: config.team1
-            ? {
-                id: config.team1.id,
-                name: config.team1.name,
-                tag: config.team1.tag,
-                flag: config.team1.flag,
-                players: enrichedTeam1Players,
-              }
-            : undefined,
-          team2: config.team2
-            ? {
-                id: config.team2.id,
-                name: config.team2.name,
-                tag: config.team2.tag,
-                flag: config.team2.flag,
-                players: enrichedTeam2Players,
-              }
-            : undefined,
+          maplist: description.maps.length > 0 ? description.maps : null,
+          num_maps: description.seriesLength,
+          players_per_team: perTeam,
+          expected_players_total: perTeam ? perTeam * 2 : 10,
+          expected_players_team1: perTeam || 5,
+          expected_players_team2: perTeam || 5,
+          // Whether there is a veto: the match's config, else (a later round in its break) the
+          // tournament. Missing here, the team's match room showed a veto for a tournament
+          // without one and the bans were refused (2026-10-15).
+          vetoDisabled:
+            description.skipPreMatchPhase ??
+            (tournament
+              ? !(
+                  integrationForMatch(match).usesPreMatchPhase?.({
+                    settings:
+                      typeof tournament.settings === 'string'
+                        ? JSON.parse(tournament.settings)
+                        : (tournament.settings ?? {}),
+                  }) ?? true
+                )
+              : undefined),
+          team1: {
+            id: description.team1.id,
+            name: description.team1.name,
+            tag: description.team1.tag,
+            flag: description.team1.flag,
+            players: enrichedTeam1Players,
+          },
+          team2: {
+            id: description.team2.id,
+            name: description.team2.name,
+            tag: description.team2.tag,
+            flag: description.team2.flag,
+            players: enrichedTeam2Players,
+          },
         },
         // Used by the frontend to decide whether to show sensitive controls
         // like veto actions and server connection details.

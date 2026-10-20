@@ -1,336 +1,188 @@
+import { DiscordBotCard } from '../components/settings/DiscordBotCard';
+import { pageTitle } from '../utils/pageTitle';
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { usePageHeader } from '../contexts/PageHeaderContext';
+import { PageHead, Panel } from '../components/common/ui';
 import { useSnackbar } from '../contexts/SnackbarContext';
 import {
   Box,
   Typography,
-  Alert,
-  Paper,
   Stack,
-  TextField,
   Button,
   LinearProgress,
-  Divider,
-  CircularProgress,
-  Tabs,
-  Tab,
-  Accordion,
-  AccordionSummary,
-  AccordionDetails,
   Dialog,
   DialogTitle,
   DialogContent,
   DialogActions,
-  Slider,
 } from '@mui/material';
 import Switch from '@mui/material/Switch';
-import FormControlLabel from '@mui/material/FormControlLabel';
-import SyncIcon from '@mui/icons-material/Sync';
-import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import { api } from '../utils/api';
 import type { SettingsResponse } from '../types/api.types';
 import { useIsDevelopment } from '../hooks/useIsDevelopment';
 import { useTranslation } from 'react-i18next';
+import { Link as RouterLink, useNavigate, useSearchParams } from 'react-router-dom';
+import { SiteNameCard } from '../components/settings/SiteNameCard';
+import { EmailSettingsCard } from '../components/settings/EmailSettingsCard';
+import { ApiTokensCard } from '../components/settings/ApiTokensCard';
+import { WebhooksCard } from '../components/settings/WebhooksCard';
+import { MatchmakingSettingsCard } from '../components/settings/MatchmakingSettingsCard';
+import { AdminNoticesCard } from '../components/settings/AdminNoticesCard';
+import { NewsSettingsCard } from '../components/settings/NewsSettingsCard';
+import {
+  ExperimentalCard,
+  type ExperimentalFeatureState,
+} from '../components/settings/ExperimentalCard';
+import { SignInProvidersCard } from '../components/settings/SignInProvidersCard';
+import { SettingsCardHead, SettingsRow } from '../components/settings/SettingsRow';
+import { useInstalledIntegrations } from '../integrations/registry';
+import { moduleNavItems, navItemLabel } from '../utils/moduleNavLabels';
+import { tokens, radii } from '../theme/tokens';
 
 declare const __APP_VERSION__: string | undefined;
 
-interface TabPanelProps {
-  children?: React.ReactNode;
-  index: number;
-  value: number;
-}
+const { color } = tokens;
 
-function TabPanel(props: TabPanelProps) {
-  const { children, value, index, ...other } = props;
+/**
+ * `?section=` values, old and new, to the section they open (bookmarks,
+ * links in docs, `SIGN_IN_SETTINGS_PATH`). Settings is a list of sections
+ * beside the one that is open, as on the SettingsIA board.
+ */
+const SECTION_CARDS: Record<string, string> = {
+  general: 'site',
+  site: 'site',
+  signin: 'signin',
+  email: 'email',
+  players: 'players',
+  ratings: 'players',
+  matches: 'players',
+  webhooks: 'webhooks',
+  integrations: 'webhooks',
+  apitokens: 'apitokens',
+  'api-tokens': 'apitokens',
+  tokens: 'apitokens',
+  matchmaking: 'matchmaking',
+  news: 'news',
+  adminNotices: 'adminnotices',
+  adminnotices: 'adminnotices',
+  notifications: 'adminnotices',
+  experimental: 'advanced',
+  developer: 'advanced',
+  advanced: 'advanced',
+};
 
+/**
+ * CS2's settings moved out of Settings to its own pages in the admin menu
+ * (Skins, Match rules); its old sections, and `links.settings('cs2')`, go there.
+ */
+const MOVED_SECTIONS: Record<string, string> = {
+  // The license has its own page now.
+  license: '/manage/license',
+  cs2: '/manage/match-rules',
+  'cs2:general': '/manage/match-rules',
+  'cs2:servers': '/manage/match-rules',
+  skins: '/manage/skins',
+  'cs2:skins': '/manage/skins',
+  'cs2:inventories': '/manage/skins',
+};
+
+/** The open section's card (`settings-<key>`). */
+function SettingsCard({ cardKey, children }: { cardKey: string; children: React.ReactNode }) {
   return (
-    <div
-      role="tabpanel"
-      hidden={value !== index}
-      id={`settings-tabpanel-${index}`}
-      aria-labelledby={`settings-tab-${index}`}
-      {...other}
+    <Panel
+      component="section"
+      id={`settings-${cardKey}`}
+      data-testid={`settings-card-${cardKey}`}
+      sx={{
+        p: { xs: 2, md: 3 },
+        minWidth: 0,
+        borderColor: color.rule,
+      }}
     >
-      {value === index && <Box sx={{ p: 3 }}>{children}</Box>}
-    </div>
+      {children}
+    </Panel>
   );
 }
 
-function a11yProps(index: number) {
+/** Core's own settings: the ones every game uses. */
+interface CoreSettings {
+  ratingsEnabled: boolean;
+  allowSelfRegister: boolean;
+  playersChooseName: boolean;
+}
+
+const CORE_KEYS = ['ratingsEnabled', 'allowSelfRegister', 'playersChooseName'] as const;
+
+function coreSettingsFrom(settings: SettingsResponse['settings'] | undefined): CoreSettings {
   return {
-    id: `settings-tab-${index}`,
-    'aria-controls': `settings-tabpanel-${index}`,
+    ratingsEnabled: settings?.ratingsEnabled ?? true,
+    allowSelfRegister: settings?.allowSelfRegister ?? false,
+    playersChooseName: settings?.playersChooseName ?? false,
   };
 }
 
+/**
+ * Settings: the platform's own, as on the SettingsIA board. A list of
+ * sections (Site, Sign-in, Email, Players, Matchmaking, News, Notifications,
+ * Integrations, Advanced) beside the one that is open; `?section=` picks it.
+ * A game's settings are its own pages in the admin menu (CS2: Skins, Match
+ * rules), linked under the list.
+ */
 export default function Settings() {
-  const { setHeaderActions } = usePageHeader();
-  const { showSuccess, showError, showSnackbar } = useSnackbar();
-  const DEFAULT_MATCHZY_CHAT_PREFIX = '[{Green}MAT{Default}]';
-  const DEFAULT_MATCHZY_ADMIN_CHAT_PREFIX = '[{Red}ADMIN{Default}]';
-  const [webhookUrl, setWebhookUrl] = useState('');
+  const { showSuccess, showError } = useSnackbar();
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [syncingMaps, setSyncingMaps] = useState(false);
-  const [initialWebhookUrl, setInitialWebhookUrl] = useState('');
-  const [simulateMatches, setSimulateMatches] = useState(false);
-  const [initialSimulateMatches, setInitialSimulateMatches] = useState(false);
-  const [simulationTimescale, setSimulationTimescale] = useState<number>(1);
-  const [initialSimulationTimescale, setInitialSimulationTimescale] = useState<number>(1);
-  const [matchzyChatPrefix, setMatchzyChatPrefix] = useState(DEFAULT_MATCHZY_CHAT_PREFIX);
-  const [initialMatchzyChatPrefix, setInitialMatchzyChatPrefix] =
-    useState(DEFAULT_MATCHZY_CHAT_PREFIX);
-  const [matchzyAdminChatPrefix, setMatchzyAdminChatPrefix] = useState(
-    DEFAULT_MATCHZY_ADMIN_CHAT_PREFIX
-  );
-  const [initialMatchzyAdminChatPrefix, setInitialMatchzyAdminChatPrefix] = useState(
-    DEFAULT_MATCHZY_ADMIN_CHAT_PREFIX
-  );
-  const [matchzyKnifeEnabledDefault, setMatchzyKnifeEnabledDefault] = useState(true);
-  const [initialMatchzyKnifeEnabledDefault, setInitialMatchzyKnifeEnabledDefault] = useState(true);
-  const [ratingsEnabled, setRatingsEnabled] = useState(true);
-  const [initialRatingsEnabled, setInitialRatingsEnabled] = useState(true);
-  const [matchzyDebugChatEnabled, setMatchzyDebugChatEnabled] = useState(false);
-  const [initialMatchzyDebugChatEnabled, setInitialMatchzyDebugChatEnabled] = useState(false);
-  const [allowSelfRegister, setAllowSelfRegister] = useState(false);
-  const [initialAllowSelfRegister, setInitialAllowSelfRegister] = useState(false);
-  // MatchZy core defaults
-  const [matchzyAutostartMode, setMatchzyAutostartMode] = useState<0 | 1 | 2>(1);
-  const [initialMatchzyAutostartMode, setInitialMatchzyAutostartMode] = useState<0 | 1 | 2>(1);
-  const [matchzyMinimumReadyRequired, setMatchzyMinimumReadyRequired] = useState<number>(0);
-  const [initialMatchzyMinimumReadyRequired, setInitialMatchzyMinimumReadyRequired] =
-    useState<number>(0);
-  const [matchzyAllowForceReady, setMatchzyAllowForceReady] = useState<boolean>(true);
-  const [initialMatchzyAllowForceReady, setInitialMatchzyAllowForceReady] =
-    useState<boolean>(true);
-  const [matchzyKickWhenNoMatchLoaded, setMatchzyKickWhenNoMatchLoaded] =
-    useState<boolean>(false);
-  const [initialMatchzyKickWhenNoMatchLoaded, setInitialMatchzyKickWhenNoMatchLoaded] =
-    useState<boolean>(false);
-  const [matchzyWhitelistEnabledDefault, setMatchzyWhitelistEnabledDefault] =
-    useState<boolean>(false);
-  const [initialMatchzyWhitelistEnabledDefault, setInitialMatchzyWhitelistEnabledDefault] =
-    useState<boolean>(false);
-  const [matchzyPauseAfterRestore, setMatchzyPauseAfterRestore] = useState<boolean>(true);
-  const [initialMatchzyPauseAfterRestore, setInitialMatchzyPauseAfterRestore] =
-    useState<boolean>(true);
-  const [matchzyStopCommandAvailable, setMatchzyStopCommandAvailable] =
-    useState<boolean>(false);
-  const [initialMatchzyStopCommandAvailable, setInitialMatchzyStopCommandAvailable] =
-    useState<boolean>(false);
-  const [matchzyStopCommandNoDamage, setMatchzyStopCommandNoDamage] = useState<boolean>(false);
-  const [initialMatchzyStopCommandNoDamage, setInitialMatchzyStopCommandNoDamage] =
-    useState<boolean>(false);
-  const [matchzyUsePauseCommandForTacticalPause, setMatchzyUsePauseCommandForTacticalPause] =
-    useState<boolean>(false);
-  const [
-    initialMatchzyUsePauseCommandForTacticalPause,
-    setInitialMatchzyUsePauseCommandForTacticalPause,
-  ] = useState<boolean>(false);
-  const [matchzyDemoPath, setMatchzyDemoPath] = useState<string>('MatchZy/');
-  const [initialMatchzyDemoPath, setInitialMatchzyDemoPath] = useState<string>('MatchZy/');
-  const [matchzyDemoNameFormat, setMatchzyDemoNameFormat] = useState<string>(
-    '{TIME}_{MATCH_ID}_{MAP}_{TEAM1}_vs_{TEAM2}'
-  );
-  const [initialMatchzyDemoNameFormat, setInitialMatchzyDemoNameFormat] = useState<string>(
-    '{TIME}_{MATCH_ID}_{MAP}_{TEAM1}_vs_{TEAM2}'
-  );
-  const [matchzySeriesEndKickDelayNoDemo, setMatchzySeriesEndKickDelayNoDemo] =
-    useState<number>(5);
-  const [initialMatchzySeriesEndKickDelayNoDemo, setInitialMatchzySeriesEndKickDelayNoDemo] =
-    useState<number>(5);
-  const [matchzySeriesEndKickDelayDemoNoUpload, setMatchzySeriesEndKickDelayDemoNoUpload] =
-    useState<number>(10);
-  const [
-    initialMatchzySeriesEndKickDelayDemoNoUpload,
-    setInitialMatchzySeriesEndKickDelayDemoNoUpload,
-  ] = useState<number>(10);
-  const [matchzySeriesEndKickDelayDemoUpload, setMatchzySeriesEndKickDelayDemoUpload] =
-    useState<number>(60);
-  const [initialMatchzySeriesEndKickDelayDemoUpload, setInitialMatchzySeriesEndKickDelayDemoUpload] =
-    useState<number>(60);
-  // MatchZy Enhanced v1.3.0 settings
-  const [matchzyAutoreadyEnabled, setMatchzyAutoreadyEnabled] = useState<0 | 1 | null>(null);
-  const [initialMatchzyAutoreadyEnabled, setInitialMatchzyAutoreadyEnabled] = useState<0 | 1 | null>(null);
-  const [matchzyBothTeamsUnpauseRequired, setMatchzyBothTeamsUnpauseRequired] = useState<0 | 1 | null>(null);
-  const [initialMatchzyBothTeamsUnpauseRequired, setInitialMatchzyBothTeamsUnpauseRequired] = useState<0 | 1 | null>(null);
-  const [matchzyMaxPausesPerTeam, setMatchzyMaxPausesPerTeam] = useState<number | null>(null);
-  const [initialMatchzyMaxPausesPerTeam, setInitialMatchzyMaxPausesPerTeam] = useState<number | null>(null);
-  const [matchzyPauseDuration, setMatchzyPauseDuration] = useState<number | null>(null);
-  const [initialMatchzyPauseDuration, setInitialMatchzyPauseDuration] = useState<number | null>(null);
-  const [matchzySideSelectionEnabled, setMatchzySideSelectionEnabled] = useState<0 | 1 | null>(null);
-  const [initialMatchzySideSelectionEnabled, setInitialMatchzySideSelectionEnabled] = useState<0 | 1 | null>(null);
-  const [matchzySideSelectionTime, setMatchzySideSelectionTime] = useState<number | null>(null);
-  const [initialMatchzySideSelectionTime, setInitialMatchzySideSelectionTime] = useState<number | null>(null);
-  const [matchzyGgEnabled, setMatchzyGgEnabled] = useState<0 | 1 | null>(null);
-  const [initialMatchzyGgEnabled, setInitialMatchzyGgEnabled] = useState<0 | 1 | null>(null);
-  const [matchzyGgThreshold, setMatchzyGgThreshold] = useState<number | null>(null);
-  const [initialMatchzyGgThreshold, setInitialMatchzyGgThreshold] = useState<number | null>(null);
-  const [matchzyGgMinScoreDiff, setMatchzyGgMinScoreDiff] = useState<number | null>(null);
-  const [initialMatchzyGgMinScoreDiff, setInitialMatchzyGgMinScoreDiff] = useState<number | null>(null);
-  const [matchzyFfwEnabled, setMatchzyFfwEnabled] = useState<0 | 1 | null>(null);
-  const [initialMatchzyFfwEnabled, setInitialMatchzyFfwEnabled] = useState<0 | 1 | null>(null);
-  const [matchzyFfwTime, setMatchzyFfwTime] = useState<number | null>(null);
-  const [initialMatchzyFfwTime, setInitialMatchzyFfwTime] = useState<number | null>(null);
-  const [matchzyDemoRecordingEnabled, setMatchzyDemoRecordingEnabled] = useState<0 | 1 | null>(null);
-  const [initialMatchzyDemoRecordingEnabled, setInitialMatchzyDemoRecordingEnabled] = useState<0 | 1 | null>(null);
+  const [values, setValues] = useState<CoreSettings>(() => coreSettingsFrom(undefined));
+  const [saved, setSaved] = useState<CoreSettings>(() => coreSettingsFrom(undefined));
   const [resetApiDialogOpen, setResetApiDialogOpen] = useState(false);
   const [resettingApi, setResettingApi] = useState(false);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const isDev = useIsDevelopment();
-  const [tabIndex, setTabIndex] = useState(0);
   const { t } = useTranslation();
+  // Experimental features (none right now): the Advanced card shows only with some, or in development.
+  const [experimental, setExperimental] = useState<ExperimentalFeatureState[]>([]);
+  useEffect(() => {
+    api
+      .get<{ features: ExperimentalFeatureState[] }>('/api/experimental')
+      .then((res) => setExperimental(res.features))
+      .catch(() => setExperimental([]));
+  }, []);
 
-  const ACCORDION_SX = {
-    bgcolor: 'rgba(0, 0, 0, 0.18)',
-    border: '1px solid rgba(255, 255, 255, 0.08)',
-    boxShadow: 'none',
-    // MUI renders a default divider line via :before; hide it so our border is the only separator
-    '&:before': { display: 'none' },
-  } as const;
+  // `?section=` scrolls to that card; CS2's old sections open its own pages.
+  // Modules other than CS2 that still have `instanceSettings` get a card
+  // each at the end, found by their id.
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const installed = useInstalledIntegrations();
+  const moduleSettings = installed.flatMap((integration) =>
+    integration.instanceSettings
+      ? [
+          {
+            id: integration.id,
+            labelKey: integration.instanceSettings.labelKey,
+            pages: integration.instanceSettings.pages,
+            Section: integration.instanceSettings.section,
+          },
+        ]
+      : []
+  );
+  const gameLinks = moduleNavItems(installed);
+  const requested = searchParams.get('section') ?? '';
+  const moved = MOVED_SECTIONS[requested];
+  const target =
+    SECTION_CARDS[requested] ??
+    (moduleSettings.some(({ id }) => requested === id || requested.startsWith(`${id}:`))
+      ? requested.split(':')[0]
+      : '');
 
-  const ACCORDION_SUMMARY_SX = {
-    bgcolor: 'rgba(0, 0, 0, 0.26)',
-  } as const;
-
-  const ACCORDION_DETAILS_SX = {
-    bgcolor: 'rgba(0, 0, 0, 0.18)',
-  } as const;
-
-  const handleTabChange = (_event: React.SyntheticEvent, newValue: number) => {
-    setTabIndex(newValue);
-  };
+  useEffect(() => {
+    if (moved) navigate(moved, { replace: true });
+  }, [moved, navigate]);
 
   const fetchSettings = useCallback(async () => {
     setLoading(true);
-
     try {
       const response: SettingsResponse = await api.get('/api/settings');
-      const webhook = response.settings.webhookUrl ?? '';
-      const simulate = response.settings.simulateMatches ?? false;
-      const timescale = response.settings.simulationTimescale ?? 1;
-      const chatPrefix = response.settings.matchzyChatPrefix ?? DEFAULT_MATCHZY_CHAT_PREFIX;
-      const adminChatPrefix =
-        response.settings.matchzyAdminChatPrefix ?? DEFAULT_MATCHZY_ADMIN_CHAT_PREFIX;
-      const knifeEnabled =
-        response.settings.matchzyKnifeEnabledDefault !== undefined
-          ? response.settings.matchzyKnifeEnabledDefault
-          : true;
-      const ratingsEnabledValue =
-        response.settings.ratingsEnabled !== undefined ? response.settings.ratingsEnabled : true;
-      const debugChatEnabled =
-        response.settings.matchzyDebugChatEnabled !== undefined
-          ? response.settings.matchzyDebugChatEnabled
-          : false;
-      const allowSelfRegisterValue =
-        response.settings.allowSelfRegister !== undefined
-          ? response.settings.allowSelfRegister
-          : false;
-      // MatchZy core defaults
-      const autostartMode = response.settings.matchzyAutostartMode ?? 1;
-      const minimumReadyRequired = response.settings.matchzyMinimumReadyRequired ?? 0;
-      const allowForceReady = response.settings.matchzyAllowForceReady ?? true;
-      const kickWhenNoMatchLoaded = response.settings.matchzyKickWhenNoMatchLoaded ?? false;
-      const whitelistEnabledDefault = response.settings.matchzyWhitelistEnabledDefault ?? false;
-      const pauseAfterRestore = response.settings.matchzyPauseAfterRestore ?? true;
-      const stopCommandAvailable = response.settings.matchzyStopCommandAvailable ?? false;
-      const stopCommandNoDamage = response.settings.matchzyStopCommandNoDamage ?? false;
-      const usePauseCommandForTacticalPause =
-        response.settings.matchzyUsePauseCommandForTacticalPause ?? false;
-      const demoPath = response.settings.matchzyDemoPath ?? 'MatchZy/';
-      const demoNameFormat =
-        response.settings.matchzyDemoNameFormat ?? '{TIME}_{MATCH_ID}_{MAP}_{TEAM1}_vs_{TEAM2}';
-      const seriesEndKickDelayNoDemo = response.settings.matchzySeriesEndKickDelayNoDemo ?? 5;
-      const seriesEndKickDelayDemoNoUpload =
-        response.settings.matchzySeriesEndKickDelayDemoNoUpload ?? 10;
-      const seriesEndKickDelayDemoUpload =
-        response.settings.matchzySeriesEndKickDelayDemoUpload ?? 60;
-      // MatchZy Enhanced v1.3.0 settings
-      const matchzyAutoready = response.settings.matchzyAutoreadyEnabled ?? null;
-      const matchzyBothTeamsUnpause = response.settings.matchzyBothTeamsUnpauseRequired ?? null;
-      const matchzyMaxPauses = response.settings.matchzyMaxPausesPerTeam ?? null;
-      const matchzyPauseDur = response.settings.matchzyPauseDuration ?? null;
-      const matchzySideSelEnabled = response.settings.matchzySideSelectionEnabled ?? null;
-      const matchzySideSelTime = response.settings.matchzySideSelectionTime ?? null;
-      const matchzyGg = response.settings.matchzyGgEnabled ?? null;
-      const matchzyGgThresh = response.settings.matchzyGgThreshold ?? null;
-      const matchzyGgMinDiff = response.settings.matchzyGgMinScoreDiff ?? null;
-      const matchzyFfw = response.settings.matchzyFfwEnabled ?? null;
-      const matchzyFfwT = response.settings.matchzyFfwTime ?? null;
-      const matchzyDemo = response.settings.matchzyDemoRecordingEnabled ?? null;
-      
-      setWebhookUrl(webhook);
-      setInitialWebhookUrl(webhook);
-      setSimulateMatches(simulate);
-      setInitialSimulateMatches(simulate);
-      setSimulationTimescale(timescale);
-      setInitialSimulationTimescale(timescale);
-      setMatchzyChatPrefix(chatPrefix);
-      setInitialMatchzyChatPrefix(chatPrefix);
-      setMatchzyAdminChatPrefix(adminChatPrefix);
-      setInitialMatchzyAdminChatPrefix(adminChatPrefix);
-      setMatchzyKnifeEnabledDefault(knifeEnabled);
-      setInitialMatchzyKnifeEnabledDefault(knifeEnabled);
-      setMatchzyDebugChatEnabled(debugChatEnabled);
-      setInitialMatchzyDebugChatEnabled(debugChatEnabled);
-      setAllowSelfRegister(allowSelfRegisterValue);
-      setInitialAllowSelfRegister(allowSelfRegisterValue);
-      setRatingsEnabled(ratingsEnabledValue);
-      setInitialRatingsEnabled(ratingsEnabledValue);
-      setMatchzyAutostartMode(autostartMode);
-      setInitialMatchzyAutostartMode(autostartMode);
-      setMatchzyMinimumReadyRequired(minimumReadyRequired);
-      setInitialMatchzyMinimumReadyRequired(minimumReadyRequired);
-      setMatchzyAllowForceReady(allowForceReady);
-      setInitialMatchzyAllowForceReady(allowForceReady);
-      setMatchzyKickWhenNoMatchLoaded(kickWhenNoMatchLoaded);
-      setInitialMatchzyKickWhenNoMatchLoaded(kickWhenNoMatchLoaded);
-      setMatchzyWhitelistEnabledDefault(whitelistEnabledDefault);
-      setInitialMatchzyWhitelistEnabledDefault(whitelistEnabledDefault);
-      setMatchzyPauseAfterRestore(pauseAfterRestore);
-      setInitialMatchzyPauseAfterRestore(pauseAfterRestore);
-      setMatchzyStopCommandAvailable(stopCommandAvailable);
-      setInitialMatchzyStopCommandAvailable(stopCommandAvailable);
-      setMatchzyStopCommandNoDamage(stopCommandNoDamage);
-      setInitialMatchzyStopCommandNoDamage(stopCommandNoDamage);
-      setMatchzyUsePauseCommandForTacticalPause(usePauseCommandForTacticalPause);
-      setInitialMatchzyUsePauseCommandForTacticalPause(usePauseCommandForTacticalPause);
-      setMatchzyDemoPath(demoPath);
-      setInitialMatchzyDemoPath(demoPath);
-      setMatchzyDemoNameFormat(demoNameFormat);
-      setInitialMatchzyDemoNameFormat(demoNameFormat);
-      setMatchzySeriesEndKickDelayNoDemo(seriesEndKickDelayNoDemo);
-      setInitialMatchzySeriesEndKickDelayNoDemo(seriesEndKickDelayNoDemo);
-      setMatchzySeriesEndKickDelayDemoNoUpload(seriesEndKickDelayDemoNoUpload);
-      setInitialMatchzySeriesEndKickDelayDemoNoUpload(seriesEndKickDelayDemoNoUpload);
-      setMatchzySeriesEndKickDelayDemoUpload(seriesEndKickDelayDemoUpload);
-      setInitialMatchzySeriesEndKickDelayDemoUpload(seriesEndKickDelayDemoUpload);
-      // MatchZy Enhanced
-      setMatchzyAutoreadyEnabled(matchzyAutoready);
-      setInitialMatchzyAutoreadyEnabled(matchzyAutoready);
-      setMatchzyBothTeamsUnpauseRequired(matchzyBothTeamsUnpause);
-      setInitialMatchzyBothTeamsUnpauseRequired(matchzyBothTeamsUnpause);
-      setMatchzyMaxPausesPerTeam(matchzyMaxPauses);
-      setInitialMatchzyMaxPausesPerTeam(matchzyMaxPauses);
-      setMatchzyPauseDuration(matchzyPauseDur);
-      setInitialMatchzyPauseDuration(matchzyPauseDur);
-      setMatchzySideSelectionEnabled(matchzySideSelEnabled);
-      setInitialMatchzySideSelectionEnabled(matchzySideSelEnabled);
-      setMatchzySideSelectionTime(matchzySideSelTime);
-      setInitialMatchzySideSelectionTime(matchzySideSelTime);
-      setMatchzyGgEnabled(matchzyGg);
-      setInitialMatchzyGgEnabled(matchzyGg);
-      setMatchzyGgThreshold(matchzyGgThresh);
-      setInitialMatchzyGgThreshold(matchzyGgThresh);
-      setMatchzyGgMinScoreDiff(matchzyGgMinDiff);
-      setInitialMatchzyGgMinScoreDiff(matchzyGgMinDiff);
-      setMatchzyFfwEnabled(matchzyFfw);
-      setInitialMatchzyFfwEnabled(matchzyFfw);
-      setMatchzyFfwTime(matchzyFfwT);
-      setInitialMatchzyFfwTime(matchzyFfwT);
-      setMatchzyDemoRecordingEnabled(matchzyDemo);
-      setInitialMatchzyDemoRecordingEnabled(matchzyDemo);
+      const core = coreSettingsFrom(response.settings);
+      setValues(core);
+      setSaved(core);
     } catch (err) {
       const message = err instanceof Error ? err.message : t('settingsPage.errors.loadSettings');
       showError(message);
@@ -340,336 +192,45 @@ export default function Settings() {
   }, [showError, t]);
 
   useEffect(() => {
-    document.title = t('settingsPage.title');
+    document.title = pageTitle(t('settingsPage.title'));
     void fetchSettings();
   }, [fetchSettings, t]);
 
+  // Only the fields that changed: every `PUT /api/settings` field is optional.
+  const handleSave = useCallback(async () => {
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+      saveTimeoutRef.current = null;
+    }
+    const changed = CORE_KEYS.filter((key) => values[key] !== saved[key]);
+    if (changed.length === 0) return;
+    const body = Object.fromEntries(changed.map((key) => [key, values[key]]));
+
+    try {
+      const response: SettingsResponse = await api.put('/api/settings', body);
+      const stored = coreSettingsFrom(response.settings);
+      setSaved(stored);
+      setValues((prev) => ({ ...prev, ...Object.fromEntries(changed.map((k) => [k, stored[k]])) }));
+      showSuccess(t('settingsPage.success.saveSettings'));
+      window.dispatchEvent(
+        new CustomEvent<SettingsResponse['settings']>('at:settingsUpdated', {
+          detail: response.settings,
+        })
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('settingsPage.errors.saveSettings');
+      showError(message);
+    }
+  }, [values, saved, showError, showSuccess, t]);
+
+  // Auto-save a second after a change
   useEffect(() => {
-    // No header actions needed for settings page
-    setHeaderActions(null);
-
+    if (loading || CORE_KEYS.every((key) => values[key] === saved[key])) return;
+    saveTimeoutRef.current = setTimeout(() => void handleSave(), 1000);
     return () => {
-      setHeaderActions(null);
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     };
-  }, [setHeaderActions]);
-
-  const handleSave = useCallback(
-    async (showSuccessMessage = true, overrides?: { matchzyDebugChatEnabled?: boolean }) => {
-      setSaving(true);
-
-      // Cancel any pending auto-save
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-        saveTimeoutRef.current = null;
-      }
-
-      try {
-        const payload = {
-          webhookUrl: webhookUrl.trim() === '' ? null : webhookUrl.trim(),
-          matchzyChatPrefix: matchzyChatPrefix.trim() === '' ? null : matchzyChatPrefix.trim(),
-          matchzyAdminChatPrefix:
-            matchzyAdminChatPrefix.trim() === '' ? null : matchzyAdminChatPrefix.trim(),
-          matchzyKnifeEnabledDefault,
-          ratingsEnabled,
-          matchzyDebugChatEnabled: overrides?.matchzyDebugChatEnabled ?? matchzyDebugChatEnabled,
-          allowSelfRegister,
-          // MatchZy core defaults
-          matchzyAutostartMode,
-          matchzyMinimumReadyRequired,
-          matchzyAllowForceReady,
-          matchzyKickWhenNoMatchLoaded,
-          matchzyWhitelistEnabledDefault,
-          matchzyPauseAfterRestore,
-          matchzyStopCommandAvailable,
-          matchzyStopCommandNoDamage,
-          matchzyUsePauseCommandForTacticalPause,
-          matchzyDemoPath: matchzyDemoPath.trim(),
-          matchzyDemoNameFormat: matchzyDemoNameFormat.trim(),
-          matchzySeriesEndKickDelayNoDemo,
-          matchzySeriesEndKickDelayDemoNoUpload,
-          matchzySeriesEndKickDelayDemoUpload,
-          // MatchZy Enhanced v1.3.0 settings
-          matchzyAutoreadyEnabled,
-          matchzyBothTeamsUnpauseRequired,
-          matchzyMaxPausesPerTeam,
-          matchzyPauseDuration,
-          matchzySideSelectionEnabled,
-          matchzySideSelectionTime,
-          matchzyGgEnabled,
-          matchzyGgThreshold,
-          matchzyGgMinScoreDiff,
-          matchzyFfwEnabled,
-          matchzyFfwTime,
-          matchzyDemoRecordingEnabled,
-          // Only send developer options from dev builds to keep this feature
-          // clearly scoped to development environments.
-          ...(isDev && { simulateMatches, simulationTimescale }),
-        };
-
-        const response: SettingsResponse = await api.put('/api/settings', payload);
-        const newWebhook = response.settings.webhookUrl ?? '';
-        const newSimulate = response.settings.simulateMatches ?? false;
-        const newTimescale = response.settings.simulationTimescale ?? 1;
-        const newChatPrefix = response.settings.matchzyChatPrefix ?? DEFAULT_MATCHZY_CHAT_PREFIX;
-        const newAdminChatPrefix =
-          response.settings.matchzyAdminChatPrefix ?? DEFAULT_MATCHZY_ADMIN_CHAT_PREFIX;
-        const newKnifeEnabled =
-          response.settings.matchzyKnifeEnabledDefault !== undefined
-            ? response.settings.matchzyKnifeEnabledDefault
-            : true;
-        const newRatingsEnabled =
-          response.settings.ratingsEnabled !== undefined
-            ? response.settings.ratingsEnabled
-            : true;
-        const newDebugChatEnabled =
-          response.settings.matchzyDebugChatEnabled !== undefined
-            ? response.settings.matchzyDebugChatEnabled
-            : false;
-        const newAllowSelfRegister =
-          response.settings.allowSelfRegister !== undefined
-            ? response.settings.allowSelfRegister
-            : false;
-        const newAutostartMode = response.settings.matchzyAutostartMode ?? 1;
-        const newMinimumReadyRequired = response.settings.matchzyMinimumReadyRequired ?? 0;
-        const newAllowForceReady = response.settings.matchzyAllowForceReady ?? true;
-        const newKickWhenNoMatchLoaded = response.settings.matchzyKickWhenNoMatchLoaded ?? false;
-        const newWhitelistEnabledDefault = response.settings.matchzyWhitelistEnabledDefault ?? false;
-        const newPauseAfterRestore = response.settings.matchzyPauseAfterRestore ?? true;
-        const newStopCommandAvailable = response.settings.matchzyStopCommandAvailable ?? false;
-        const newStopCommandNoDamage = response.settings.matchzyStopCommandNoDamage ?? false;
-        const newUsePauseCommandForTacticalPause =
-          response.settings.matchzyUsePauseCommandForTacticalPause ?? false;
-        const newDemoPath = response.settings.matchzyDemoPath ?? 'MatchZy/';
-        const newDemoNameFormat =
-          response.settings.matchzyDemoNameFormat ?? '{TIME}_{MATCH_ID}_{MAP}_{TEAM1}_vs_{TEAM2}';
-        const newSeriesEndKickDelayNoDemo = response.settings.matchzySeriesEndKickDelayNoDemo ?? 5;
-        const newSeriesEndKickDelayDemoNoUpload =
-          response.settings.matchzySeriesEndKickDelayDemoNoUpload ?? 10;
-        const newSeriesEndKickDelayDemoUpload =
-          response.settings.matchzySeriesEndKickDelayDemoUpload ?? 60;
-        // MatchZy Enhanced v1.3.0 settings
-        const newMatchzyAutoready = response.settings.matchzyAutoreadyEnabled ?? null;
-        const newMatchzyBothTeamsUnpause = response.settings.matchzyBothTeamsUnpauseRequired ?? null;
-        const newMatchzyMaxPauses = response.settings.matchzyMaxPausesPerTeam ?? null;
-        const newMatchzyPauseDur = response.settings.matchzyPauseDuration ?? null;
-        const newMatchzySideSelEnabled = response.settings.matchzySideSelectionEnabled ?? null;
-        const newMatchzySideSelTime = response.settings.matchzySideSelectionTime ?? null;
-        const newMatchzyGg = response.settings.matchzyGgEnabled ?? null;
-        const newMatchzyGgThresh = response.settings.matchzyGgThreshold ?? null;
-        const newMatchzyGgMinDiff = response.settings.matchzyGgMinScoreDiff ?? null;
-        const newMatchzyFfw = response.settings.matchzyFfwEnabled ?? null;
-        const newMatchzyFfwT = response.settings.matchzyFfwTime ?? null;
-        const newMatchzyDemo = response.settings.matchzyDemoRecordingEnabled ?? null;
-        
-        // Compute deltas before updating state
-        const simulationToggled = isDev && newSimulate !== initialSimulateMatches;
-        const timescaleChanged =
-          isDev && newTimescale !== initialSimulationTimescale;
-
-        setWebhookUrl(newWebhook);
-        setInitialWebhookUrl(newWebhook);
-        setSimulateMatches(newSimulate);
-        setInitialSimulateMatches(newSimulate);
-        setSimulationTimescale(newTimescale);
-        setInitialSimulationTimescale(newTimescale);
-        setMatchzyChatPrefix(newChatPrefix);
-        setInitialMatchzyChatPrefix(newChatPrefix);
-        setMatchzyAdminChatPrefix(newAdminChatPrefix);
-        setInitialMatchzyAdminChatPrefix(newAdminChatPrefix);
-        setMatchzyKnifeEnabledDefault(newKnifeEnabled);
-        setInitialMatchzyKnifeEnabledDefault(newKnifeEnabled);
-        setRatingsEnabled(newRatingsEnabled);
-        setInitialRatingsEnabled(newRatingsEnabled);
-        setMatchzyDebugChatEnabled(newDebugChatEnabled);
-        setInitialMatchzyDebugChatEnabled(newDebugChatEnabled);
-        setAllowSelfRegister(newAllowSelfRegister);
-        setInitialAllowSelfRegister(newAllowSelfRegister);
-        setMatchzyAutostartMode(newAutostartMode);
-        setInitialMatchzyAutostartMode(newAutostartMode);
-        setMatchzyMinimumReadyRequired(newMinimumReadyRequired);
-        setInitialMatchzyMinimumReadyRequired(newMinimumReadyRequired);
-        setMatchzyAllowForceReady(newAllowForceReady);
-        setInitialMatchzyAllowForceReady(newAllowForceReady);
-        setMatchzyKickWhenNoMatchLoaded(newKickWhenNoMatchLoaded);
-        setInitialMatchzyKickWhenNoMatchLoaded(newKickWhenNoMatchLoaded);
-        setMatchzyWhitelistEnabledDefault(newWhitelistEnabledDefault);
-        setInitialMatchzyWhitelistEnabledDefault(newWhitelistEnabledDefault);
-        setMatchzyPauseAfterRestore(newPauseAfterRestore);
-        setInitialMatchzyPauseAfterRestore(newPauseAfterRestore);
-        setMatchzyStopCommandAvailable(newStopCommandAvailable);
-        setInitialMatchzyStopCommandAvailable(newStopCommandAvailable);
-        setMatchzyStopCommandNoDamage(newStopCommandNoDamage);
-        setInitialMatchzyStopCommandNoDamage(newStopCommandNoDamage);
-        setMatchzyUsePauseCommandForTacticalPause(newUsePauseCommandForTacticalPause);
-        setInitialMatchzyUsePauseCommandForTacticalPause(newUsePauseCommandForTacticalPause);
-        setMatchzyDemoPath(newDemoPath);
-        setInitialMatchzyDemoPath(newDemoPath);
-        setMatchzyDemoNameFormat(newDemoNameFormat);
-        setInitialMatchzyDemoNameFormat(newDemoNameFormat);
-        setMatchzySeriesEndKickDelayNoDemo(newSeriesEndKickDelayNoDemo);
-        setInitialMatchzySeriesEndKickDelayNoDemo(newSeriesEndKickDelayNoDemo);
-        setMatchzySeriesEndKickDelayDemoNoUpload(newSeriesEndKickDelayDemoNoUpload);
-        setInitialMatchzySeriesEndKickDelayDemoNoUpload(newSeriesEndKickDelayDemoNoUpload);
-        setMatchzySeriesEndKickDelayDemoUpload(newSeriesEndKickDelayDemoUpload);
-        setInitialMatchzySeriesEndKickDelayDemoUpload(newSeriesEndKickDelayDemoUpload);
-        // MatchZy Enhanced
-        setMatchzyAutoreadyEnabled(newMatchzyAutoready);
-        setInitialMatchzyAutoreadyEnabled(newMatchzyAutoready);
-        setMatchzyBothTeamsUnpauseRequired(newMatchzyBothTeamsUnpause);
-        setInitialMatchzyBothTeamsUnpauseRequired(newMatchzyBothTeamsUnpause);
-        setMatchzyMaxPausesPerTeam(newMatchzyMaxPauses);
-        setInitialMatchzyMaxPausesPerTeam(newMatchzyMaxPauses);
-        setMatchzyPauseDuration(newMatchzyPauseDur);
-        setInitialMatchzyPauseDuration(newMatchzyPauseDur);
-        setMatchzySideSelectionEnabled(newMatchzySideSelEnabled);
-        setInitialMatchzySideSelectionEnabled(newMatchzySideSelEnabled);
-        setMatchzySideSelectionTime(newMatchzySideSelTime);
-        setInitialMatchzySideSelectionTime(newMatchzySideSelTime);
-        setMatchzyGgEnabled(newMatchzyGg);
-        setInitialMatchzyGgEnabled(newMatchzyGg);
-        setMatchzyGgThreshold(newMatchzyGgThresh);
-        setInitialMatchzyGgThreshold(newMatchzyGgThresh);
-        setMatchzyGgMinScoreDiff(newMatchzyGgMinDiff);
-        setInitialMatchzyGgMinScoreDiff(newMatchzyGgMinDiff);
-        setMatchzyFfwEnabled(newMatchzyFfw);
-        setInitialMatchzyFfwEnabled(newMatchzyFfw);
-        setMatchzyFfwTime(newMatchzyFfwT);
-        setInitialMatchzyFfwTime(newMatchzyFfwT);
-        setMatchzyDemoRecordingEnabled(newMatchzyDemo);
-        setInitialMatchzyDemoRecordingEnabled(newMatchzyDemo);
-
-        if (showSuccessMessage) {
-          showSuccess(t('settingsPage.success.saveSettings'));
-
-          if (simulationToggled) {
-            showSnackbar(
-              newSimulate
-                ? t('settingsPage.success.simulationEnabled', {
-                    suffix: isDev ? ` at ${newTimescale.toFixed(1)}x speed` : '',
-                  })
-                : t('settingsPage.success.simulationDisabled'),
-              'info'
-            );
-          } else if (timescaleChanged && newSimulate) {
-            showSnackbar(
-              t('settingsPage.success.timescaleUpdated', {
-                value: newTimescale.toFixed(1),
-              }),
-              'info'
-            );
-          }
-        }
-
-        window.dispatchEvent(
-          new CustomEvent<SettingsResponse['settings']>('matchzy:settingsUpdated', {
-            detail: response.settings,
-          })
-        );
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : t('settingsPage.errors.saveSettings');
-        showError(message);
-      } finally {
-        setSaving(false);
-      }
-    },
-    [
-      webhookUrl,
-      matchzyChatPrefix,
-      matchzyAdminChatPrefix,
-      matchzyKnifeEnabledDefault,
-      ratingsEnabled,
-      matchzyDebugChatEnabled,
-      simulateMatches,
-      simulationTimescale,
-      allowSelfRegister,
-      matchzyAutostartMode,
-      matchzyMinimumReadyRequired,
-      matchzyAllowForceReady,
-      matchzyKickWhenNoMatchLoaded,
-      matchzyWhitelistEnabledDefault,
-      matchzyPauseAfterRestore,
-      matchzyStopCommandAvailable,
-      matchzyStopCommandNoDamage,
-      matchzyUsePauseCommandForTacticalPause,
-      matchzyDemoPath,
-      matchzyDemoNameFormat,
-      matchzySeriesEndKickDelayNoDemo,
-      matchzySeriesEndKickDelayDemoNoUpload,
-      matchzySeriesEndKickDelayDemoUpload,
-      matchzyAutoreadyEnabled,
-      matchzyBothTeamsUnpauseRequired,
-      matchzyMaxPausesPerTeam,
-      matchzyPauseDuration,
-      matchzySideSelectionEnabled,
-      matchzySideSelectionTime,
-      matchzyGgEnabled,
-      matchzyGgThreshold,
-      matchzyGgMinScoreDiff,
-      matchzyFfwEnabled,
-      matchzyFfwTime,
-      matchzyDemoRecordingEnabled,
-      isDev,
-      showSuccess,
-      showError,
-      showSnackbar,
-      initialSimulateMatches,
-      initialSimulationTimescale,
-      t,
-    ]
-  );
-
-  const handleFieldBlur = () => {
-    // Save immediately when field loses focus (if values changed)
-    if (
-      webhookUrl !== initialWebhookUrl ||
-      matchzyChatPrefix !== initialMatchzyChatPrefix ||
-      matchzyAdminChatPrefix !== initialMatchzyAdminChatPrefix ||
-      matchzyKnifeEnabledDefault !== initialMatchzyKnifeEnabledDefault ||
-      ratingsEnabled !== initialRatingsEnabled ||
-      matchzyDebugChatEnabled !== initialMatchzyDebugChatEnabled ||
-      allowSelfRegister !== initialAllowSelfRegister ||
-      matchzyAutostartMode !== initialMatchzyAutostartMode ||
-      matchzyMinimumReadyRequired !== initialMatchzyMinimumReadyRequired ||
-      matchzyAllowForceReady !== initialMatchzyAllowForceReady ||
-      matchzyKickWhenNoMatchLoaded !== initialMatchzyKickWhenNoMatchLoaded ||
-      matchzyWhitelistEnabledDefault !== initialMatchzyWhitelistEnabledDefault ||
-      matchzyPauseAfterRestore !== initialMatchzyPauseAfterRestore ||
-      matchzyStopCommandAvailable !== initialMatchzyStopCommandAvailable ||
-      matchzyStopCommandNoDamage !== initialMatchzyStopCommandNoDamage ||
-      matchzyUsePauseCommandForTacticalPause !== initialMatchzyUsePauseCommandForTacticalPause ||
-      matchzyDemoPath !== initialMatchzyDemoPath ||
-      matchzyDemoNameFormat !== initialMatchzyDemoNameFormat ||
-      matchzySeriesEndKickDelayNoDemo !== initialMatchzySeriesEndKickDelayNoDemo ||
-      matchzySeriesEndKickDelayDemoNoUpload !== initialMatchzySeriesEndKickDelayDemoNoUpload ||
-      matchzySeriesEndKickDelayDemoUpload !== initialMatchzySeriesEndKickDelayDemoUpload ||
-      matchzyAutoreadyEnabled !== initialMatchzyAutoreadyEnabled ||
-      matchzyBothTeamsUnpauseRequired !== initialMatchzyBothTeamsUnpauseRequired ||
-      matchzyMaxPausesPerTeam !== initialMatchzyMaxPausesPerTeam ||
-      matchzyPauseDuration !== initialMatchzyPauseDuration ||
-      matchzySideSelectionEnabled !== initialMatchzySideSelectionEnabled ||
-      matchzySideSelectionTime !== initialMatchzySideSelectionTime ||
-      matchzyGgEnabled !== initialMatchzyGgEnabled ||
-      matchzyGgThreshold !== initialMatchzyGgThreshold ||
-      matchzyGgMinScoreDiff !== initialMatchzyGgMinScoreDiff ||
-      matchzyFfwEnabled !== initialMatchzyFfwEnabled ||
-      matchzyFfwTime !== initialMatchzyFfwTime ||
-      matchzyDemoRecordingEnabled !== initialMatchzyDemoRecordingEnabled ||
-      (isDev &&
-        (simulateMatches !== initialSimulateMatches ||
-          simulationTimescale !== initialSimulationTimescale))
-    ) {
-      void handleSave(true); // Show success message
-    }
-  };
-
-  const handleFieldKeyDown = (event: React.KeyboardEvent) => {
-    // Save on Enter key
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      void handleSave(true); // Show success message
-    }
-  };
+  }, [values, saved, loading, handleSave]);
 
   const handleResetApi = useCallback(async () => {
     setResettingApi(true);
@@ -688,1335 +249,302 @@ export default function Settings() {
     }
   }, [fetchSettings, showError, showSuccess, t]);
 
-  // Auto-save when values change
-  useEffect(() => {
-    // Don't auto-save on initial load
-    if (loading) return;
-
-    // Don't auto-save if values haven't changed
-    if (
-      webhookUrl === initialWebhookUrl &&
-      matchzyChatPrefix === initialMatchzyChatPrefix &&
-      matchzyAdminChatPrefix === initialMatchzyAdminChatPrefix &&
-      matchzyKnifeEnabledDefault === initialMatchzyKnifeEnabledDefault &&
-      matchzyDebugChatEnabled === initialMatchzyDebugChatEnabled &&
-      ratingsEnabled === initialRatingsEnabled &&
-      allowSelfRegister === initialAllowSelfRegister &&
-      matchzyAutostartMode === initialMatchzyAutostartMode &&
-      matchzyMinimumReadyRequired === initialMatchzyMinimumReadyRequired &&
-      matchzyAllowForceReady === initialMatchzyAllowForceReady &&
-      matchzyKickWhenNoMatchLoaded === initialMatchzyKickWhenNoMatchLoaded &&
-      matchzyWhitelistEnabledDefault === initialMatchzyWhitelistEnabledDefault &&
-      matchzyPauseAfterRestore === initialMatchzyPauseAfterRestore &&
-      matchzyStopCommandAvailable === initialMatchzyStopCommandAvailable &&
-      matchzyStopCommandNoDamage === initialMatchzyStopCommandNoDamage &&
-      matchzyUsePauseCommandForTacticalPause === initialMatchzyUsePauseCommandForTacticalPause &&
-      matchzyDemoPath === initialMatchzyDemoPath &&
-      matchzyDemoNameFormat === initialMatchzyDemoNameFormat &&
-      matchzySeriesEndKickDelayNoDemo === initialMatchzySeriesEndKickDelayNoDemo &&
-      matchzySeriesEndKickDelayDemoNoUpload === initialMatchzySeriesEndKickDelayDemoNoUpload &&
-      matchzySeriesEndKickDelayDemoUpload === initialMatchzySeriesEndKickDelayDemoUpload &&
-      matchzyAutoreadyEnabled === initialMatchzyAutoreadyEnabled &&
-      matchzyBothTeamsUnpauseRequired === initialMatchzyBothTeamsUnpauseRequired &&
-      matchzyMaxPausesPerTeam === initialMatchzyMaxPausesPerTeam &&
-      matchzyPauseDuration === initialMatchzyPauseDuration &&
-      matchzySideSelectionEnabled === initialMatchzySideSelectionEnabled &&
-      matchzySideSelectionTime === initialMatchzySideSelectionTime &&
-      matchzyGgEnabled === initialMatchzyGgEnabled &&
-      matchzyGgThreshold === initialMatchzyGgThreshold &&
-      matchzyGgMinScoreDiff === initialMatchzyGgMinScoreDiff &&
-      matchzyFfwEnabled === initialMatchzyFfwEnabled &&
-      matchzyFfwTime === initialMatchzyFfwTime &&
-      matchzyDemoRecordingEnabled === initialMatchzyDemoRecordingEnabled &&
-      (!isDev ||
-        (simulateMatches === initialSimulateMatches &&
-          simulationTimescale === initialSimulationTimescale))
-    )
-      return;
-
-    // Clear existing timeout
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-    }
-
-    // Set new timeout for auto-save
-    saveTimeoutRef.current = setTimeout(() => {
-      void handleSave(true); // Auto-save with success message
-    }, 1000); // 1 second debounce
-
-    return () => {
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-      }
-    };
-  }, [
-    webhookUrl,
-    matchzyChatPrefix,
-    matchzyAdminChatPrefix,
-    matchzyKnifeEnabledDefault,
-    matchzyDebugChatEnabled,
-    ratingsEnabled,
-    allowSelfRegister,
-    matchzyAutostartMode,
-    matchzyMinimumReadyRequired,
-    matchzyAllowForceReady,
-    matchzyKickWhenNoMatchLoaded,
-    matchzyWhitelistEnabledDefault,
-    matchzyPauseAfterRestore,
-    matchzyStopCommandAvailable,
-    matchzyStopCommandNoDamage,
-    matchzyUsePauseCommandForTacticalPause,
-    matchzyDemoPath,
-    matchzyDemoNameFormat,
-    matchzySeriesEndKickDelayNoDemo,
-    matchzySeriesEndKickDelayDemoNoUpload,
-    matchzySeriesEndKickDelayDemoUpload,
-    matchzyAutoreadyEnabled,
-    matchzyBothTeamsUnpauseRequired,
-    matchzyMaxPausesPerTeam,
-    matchzyPauseDuration,
-    matchzySideSelectionEnabled,
-    matchzySideSelectionTime,
-    matchzyGgEnabled,
-    matchzyGgThreshold,
-    matchzyGgMinScoreDiff,
-    matchzyFfwEnabled,
-    matchzyFfwTime,
-    matchzyDemoRecordingEnabled,
-    initialWebhookUrl,
-    initialMatchzyChatPrefix,
-    initialMatchzyAdminChatPrefix,
-    initialMatchzyKnifeEnabledDefault,
-    initialMatchzyDebugChatEnabled,
-    initialRatingsEnabled,
-    initialAllowSelfRegister,
-    initialMatchzyAutostartMode,
-    initialMatchzyMinimumReadyRequired,
-    initialMatchzyAllowForceReady,
-    initialMatchzyKickWhenNoMatchLoaded,
-    initialMatchzyWhitelistEnabledDefault,
-    initialMatchzyPauseAfterRestore,
-    initialMatchzyStopCommandAvailable,
-    initialMatchzyStopCommandNoDamage,
-    initialMatchzyUsePauseCommandForTacticalPause,
-    initialMatchzyDemoPath,
-    initialMatchzyDemoNameFormat,
-    initialMatchzySeriesEndKickDelayNoDemo,
-    initialMatchzySeriesEndKickDelayDemoNoUpload,
-    initialMatchzySeriesEndKickDelayDemoUpload,
-    initialMatchzyAutoreadyEnabled,
-    initialMatchzyBothTeamsUnpauseRequired,
-    initialMatchzyMaxPausesPerTeam,
-    initialMatchzyPauseDuration,
-    initialMatchzySideSelectionEnabled,
-    initialMatchzySideSelectionTime,
-    initialMatchzyGgEnabled,
-    initialMatchzyGgThreshold,
-    initialMatchzyGgMinScoreDiff,
-    initialMatchzyFfwEnabled,
-    initialMatchzyFfwTime,
-    initialMatchzyDemoRecordingEnabled,
-    simulateMatches,
-    initialSimulateMatches,
-    initialSimulationTimescale,
-    simulationTimescale,
-    isDev,
-    loading,
-    handleSave,
-  ]);
-
-  const handleSyncMaps = async () => {
-    setSyncingMaps(true);
-
-    try {
-      const response = await api.post<{
-        success: boolean;
-        message?: string;
-        stats?: { total: number; added: number; skipped: number; errors: number };
-        errors?: string[];
-        error?: string;
-        errorType?: 'rate_limit' | 'github_error' | 'unknown';
-      }>('/api/maps/sync');
-
-      if (response.success) {
-        showSuccess(
-          `Map sync completed! ${response.stats?.added || 0} new map(s) added, ${
-            response.stats?.skipped || 0
-          } already existed.`
-        );
-        if (response.errors && response.errors.length > 0) {
-          showError(`Some maps failed to sync: ${response.errors.join(', ')}`);
+  // The sections, in the SettingsIA board's order. Advanced shows only with
+  // an experimental feature to turn on, or in development.
+  const playersCard = (
+    <>
+      <SettingsCardHead
+        title={t('settingsPage.players.title')}
+        hint={t('settingsPage.players.short')}
+      />
+      <SettingsRow
+        title={t('settingsPage.players.registration.toggleLabel')}
+        sub={t('settingsPage.players.registration.short')}
+        control={
+          <Switch
+            checked={values.allowSelfRegister}
+            onChange={(event) =>
+              setValues((prev) => ({ ...prev, allowSelfRegister: event.target.checked }))
+            }
+            slotProps={{
+              input: {
+                'aria-label': t('settingsPage.players.registration.toggleLabel'),
+                'data-testid': 'settings-self-register',
+              } as React.InputHTMLAttributes<HTMLInputElement>,
+            }}
+          />
         }
-      } else {
-        // Handle different error types with user-friendly messages
-        let errorMessage = response.error || 'Failed to sync maps';
-
-        if (response.errorType === 'rate_limit') {
-          errorMessage =
-            'GitHub API rate limit exceeded. Please try again in a few minutes. You can set GITHUB_TOKEN environment variable to increase the rate limit.';
-        } else if (response.errorType === 'github_error') {
-          errorMessage =
-            'Unable to reach GitHub repository. Please check your internet connection and try again later.';
+      />
+      <SettingsRow
+        title={t('settingsPage.players.chooseName.toggleLabel')}
+        sub={t('settingsPage.players.chooseName.short')}
+        control={
+          <Switch
+            checked={values.playersChooseName}
+            onChange={(event) =>
+              setValues((prev) => ({ ...prev, playersChooseName: event.target.checked }))
+            }
+            slotProps={{
+              input: {
+                'aria-label': t('settingsPage.players.chooseName.toggleLabel'),
+                'data-testid': 'settings-players-choose-name',
+              } as React.InputHTMLAttributes<HTMLInputElement>,
+            }}
+          />
         }
-
-        showError(errorMessage);
-      }
-    } catch (err: unknown) {
-      // Handle API errors (network, 429, 503, etc.)
-      let errorMessage = 'Failed to sync maps';
-
-      if (err && typeof err === 'object' && 'response' in err) {
-        const apiError = err as {
-          response?: { data?: { error?: string; errorType?: string }; status?: number };
-        };
-        const status = apiError.response?.status;
-        const errorData = apiError.response?.data;
-
-        if (status === 429) {
-          errorMessage =
-            'GitHub API rate limit exceeded. Please try again in a few minutes. You can set GITHUB_TOKEN environment variable to increase the rate limit.';
-        } else if (status === 503) {
-          errorMessage =
-            'Unable to reach GitHub repository. Please check your internet connection and try again later.';
-        } else if (errorData?.error) {
-          errorMessage = errorData.error;
-          // Check error type for additional context
-          if (errorData.errorType === 'rate_limit') {
-            errorMessage = 'GitHub API rate limit exceeded. Please try again in a few minutes.';
+      />
+      <SettingsRow
+        title={t('settingsPage.matchRating.ratings.toggleLabel')}
+        sub={t('settingsPage.matchRating.ratings.short')}
+        control={
+          <Switch
+            checked={values.ratingsEnabled}
+            onChange={(event) =>
+              setValues((prev) => ({ ...prev, ratingsEnabled: event.target.checked }))
+            }
+            slotProps={{
+              input: {
+                'aria-label': t('settingsPage.matchRating.ratings.toggleLabel'),
+                'data-testid': 'settings-ratings-enabled',
+              } as React.InputHTMLAttributes<HTMLInputElement>,
+            }}
+          />
+        }
+      />
+    </>
+  );
+  const advancedCard = (
+    <>
+      <ExperimentalCard features={experimental} onChange={setExperimental} />
+      {isDev && (
+        <Box
+          sx={
+            experimental.length > 0
+              ? { mt: 3, pt: 3, borderTop: `1px solid ${color.rule}` }
+              : undefined
           }
-        }
-      } else if (err instanceof Error) {
-        // Check if error message contains rate limit info
-        const errMsg = err.message.toLowerCase();
-        if (errMsg.includes('rate limit') || errMsg.includes('rate limit exceeded')) {
-          errorMessage = 'GitHub API rate limit exceeded. Please try again in a few minutes.';
-        } else {
-          errorMessage = err.message;
-        }
-      }
-
-      showError(errorMessage);
-    } finally {
-      setSyncingMaps(false);
-    }
-  };
+          data-testid="settings-developer"
+        >
+          <Typography variant="h6" fontWeight={600} gutterBottom color="error">
+            {t('settingsPage.developer.resetApiTitle')}
+          </Typography>
+          <Typography variant="body2" color="text.secondary" mb={2}>
+            {t('settingsPage.developer.resetApiDescription')}
+          </Typography>
+          <Button
+            variant="outlined"
+            color="error"
+            onClick={() => setResetApiDialogOpen(true)}
+            disabled={resettingApi}
+            data-testid="settings-reset-api-button"
+          >
+            {resettingApi
+              ? t('settingsPage.developer.resetApiButtonLoading')
+              : t('settingsPage.developer.resetApiButton')}
+          </Button>
+        </Box>
+      )}
+    </>
+  );
+  const sections: { key: string; name: string; hint: string; body: React.ReactNode }[] = [
+    { key: 'site', body: <SiteNameCard /> },
+    {
+      key: 'signin',
+      body: <SignInProvidersCard welcome={searchParams.get('welcome') === 'setup'} />,
+    },
+    { key: 'email', body: <EmailSettingsCard /> },
+    { key: 'players', body: playersCard },
+    { key: 'matchmaking', body: <MatchmakingSettingsCard /> },
+    { key: 'news', body: <NewsSettingsCard /> },
+    { key: 'adminnotices', body: <AdminNoticesCard /> },
+    {
+      key: 'webhooks',
+      body: (
+        <>
+          <WebhooksCard />
+          <DiscordBotCard />
+        </>
+      ),
+    },
+    { key: 'apitokens', body: <ApiTokensCard /> },
+    ...(isDev || experimental.length > 0 ? [{ key: 'advanced', body: advancedCard }] : []),
+  ].map((section) => ({
+    ...section,
+    name: t(`settingsPage.sections.${section.key}.name`),
+    hint: t(`settingsPage.sections.${section.key}.hint`),
+  }));
+  // Modules that still keep settings here: a section each.
+  for (const { id, labelKey, pages, Section } of moduleSettings) {
+    sections.push({
+      key: id,
+      name: t(labelKey, { ns: id }),
+      hint: t('settingsPage.sections.module.hint'),
+      body: (
+        <Box data-testid={`settings-module-${id}`}>
+          <Typography variant="h6" fontWeight={600} sx={{ mb: 2 }}>
+            {t(labelKey, { ns: id })}
+          </Typography>
+          {pages?.length ? (
+            <Stack spacing={3}>
+              {pages.map((page) => (
+                <Section key={page.key} page={page.key} />
+              ))}
+            </Stack>
+          ) : (
+            <Section />
+          )}
+        </Box>
+      ),
+    });
+  }
+  const open = sections.find((section) => section.key === target) ?? sections[0];
 
   return (
     <Box sx={{ width: '100%', height: '100%' }}>
-      <Typography variant="body2" color="text.secondary" mb={4}>
-        {t('settingsPage.intro')}
-      </Typography>
+      <PageHead title={t('layout.pageTitle.settings')} subtitle={t('settingsPage.intro')} />
 
-      {loading && (
-        <Paper sx={{ p: 3, mb: 3 }}>
-          <LinearProgress />
-        </Paper>
-      )}
+      {loading && <LinearProgress />}
 
       {!loading && (
         <>
-          <Paper sx={{ mb: 2 }}>
-            <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
-              <Tabs
-                value={tabIndex}
-                onChange={handleTabChange}
-                textColor="secondary"
-                indicatorColor="secondary"
-                aria-label={t('settingsPage.title')}
-                variant="scrollable"
-                scrollButtons="auto"
+          <Box
+            sx={{
+              display: 'grid',
+              gap: 3,
+              gridTemplateColumns: 'minmax(0, 1fr)',
+              alignItems: 'start',
+              '@media (min-width: 900px)': { gridTemplateColumns: '220px minmax(0, 1fr)' },
+            }}
+          >
+            <Box
+              sx={{
+                display: 'grid',
+                gap: 2,
+                '@media (min-width: 900px)': { position: 'sticky', top: 24 },
+              }}
+            >
+              {/* The sections: a link each, with what it holds. */}
+              <Box
+                component="nav"
+                aria-label={t('settingsPage.sections.label')}
+                data-testid="settings-sections"
+                sx={{
+                  display: 'flex',
+                  gap: 0.25,
+                  overflowX: 'auto',
+                  '@media (min-width: 900px)': { flexDirection: 'column', overflowX: 'visible' },
+                }}
               >
-                <Tab label={t('settingsPage.tabs.integrations')} {...a11yProps(0)} />
-                <Tab label={t('settingsPage.tabs.players')} {...a11yProps(1)} />
-                <Tab label={t('settingsPage.tabs.matches')} {...a11yProps(2)} />
-                <Tab label={t('settingsPage.tabs.advanced')} {...a11yProps(3)} />
-                {isDev && <Tab label={t('settingsPage.tabs.developer')} {...a11yProps(4)} />}
-              </Tabs>
-            </Box>
-
-            <TabPanel value={tabIndex} index={0}>
-              <Stack spacing={3}>
-                <Box>
-                  <Typography variant="h6" fontWeight={600} gutterBottom>
-                    {t('settingsPage.integrations.webhook.title')}
-                  </Typography>
-                  <Typography variant="body2" color="text.secondary" mb={2}>
-                    {t('settingsPage.integrations.webhook.description')}
-                  </Typography>
-                  <TextField
-                    label={t('settingsPage.integrations.webhook.label')}
-                    value={webhookUrl}
-                    onChange={(event) => setWebhookUrl(event.target.value)}
-                    onBlur={handleFieldBlur}
-                    onKeyDown={handleFieldKeyDown}
-                    helperText={t('settingsPage.integrations.webhook.helper')}
-                    fullWidth
-                    required
-                    error={!loading && webhookUrl.trim() === ''}
-                    slotProps={{
-                      htmlInput: { 'data-testid': 'settings-webhook-url-input' },
-                    }}
-                  />
-                </Box>
-
-                <Box>
-                  <Typography variant="h6" fontWeight={600} gutterBottom>
-                    {t('settingsPage.integrations.mapSync.title')}
-                  </Typography>
-                  <Typography variant="body2" color="text.secondary" mb={2}>
-                    {t('settingsPage.integrations.mapSync.description')}
-                  </Typography>
-                  <Button
-                    variant="outlined"
-                    startIcon={syncingMaps ? <CircularProgress size={16} /> : <SyncIcon />}
-                    onClick={handleSyncMaps}
-                    disabled={syncingMaps || loading}
-                  >
-                    {syncingMaps
-                      ? t('settingsPage.integrations.mapSync.buttonSyncing')
-                      : t('settingsPage.integrations.mapSync.buttonIdle')}
-                  </Button>
-                </Box>
-              </Stack>
-            </TabPanel>
-
-            {/* Players & access control */}
-            <TabPanel value={tabIndex} index={1}>
-              <Stack spacing={3}>
-                <Box>
-                  <Typography variant="h6" fontWeight={600} gutterBottom>
-                    {t('settingsPage.players.registration.title')}
-                  </Typography>
-                  <Typography variant="body2" color="text.secondary" mb={2}>
-                    {t('settingsPage.players.registration.description')}
-                  </Typography>
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={allowSelfRegister}
-                        onChange={(event) => setAllowSelfRegister(event.target.checked)}
-                        color="primary"
-                        size="small"
-                      />
-                    }
-                    label={t('settingsPage.players.registration.toggleLabel')}
-                  />
-                  <Typography variant="caption" color="text.secondary" display="block">
-                    {t('settingsPage.players.registration.recommendation')}
-                  </Typography>
-                </Box>
-
-                <Divider />
-
-              </Stack>
-            </TabPanel>
-
-            {/* Match behavior and rating rules */}
-            <TabPanel value={tabIndex} index={2}>
-              <Stack spacing={3}>
-                <Accordion defaultExpanded sx={ACCORDION_SX}>
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={ACCORDION_SUMMARY_SX}>
-                    <Box>
-                      <Typography variant="h6" fontWeight={600}>
-                        {t('settingsPage.matchRating.ratings.title')}
-                      </Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {t('settingsPage.matchRating.ratings.description')}
-                      </Typography>
-                    </Box>
-                  </AccordionSummary>
-                  <AccordionDetails sx={ACCORDION_DETAILS_SX}>
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={ratingsEnabled}
-                          onChange={(event) => setRatingsEnabled(event.target.checked)}
-                          color="primary"
-                          size="small"
-                        />
-                      }
-                      label={t('settingsPage.matchRating.ratings.toggleLabel')}
-                    />
-                    <Typography variant="caption" color="text.secondary" display="block">
-                      {t('settingsPage.matchRating.ratings.note')}
-                    </Typography>
-                  </AccordionDetails>
-                </Accordion>
-
-                <Accordion sx={ACCORDION_SX}>
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={ACCORDION_SUMMARY_SX}>
-                    <Box>
-                      <Typography variant="h6" fontWeight={600}>
-                        {t('settingsPage.matchRating.chatDefaults.title')}
-                      </Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {t('settingsPage.matchRating.chatDefaults.description')}
-                      </Typography>
-                    </Box>
-                  </AccordionSummary>
-                  <AccordionDetails sx={ACCORDION_DETAILS_SX}>
-                    <Stack spacing={2}>
-                      <TextField
-                        label={t('settingsPage.matchRating.chatDefaults.chatPrefixLabel')}
-                        value={matchzyChatPrefix}
-                        onChange={(event) => setMatchzyChatPrefix(event.target.value)}
-                        onBlur={handleFieldBlur}
-                        onKeyDown={handleFieldKeyDown}
-                        helperText={t('settingsPage.matchRating.chatDefaults.chatPrefixHelper')}
-                        fullWidth
-                      />
-                      <TextField
-                        label={t('settingsPage.matchRating.chatDefaults.adminChatPrefixLabel')}
-                        value={matchzyAdminChatPrefix}
-                        onChange={(event) => setMatchzyAdminChatPrefix(event.target.value)}
-                        onBlur={handleFieldBlur}
-                        onKeyDown={handleFieldKeyDown}
-                        helperText={t('settingsPage.matchRating.chatDefaults.adminChatPrefixHelper')}
-                        fullWidth
-                      />
-                      <FormControlLabel
-                        control={
-                          <Switch
-                            checked={matchzyKnifeEnabledDefault}
-                            onChange={(event) => setMatchzyKnifeEnabledDefault(event.target.checked)}
-                            color="primary"
-                            size="small"
-                          />
-                        }
-                        label={t('settingsPage.matchRating.chatDefaults.knifeToggleLabel')}
-                      />
-                      <Typography variant="caption" color="text.secondary" display="block">
-                        {t('settingsPage.matchRating.chatDefaults.knifeNote')}
-                      </Typography>
-                    </Stack>
-                  </AccordionDetails>
-                </Accordion>
-
-                <Accordion sx={ACCORDION_SX}>
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={ACCORDION_SUMMARY_SX}>
-                    <Box>
-                      <Typography variant="h6" fontWeight={600}>
-                        {t('settingsPage.matchRating.matchzyEnhanced.demo.title')}
-                      </Typography>
-                    </Box>
-                  </AccordionSummary>
-                  <AccordionDetails sx={ACCORDION_DETAILS_SX}>
-                    <Stack spacing={2}>
-                      <FormControlLabel
-                        control={
-                          <Switch
-                            checked={matchzyDemoRecordingEnabled !== 0}
-                            onChange={(e) =>
-                              setMatchzyDemoRecordingEnabled(e.target.checked ? 1 : 0)
-                            }
-                            color="primary"
-                            size="small"
-                          />
-                        }
-                        label={t('settingsPage.matchRating.matchzyEnhanced.demo.enabled')}
-                      />
-                      <Typography variant="caption" color="text.secondary" display="block">
-                        {t('settingsPage.matchRating.matchzyEnhanced.demo.description')}
-                      </Typography>
-
-                      <Divider />
-
-                      <Typography variant="subtitle1" fontWeight={600}>
-                        {t('settingsPage.matchRating.matchzyCore.demos.title')}
-                      </Typography>
-                      <TextField
-                        label={t('settingsPage.matchRating.matchzyCore.demos.demoPathLabel')}
-                        value={matchzyDemoPath}
-                        onChange={(e) => setMatchzyDemoPath(e.target.value)}
-                        onBlur={handleFieldBlur}
-                        onKeyDown={handleFieldKeyDown}
-                        helperText={t('settingsPage.matchRating.matchzyCore.demos.demoPathHelper')}
-                        fullWidth
-                        size="small"
-                      />
-                      <TextField
-                        label={t('settingsPage.matchRating.matchzyCore.demos.demoNameFormatLabel')}
-                        value={matchzyDemoNameFormat}
-                        onChange={(e) => setMatchzyDemoNameFormat(e.target.value)}
-                        onBlur={handleFieldBlur}
-                        onKeyDown={handleFieldKeyDown}
-                        helperText={t('settingsPage.matchRating.matchzyCore.demos.demoNameFormatHelper')}
-                        fullWidth
-                        size="small"
-                      />
-
-                      <Divider />
-
-                      <Typography variant="subtitle1" fontWeight={600}>
-                        {t('settingsPage.matchRating.matchzyCore.seriesEnd.title')}
-                      </Typography>
-                      <Stack spacing={2}>
-                        <TextField
-                          label={t('settingsPage.matchRating.matchzyCore.seriesEnd.kickDelayNoDemoLabel')}
-                          type="number"
-                          value={matchzySeriesEndKickDelayNoDemo}
-                          onChange={(e) => {
-                            const v = parseInt(e.target.value, 10);
-                            if (!Number.isFinite(v)) return;
-                            setMatchzySeriesEndKickDelayNoDemo(v);
-                          }}
-                          onBlur={handleFieldBlur}
-                          onKeyDown={handleFieldKeyDown}
-                          inputProps={{ min: 0, max: 600 }}
-                          size="small"
-                          fullWidth
-                        />
-                        <TextField
-                          label={t(
-                            'settingsPage.matchRating.matchzyCore.seriesEnd.kickDelayDemoNoUploadLabel'
-                          )}
-                          type="number"
-                          value={matchzySeriesEndKickDelayDemoNoUpload}
-                          onChange={(e) => {
-                            const v = parseInt(e.target.value, 10);
-                            if (!Number.isFinite(v)) return;
-                            setMatchzySeriesEndKickDelayDemoNoUpload(v);
-                          }}
-                          onBlur={handleFieldBlur}
-                          onKeyDown={handleFieldKeyDown}
-                          inputProps={{ min: 0, max: 600 }}
-                          size="small"
-                          fullWidth
-                        />
-                        <TextField
-                          label={t(
-                            'settingsPage.matchRating.matchzyCore.seriesEnd.kickDelayDemoUploadLabel'
-                          )}
-                          type="number"
-                          value={matchzySeriesEndKickDelayDemoUpload}
-                          onChange={(e) => {
-                            const v = parseInt(e.target.value, 10);
-                            if (!Number.isFinite(v)) return;
-                            setMatchzySeriesEndKickDelayDemoUpload(v);
-                          }}
-                          onBlur={handleFieldBlur}
-                          onKeyDown={handleFieldKeyDown}
-                          inputProps={{ min: 0, max: 600 }}
-                          size="small"
-                          fullWidth
-                        />
-                        <Typography variant="caption" color="text.secondary">
-                          {t('settingsPage.matchRating.matchzyCore.seriesEnd.kickDelayHelper')}
-                        </Typography>
-                      </Stack>
-                    </Stack>
-                  </AccordionDetails>
-                </Accordion>
-              </Stack>
-            </TabPanel>
-
-            {/* Advanced settings */}
-            <TabPanel value={tabIndex} index={3}>
-              <Stack spacing={3}>
-                <Alert severity="warning">
-                  {t('settingsPage.matchRating.matchzyCore.expert.description')}
-                </Alert>
-
-                <Accordion defaultExpanded sx={ACCORDION_SX}>
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={ACCORDION_SUMMARY_SX}>
-                    <Box>
-                      <Typography variant="h6" fontWeight={600}>
-                        {t('settingsPage.matchRating.matchzyCore.title')}
-                      </Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {t('settingsPage.matchRating.matchzyCore.description')}
-                      </Typography>
-                    </Box>
-                  </AccordionSummary>
-                  <AccordionDetails sx={ACCORDION_DETAILS_SX}>
-                    <Stack spacing={3}>
-                      {/* Ready / flow */}
-                      <Box>
-                        <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                          {t('settingsPage.matchRating.matchzyCore.ready.title')}
-                        </Typography>
-                        <Stack spacing={2}>
-                          <TextField
-                            label={t('settingsPage.matchRating.matchzyCore.ready.minimumReadyLabel')}
-                            type="number"
-                            value={matchzyMinimumReadyRequired}
-                            onChange={(e) => {
-                              const v = parseInt(e.target.value, 10);
-                              if (!Number.isFinite(v)) return;
-                              setMatchzyMinimumReadyRequired(v);
-                            }}
-                            onBlur={handleFieldBlur}
-                            onKeyDown={handleFieldKeyDown}
-                            helperText={t(
-                              'settingsPage.matchRating.matchzyCore.ready.minimumReadyHelper'
-                            )}
-                            inputProps={{ min: 0, max: 10 }}
-                            size="small"
-                            fullWidth
-                          />
-                          <FormControlLabel
-                            control={
-                              <Switch
-                                checked={matchzyAllowForceReady}
-                                onChange={(e) => setMatchzyAllowForceReady(e.target.checked)}
-                                color="primary"
-                                size="small"
-                              />
-                            }
-                            label={t('settingsPage.matchRating.matchzyCore.ready.allowForceReady')}
-                          />
-                        </Stack>
-                      </Box>
-
-                      <Divider />
-
+                {sections.map((section) => {
+                  const current = section.key === open.key;
+                  return (
+                    <Box
+                      key={section.key}
+                      component={RouterLink}
+                      to={`?section=${section.key}`}
+                      replace
+                      aria-current={current ? 'page' : undefined}
+                      data-testid={`settings-section-${section.key}`}
+                      sx={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 0.25,
+                        flex: 'none',
+                        px: 1.5,
+                        py: 1.25,
+                        borderRadius: radii.md,
+                        textDecoration: 'none',
+                        bgcolor: current ? color.paper2 : 'transparent',
+                        '&:hover': { bgcolor: color.paper2 },
+                        '&:focus-visible': {
+                          outline: `2px solid ${color.focus}`,
+                          outlineOffset: 2,
+                        },
+                      }}
+                    >
                       <Box
+                        component="span"
                         sx={{
-                          bgcolor: 'warning.50',
-                          border: 1,
-                          borderColor: 'warning.main',
-                          borderRadius: 1,
-                          p: 2,
+                          fontSize: 14,
+                          fontWeight: 600,
+                          color: current ? color.ink : color.ink2,
+                          whiteSpace: 'nowrap',
                         }}
                       >
-                        <Typography variant="subtitle1" fontWeight={700} gutterBottom>
-                          {t('settingsPage.matchRating.matchzyCore.expert.title')}
-                        </Typography>
-                        <Typography variant="body2" color="text.secondary" mb={2}>
-                          {t('settingsPage.matchRating.matchzyCore.expert.description')}
-                        </Typography>
-
-                        <Stack spacing={2}>
-                          <TextField
-                            select
-                            label={t(
-                              'settingsPage.matchRating.matchzyCore.expert.autostartMode.label'
-                            )}
-                            value={matchzyAutostartMode}
-                            onChange={(e) =>
-                              setMatchzyAutostartMode(Number(e.target.value) as 0 | 1 | 2)
-                            }
-                            onBlur={handleFieldBlur}
-                            helperText={t(
-                              'settingsPage.matchRating.matchzyCore.expert.autostartMode.helper'
-                            )}
-                            size="small"
-                            fullWidth
-                          >
-                            <option value={0}>
-                              {t('settingsPage.matchRating.matchzyCore.expert.autostartMode.options.0')}
-                            </option>
-                            <option value={1}>
-                              {t('settingsPage.matchRating.matchzyCore.expert.autostartMode.options.1')}
-                            </option>
-                            <option value={2}>
-                              {t('settingsPage.matchRating.matchzyCore.expert.autostartMode.options.2')}
-                            </option>
-                          </TextField>
-
-                          <Divider />
-
-                          {/* Access / server lockdown */}
-                          <Box>
-                            <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                              {t('settingsPage.matchRating.matchzyCore.access.title')}
-                            </Typography>
-                            <Stack spacing={1}>
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={matchzyKickWhenNoMatchLoaded}
-                                    onChange={(e) => setMatchzyKickWhenNoMatchLoaded(e.target.checked)}
-                                    color="primary"
-                                    size="small"
-                                  />
-                                }
-                                label={t(
-                                  'settingsPage.matchRating.matchzyCore.access.kickWhenNoMatchLoaded'
-                                )}
-                              />
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={matchzyWhitelistEnabledDefault}
-                                    onChange={(e) => setMatchzyWhitelistEnabledDefault(e.target.checked)}
-                                    color="primary"
-                                    size="small"
-                                  />
-                                }
-                                label={t(
-                                  'settingsPage.matchRating.matchzyCore.access.whitelistEnabledDefault'
-                                )}
-                              />
-                            </Stack>
-                          </Box>
-
-                          <Divider />
-
-                          {/* Admin tools */}
-                          <Box>
-                            <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                              {t('settingsPage.matchRating.matchzyCore.adminTools.title')}
-                            </Typography>
-                            <Stack spacing={1}>
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={matchzyPauseAfterRestore}
-                                    onChange={(e) => setMatchzyPauseAfterRestore(e.target.checked)}
-                                    color="primary"
-                                    size="small"
-                                  />
-                                }
-                                label={t(
-                                  'settingsPage.matchRating.matchzyCore.adminTools.pauseAfterRestore'
-                                )}
-                              />
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={matchzyStopCommandAvailable}
-                                    onChange={(e) => setMatchzyStopCommandAvailable(e.target.checked)}
-                                    color="primary"
-                                    size="small"
-                                  />
-                                }
-                                label={t(
-                                  'settingsPage.matchRating.matchzyCore.adminTools.stopCommandAvailable'
-                                )}
-                              />
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={matchzyStopCommandNoDamage}
-                                    onChange={(e) => setMatchzyStopCommandNoDamage(e.target.checked)}
-                                    color="primary"
-                                    size="small"
-                                    disabled={!matchzyStopCommandAvailable}
-                                  />
-                                }
-                                label={t(
-                                  'settingsPage.matchRating.matchzyCore.adminTools.stopCommandNoDamage'
-                                )}
-                              />
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={matchzyUsePauseCommandForTacticalPause}
-                                    onChange={(e) =>
-                                      setMatchzyUsePauseCommandForTacticalPause(e.target.checked)
-                                    }
-                                    color="primary"
-                                    size="small"
-                                  />
-                                }
-                                label={t(
-                                  'settingsPage.matchRating.matchzyCore.adminTools.usePauseForTacticalPause'
-                                )}
-                              />
-                            </Stack>
-                          </Box>
-                        </Stack>
+                        {section.name}
                       </Box>
-                    </Stack>
-                  </AccordionDetails>
-                </Accordion>
-
-                <Accordion sx={ACCORDION_SX}>
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={ACCORDION_SUMMARY_SX}>
-                    <Box>
-                      <Typography variant="h6" fontWeight={600}>
-                        {t('settingsPage.matchRating.matchzyEnhanced.title')}
-                      </Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {t('settingsPage.matchRating.matchzyEnhanced.description')}
-                      </Typography>
-                    </Box>
-                  </AccordionSummary>
-                  <AccordionDetails sx={ACCORDION_DETAILS_SX}>
-                    <Stack spacing={3}>
-                      {/* Auto-Ready System */}
-                      <Box>
-                        <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                          {t('settingsPage.matchRating.matchzyEnhanced.autoready.title')}
-                        </Typography>
-                        <FormControlLabel
-                          control={
-                            <Switch
-                              checked={matchzyAutoreadyEnabled === 1}
-                              onChange={(e) => setMatchzyAutoreadyEnabled(e.target.checked ? 1 : 0)}
-                              color="primary"
-                              size="small"
-                            />
-                          }
-                          label={t('settingsPage.matchRating.matchzyEnhanced.autoready.label')}
-                        />
-                        <Typography variant="caption" color="text.secondary" display="block">
-                          {t('settingsPage.matchRating.matchzyEnhanced.autoready.description')}
-                        </Typography>
-                      </Box>
-
-                      <Divider />
-
-                      {/* Pause System */}
-                      <Box>
-                        <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                          {t('settingsPage.matchRating.matchzyEnhanced.pause.title')}
-                        </Typography>
-                        <Stack spacing={2}>
-                          <FormControlLabel
-                            control={
-                              <Switch
-                                checked={matchzyBothTeamsUnpauseRequired === 1}
-                                onChange={(e) =>
-                                  setMatchzyBothTeamsUnpauseRequired(e.target.checked ? 1 : 0)
-                                }
-                                color="primary"
-                                size="small"
-                              />
-                            }
-                            label={t('settingsPage.matchRating.matchzyEnhanced.pause.bothTeamsUnpause')}
-                          />
-                          <TextField
-                            label={t('settingsPage.matchRating.matchzyEnhanced.pause.maxPausesLabel')}
-                            type="number"
-                            value={matchzyMaxPausesPerTeam ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
-                              setMatchzyMaxPausesPerTeam(isNaN(val as number) ? null : val);
-                            }}
-                            onBlur={handleFieldBlur}
-                            helperText={t('settingsPage.matchRating.matchzyEnhanced.pause.maxPausesHelper')}
-                            inputProps={{ min: 0, max: 999 }}
-                            size="small"
-                            fullWidth
-                          />
-                          <TextField
-                            label={t(
-                              'settingsPage.matchRating.matchzyEnhanced.pause.pauseDurationLabel'
-                            )}
-                            type="number"
-                            value={matchzyPauseDuration ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
-                              setMatchzyPauseDuration(isNaN(val as number) ? null : val);
-                            }}
-                            onBlur={handleFieldBlur}
-                            helperText={t(
-                              'settingsPage.matchRating.matchzyEnhanced.pause.pauseDurationHelper'
-                            )}
-                            inputProps={{ min: 0, max: 999 }}
-                            size="small"
-                            fullWidth
-                          />
-                        </Stack>
-                      </Box>
-
-                      <Divider />
-
-                      {/* Side Selection */}
-                      <Box>
-                        <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                          {t('settingsPage.matchRating.matchzyEnhanced.sideSelection.title')}
-                        </Typography>
-                        <Stack spacing={2}>
-                          <FormControlLabel
-                            control={
-                              <Switch
-                                checked={matchzySideSelectionEnabled === 1}
-                                onChange={(e) =>
-                                  setMatchzySideSelectionEnabled(e.target.checked ? 1 : 0)
-                                }
-                                color="primary"
-                                size="small"
-                              />
-                            }
-                            label={t('settingsPage.matchRating.matchzyEnhanced.sideSelection.enabled')}
-                          />
-                          <TextField
-                            label={t('settingsPage.matchRating.matchzyEnhanced.sideSelection.timeLabel')}
-                            type="number"
-                            value={matchzySideSelectionTime ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
-                              setMatchzySideSelectionTime(isNaN(val as number) ? null : val);
-                            }}
-                            onBlur={handleFieldBlur}
-                            helperText={t('settingsPage.matchRating.matchzyEnhanced.sideSelection.timeHelper')}
-                            inputProps={{ min: 1, max: 999 }}
-                            size="small"
-                            fullWidth
-                            disabled={matchzySideSelectionEnabled !== 1}
-                          />
-                        </Stack>
-                      </Box>
-
-                      <Divider />
-
-                      {/* .gg Command */}
-                      <Box>
-                        <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                          {t('settingsPage.matchRating.matchzyEnhanced.gg.title')}
-                        </Typography>
-                        <Stack spacing={2}>
-                          <FormControlLabel
-                            control={
-                              <Switch
-                                checked={matchzyGgEnabled === 1}
-                                onChange={(e) => setMatchzyGgEnabled(e.target.checked ? 1 : 0)}
-                                color="primary"
-                                size="small"
-                              />
-                            }
-                            label={t('settingsPage.matchRating.matchzyEnhanced.gg.enabled')}
-                          />
-                          <TextField
-                            label={t('settingsPage.matchRating.matchzyEnhanced.gg.thresholdLabel')}
-                            type="number"
-                            value={matchzyGgThreshold ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? null : parseFloat(e.target.value);
-                              setMatchzyGgThreshold(isNaN(val as number) ? null : val);
-                            }}
-                            onBlur={handleFieldBlur}
-                            helperText={t('settingsPage.matchRating.matchzyEnhanced.gg.thresholdHelper')}
-                            inputProps={{ min: 0, max: 1, step: 0.1 }}
-                            size="small"
-                            fullWidth
-                            disabled={matchzyGgEnabled !== 1}
-                          />
-                          <TextField
-                            label={t('settingsPage.matchRating.matchzyEnhanced.gg.minScoreDiffLabel')}
-                            type="number"
-                            value={matchzyGgMinScoreDiff ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
-                              setMatchzyGgMinScoreDiff(isNaN(val as number) ? null : val);
-                            }}
-                            onBlur={handleFieldBlur}
-                            helperText={t('settingsPage.matchRating.matchzyEnhanced.gg.minScoreDiffHelper')}
-                            inputProps={{ min: 0, max: 16 }}
-                            size="small"
-                            fullWidth
-                            disabled={matchzyGgEnabled !== 1}
-                          />
-                        </Stack>
-                      </Box>
-
-                      <Divider />
-
-                      {/* FFW System */}
-                      <Box>
-                        <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-                          {t('settingsPage.matchRating.matchzyEnhanced.ffw.title')}
-                        </Typography>
-                        <Stack spacing={2}>
-                          <FormControlLabel
-                            control={
-                              <Switch
-                                checked={matchzyFfwEnabled === 1}
-                                onChange={(e) => setMatchzyFfwEnabled(e.target.checked ? 1 : 0)}
-                                color="primary"
-                                size="small"
-                              />
-                            }
-                            label={t('settingsPage.matchRating.matchzyEnhanced.ffw.enabled')}
-                          />
-                          <TextField
-                            label={t('settingsPage.matchRating.matchzyEnhanced.ffw.timeLabel')}
-                            type="number"
-                            value={matchzyFfwTime ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? null : parseInt(e.target.value, 10);
-                              setMatchzyFfwTime(isNaN(val as number) ? null : val);
-                            }}
-                            onBlur={handleFieldBlur}
-                            helperText={t('settingsPage.matchRating.matchzyEnhanced.ffw.timeHelper')}
-                            inputProps={{ min: 1, max: 999 }}
-                            size="small"
-                            fullWidth
-                            disabled={matchzyFfwEnabled !== 1}
-                          />
-                        </Stack>
-                      </Box>
-                    </Stack>
-                  </AccordionDetails>
-                </Accordion>
-              </Stack>
-            </TabPanel>
-
-            {isDev && (
-              <TabPanel value={tabIndex} index={4}>
-                <Stack spacing={3}>
-                  <Box>
-                    <Typography variant="h6" fontWeight={600} gutterBottom>
-                      {t('settingsPage.developer.title')}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary" mb={2}>
-                      {t('settingsPage.developer.description')}
-                    </Typography>
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={matchzyDebugChatEnabled}
-                          onChange={(e) => {
-                            const newValue = e.target.checked;
-                            setMatchzyDebugChatEnabled(newValue);
-                            // Pass the new value as an override to handleSave since state updates are async
-                            void handleSave(true, { matchzyDebugChatEnabled: newValue });
-                          }}
-                          size="small"
-                          color="primary"
-                        />
-                      }
-                      label={t('settingsPage.developer.debugChat.label')}
-                    />
-                    <Typography variant="caption" color="text.secondary" display="block" mb={2}>
-                      {t('settingsPage.developer.debugChat.description')}
-                    </Typography>
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={simulateMatches}
-                          onChange={(event) => setSimulateMatches(event.target.checked)}
-                          color="error"
-                          size="small"
-                          inputProps={
-                            {
-                              'data-testid': 'settings-simulate-matches-toggle',
-                            } satisfies React.InputHTMLAttributes<HTMLInputElement>
-                          }
-                        />
-                      }
-                      label={
-                        <Typography component="span" color="error.main" fontWeight={600}>
-                          {t('settingsPage.developer.simulateToggleLabel')}
-                        </Typography>
-                      }
-                    />
-                    <Typography variant="caption" color="error.main" display="block" mt={1} fontWeight={500}>
-                      {t('settingsPage.developer.simulateNote')}
-                    </Typography>
-                    <Box mt={3}>
-                      <Typography variant="subtitle1" fontWeight={500} gutterBottom>
-                        {t('settingsPage.developer.timescaleTitle')}
-                      </Typography>
-                      <Typography variant="body2" color="text.secondary" mb={1}>
-                        {t('settingsPage.developer.timescaleDescription')}
-                      </Typography>
-                      <Box px={1}>
-                        <Slider
-                          value={simulationTimescale}
-                          onChange={(_e, value) => {
-                            const v = Array.isArray(value) ? value[0] : value;
-                            setSimulationTimescale(typeof v === 'number' ? v : 1);
-                          }}
-                          onChangeCommitted={(_e, value) => {
-                            const v = Array.isArray(value) ? value[0] : value;
-                            setSimulationTimescale(typeof v === 'number' ? v : 1);
-                            void handleSave(true);
-                          }}
-                          min={0.1}
-                          max={4}
-                          step={0.1}
-                          marks
-                          valueLabelDisplay="on"
-                          data-testid="settings-simulation-timescale-slider"
-                        />
-                        {simulationTimescale > 2 && (
-                          <Typography
-                            variant="caption"
-                            color="warning.main"
-                            sx={{ mt: 1, display: 'block' }}
-                          >
-                            {t('settingsPage.developer.timescaleWarning')}
-                          </Typography>
-                        )}
+                      <Box
+                        component="span"
+                        sx={{
+                          fontSize: 12,
+                          color: color.muted,
+                          display: 'none',
+                          '@media (min-width: 900px)': { display: 'block' },
+                        }}
+                      >
+                        {section.hint}
                       </Box>
                     </Box>
-                  </Box>
-                  <Divider />
-                  <Box>
-                    <Typography variant="h6" fontWeight={600} gutterBottom color="error">
-                      {t('settingsPage.developer.resetApiTitle')}
+                  );
+                })}
+              </Box>
+
+              {/* Each game's own settings sit with the game in the admin menu. */}
+              {gameLinks.length > 0 && (
+                <Box
+                  data-testid="settings-game-links"
+                  sx={{
+                    border: `1px dashed ${color.rule}`,
+                    borderRadius: radii.md,
+                    p: 1.5,
+                    display: 'grid',
+                    gap: 1,
+                  }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography sx={{ fontWeight: 600, fontSize: 14 }}>
+                      {t('settingsPage.gameLinks.title')}
                     </Typography>
-                    <Typography variant="body2" color="text.secondary" mb={2}>
-                      {t('settingsPage.developer.resetApiDescription')}
+                    <Typography variant="body2" color="text.secondary" sx={{ fontSize: 12 }}>
+                      {t('settingsPage.gameLinks.hint')}
                     </Typography>
-                    <Button
-                      variant="outlined"
-                      color="error"
-                      onClick={() => setResetApiDialogOpen(true)}
-                      disabled={resettingApi}
-                      data-testid="settings-reset-api-button"
-                    >
-                      {resettingApi
-                        ? t('settingsPage.developer.resetApiButtonLoading')
-                        : t('settingsPage.developer.resetApiButton')}
-                    </Button>
                   </Box>
-                </Stack>
-              </TabPanel>
-            )}
-          </Paper>
+                  <Box sx={{ display: 'flex', gap: 0.75, flexWrap: 'wrap' }}>
+                    {gameLinks.map((item) => (
+                      <Button
+                        key={`${item.moduleId}-${item.key}`}
+                        component={RouterLink}
+                        to={item.path}
+                        size="small"
+                        sx={{
+                          borderRadius: radii.pill,
+                          bgcolor: color.paper3,
+                          color: color.ink,
+                          px: 1.5,
+                        }}
+                      >
+                        {navItemLabel(t, item, 'rail')}
+                      </Button>
+                    ))}
+                  </Box>
+                </Box>
+              )}
 
-          <Box
-            mt={2}
-            display="flex"
-            justifyContent="space-between"
-            alignItems="center"
-            flexWrap="wrap"
-            gap={1}
-          >
-            <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'right' }}>
-              {t('settingsPage.footer.version')}{' '}
-              {typeof __APP_VERSION__ !== 'undefined'
-                ? __APP_VERSION__
-                : t('settingsPage.footer.unknownVersion')}
-            </Typography>
-
-            <Button
-              data-testid="settings-save-button"
-              onClick={() => setResetDialogOpen(true)}
-              disabled={loading || saving}
-            >
-              {t('settingsPage.footer.resetButton')}
-            </Button>
-          </Box>
-
-          <Dialog
-            open={resetDialogOpen}
-            onClose={() => setResetDialogOpen(false)}
-            aria-labelledby="reset-settings-dialog-title"
-          >
-            <DialogTitle id="reset-settings-dialog-title">
-              {t('settingsPage.resetDialog.title')}
-            </DialogTitle>
-            <DialogContent>
-              <Typography variant="body2" color="text.secondary">
-                {t('settingsPage.resetDialog.description')}
-              </Typography>
-            </DialogContent>
-            <DialogActions>
-              <Button onClick={() => setResetDialogOpen(false)}>
-                {t('settingsPage.resetDialog.cancel')}
-              </Button>
-              <Button
-                color="error"
-                variant="contained"
-                onClick={async () => {
-                  // Cancel any pending auto-save
-                  if (saveTimeoutRef.current) {
-                    clearTimeout(saveTimeoutRef.current);
-                    saveTimeoutRef.current = null;
-                  }
-                  // Save default values to server
-                  try {
-                    const resetPayload: {
-                      webhookUrl: null;
-                      matchzyChatPrefix: null;
-                      matchzyAdminChatPrefix: null;
-                      matchzyKnifeEnabledDefault: null;
-                      matchzyDebugChatEnabled?: boolean;
-                      simulateMatches?: boolean;
-                      // MatchZy core defaults
-                      matchzyMinimumReadyRequired?: null;
-                      matchzyAllowForceReady?: null;
-                      matchzyKickWhenNoMatchLoaded?: null;
-                      matchzyWhitelistEnabledDefault?: null;
-                      matchzyPauseAfterRestore?: null;
-                      matchzyStopCommandAvailable?: null;
-                      matchzyStopCommandNoDamage?: null;
-                      matchzyUsePauseCommandForTacticalPause?: null;
-                      matchzyDemoPath?: null;
-                      matchzyDemoNameFormat?: null;
-                      matchzySeriesEndKickDelayNoDemo?: null;
-                      matchzySeriesEndKickDelayDemoNoUpload?: null;
-                      matchzySeriesEndKickDelayDemoUpload?: null;
-                      // MatchZy Enhanced v1.3.0 settings - reset to null (use tournament defaults)
-                      matchzyAutoreadyEnabled: null;
-                      matchzyBothTeamsUnpauseRequired: null;
-                      matchzyMaxPausesPerTeam: null;
-                      matchzyPauseDuration: null;
-                      matchzySideSelectionEnabled: null;
-                      matchzySideSelectionTime: null;
-                      matchzyGgEnabled: null;
-                      matchzyGgThreshold: null;
-                      matchzyGgMinScoreDiff: null;
-                      matchzyFfwEnabled: null;
-                      matchzyFfwTime: null;
-                      matchzyDemoRecordingEnabled: null;
-                    } = {
-                      webhookUrl: null,
-                      matchzyChatPrefix: null,
-                      matchzyAdminChatPrefix: null,
-                      matchzyKnifeEnabledDefault: null,
-                      matchzyDebugChatEnabled: false,
-                      matchzyMinimumReadyRequired: null,
-                      matchzyAllowForceReady: null,
-                      matchzyKickWhenNoMatchLoaded: null,
-                      matchzyWhitelistEnabledDefault: null,
-                      matchzyPauseAfterRestore: null,
-                      matchzyStopCommandAvailable: null,
-                      matchzyStopCommandNoDamage: null,
-                      matchzyUsePauseCommandForTacticalPause: null,
-                      matchzyDemoPath: null,
-                      matchzyDemoNameFormat: null,
-                      matchzySeriesEndKickDelayNoDemo: null,
-                      matchzySeriesEndKickDelayDemoNoUpload: null,
-                      matchzySeriesEndKickDelayDemoUpload: null,
-                      // MatchZy Enhanced - reset to null to use tournament defaults
-                      matchzyAutoreadyEnabled: null,
-                      matchzyBothTeamsUnpauseRequired: null,
-                      matchzyMaxPausesPerTeam: null,
-                      matchzyPauseDuration: null,
-                      matchzySideSelectionEnabled: null,
-                      matchzySideSelectionTime: null,
-                      matchzyGgEnabled: null,
-                      matchzyGgThreshold: null,
-                      matchzyGgMinScoreDiff: null,
-                      matchzyFfwEnabled: null,
-                      matchzyFfwTime: null,
-                      matchzyDemoRecordingEnabled: null,
-                      ...(isDev && { simulateMatches: false }),
-                    };
-
-                    const response: SettingsResponse = await api.put(
-                      '/api/settings',
-                      resetPayload
-                    );
-
-                    const newWebhook = response.settings.webhookUrl ?? '';
-                    const newSimulate = response.settings.simulateMatches ?? false;
-                    const newChatPrefix =
-                      response.settings.matchzyChatPrefix ?? DEFAULT_MATCHZY_CHAT_PREFIX;
-                    const newAdminChatPrefix =
-                      response.settings.matchzyAdminChatPrefix ??
-                      DEFAULT_MATCHZY_ADMIN_CHAT_PREFIX;
-                    const newKnifeEnabled =
-                      response.settings.matchzyKnifeEnabledDefault !== undefined
-                        ? response.settings.matchzyKnifeEnabledDefault
-                        : true;
-                    const newDebugChatEnabled =
-                      response.settings.matchzyDebugChatEnabled !== undefined
-                        ? response.settings.matchzyDebugChatEnabled
-                        : false;
-                    const newMinimumReadyRequired = response.settings.matchzyMinimumReadyRequired ?? 0;
-                    const newAllowForceReady = response.settings.matchzyAllowForceReady ?? true;
-                    const newKickWhenNoMatchLoaded = response.settings.matchzyKickWhenNoMatchLoaded ?? false;
-                    const newWhitelistEnabledDefault = response.settings.matchzyWhitelistEnabledDefault ?? false;
-                    const newPauseAfterRestore = response.settings.matchzyPauseAfterRestore ?? true;
-                    const newStopCommandAvailable = response.settings.matchzyStopCommandAvailable ?? false;
-                    const newStopCommandNoDamage = response.settings.matchzyStopCommandNoDamage ?? false;
-                    const newUsePauseCommandForTacticalPause =
-                      response.settings.matchzyUsePauseCommandForTacticalPause ?? false;
-                    const newDemoPath = response.settings.matchzyDemoPath ?? 'MatchZy/';
-                    const newDemoNameFormat =
-                      response.settings.matchzyDemoNameFormat ??
-                      '{TIME}_{MATCH_ID}_{MAP}_{TEAM1}_vs_{TEAM2}';
-                    const newSeriesEndKickDelayNoDemo =
-                      response.settings.matchzySeriesEndKickDelayNoDemo ?? 5;
-                    const newSeriesEndKickDelayDemoNoUpload =
-                      response.settings.matchzySeriesEndKickDelayDemoNoUpload ?? 10;
-                    const newSeriesEndKickDelayDemoUpload =
-                      response.settings.matchzySeriesEndKickDelayDemoUpload ?? 60;
-                    // MatchZy Enhanced settings
-                    const newMatchzyAutoready = response.settings.matchzyAutoreadyEnabled ?? null;
-                    const newMatchzyBothTeamsUnpause = response.settings.matchzyBothTeamsUnpauseRequired ?? null;
-                    const newMatchzyMaxPauses = response.settings.matchzyMaxPausesPerTeam ?? null;
-                    const newMatchzyPauseDur = response.settings.matchzyPauseDuration ?? null;
-                    const newMatchzySideSelEnabled = response.settings.matchzySideSelectionEnabled ?? null;
-                    const newMatchzySideSelTime = response.settings.matchzySideSelectionTime ?? null;
-                    const newMatchzyGg = response.settings.matchzyGgEnabled ?? null;
-                    const newMatchzyGgThresh = response.settings.matchzyGgThreshold ?? null;
-                    const newMatchzyGgMinDiff = response.settings.matchzyGgMinScoreDiff ?? null;
-                    const newMatchzyFfw = response.settings.matchzyFfwEnabled ?? null;
-                    const newMatchzyFfwT = response.settings.matchzyFfwTime ?? null;
-                    const newMatchzyDemo = response.settings.matchzyDemoRecordingEnabled ?? null;
-
-                    setWebhookUrl(newWebhook);
-                    setInitialWebhookUrl(newWebhook);
-                    setSimulateMatches(newSimulate);
-                    setInitialSimulateMatches(newSimulate);
-                    setMatchzyChatPrefix(newChatPrefix);
-                    setInitialMatchzyChatPrefix(newChatPrefix);
-                    setMatchzyAdminChatPrefix(newAdminChatPrefix);
-                    setInitialMatchzyAdminChatPrefix(newAdminChatPrefix);
-                    setMatchzyKnifeEnabledDefault(newKnifeEnabled);
-                    setInitialMatchzyKnifeEnabledDefault(newKnifeEnabled);
-                    setMatchzyDebugChatEnabled(newDebugChatEnabled);
-                    setInitialMatchzyDebugChatEnabled(newDebugChatEnabled);
-                    setMatchzyMinimumReadyRequired(newMinimumReadyRequired);
-                    setInitialMatchzyMinimumReadyRequired(newMinimumReadyRequired);
-                    setMatchzyAllowForceReady(newAllowForceReady);
-                    setInitialMatchzyAllowForceReady(newAllowForceReady);
-                    setMatchzyKickWhenNoMatchLoaded(newKickWhenNoMatchLoaded);
-                    setInitialMatchzyKickWhenNoMatchLoaded(newKickWhenNoMatchLoaded);
-                    setMatchzyWhitelistEnabledDefault(newWhitelistEnabledDefault);
-                    setInitialMatchzyWhitelistEnabledDefault(newWhitelistEnabledDefault);
-                    setMatchzyPauseAfterRestore(newPauseAfterRestore);
-                    setInitialMatchzyPauseAfterRestore(newPauseAfterRestore);
-                    setMatchzyStopCommandAvailable(newStopCommandAvailable);
-                    setInitialMatchzyStopCommandAvailable(newStopCommandAvailable);
-                    setMatchzyStopCommandNoDamage(newStopCommandNoDamage);
-                    setInitialMatchzyStopCommandNoDamage(newStopCommandNoDamage);
-                    setMatchzyUsePauseCommandForTacticalPause(newUsePauseCommandForTacticalPause);
-                    setInitialMatchzyUsePauseCommandForTacticalPause(newUsePauseCommandForTacticalPause);
-                    setMatchzyDemoPath(newDemoPath);
-                    setInitialMatchzyDemoPath(newDemoPath);
-                    setMatchzyDemoNameFormat(newDemoNameFormat);
-                    setInitialMatchzyDemoNameFormat(newDemoNameFormat);
-                    setMatchzySeriesEndKickDelayNoDemo(newSeriesEndKickDelayNoDemo);
-                    setInitialMatchzySeriesEndKickDelayNoDemo(newSeriesEndKickDelayNoDemo);
-                    setMatchzySeriesEndKickDelayDemoNoUpload(newSeriesEndKickDelayDemoNoUpload);
-                    setInitialMatchzySeriesEndKickDelayDemoNoUpload(newSeriesEndKickDelayDemoNoUpload);
-                    setMatchzySeriesEndKickDelayDemoUpload(newSeriesEndKickDelayDemoUpload);
-                    setInitialMatchzySeriesEndKickDelayDemoUpload(newSeriesEndKickDelayDemoUpload);
-                    // MatchZy Enhanced
-                    setMatchzyAutoreadyEnabled(newMatchzyAutoready);
-                    setInitialMatchzyAutoreadyEnabled(newMatchzyAutoready);
-                    setMatchzyBothTeamsUnpauseRequired(newMatchzyBothTeamsUnpause);
-                    setInitialMatchzyBothTeamsUnpauseRequired(newMatchzyBothTeamsUnpause);
-                    setMatchzyMaxPausesPerTeam(newMatchzyMaxPauses);
-                    setInitialMatchzyMaxPausesPerTeam(newMatchzyMaxPauses);
-                    setMatchzyPauseDuration(newMatchzyPauseDur);
-                    setInitialMatchzyPauseDuration(newMatchzyPauseDur);
-                    setMatchzySideSelectionEnabled(newMatchzySideSelEnabled);
-                    setInitialMatchzySideSelectionEnabled(newMatchzySideSelEnabled);
-                    setMatchzySideSelectionTime(newMatchzySideSelTime);
-                    setInitialMatchzySideSelectionTime(newMatchzySideSelTime);
-                    setMatchzyGgEnabled(newMatchzyGg);
-                    setInitialMatchzyGgEnabled(newMatchzyGg);
-                    setMatchzyGgThreshold(newMatchzyGgThresh);
-                    setInitialMatchzyGgThreshold(newMatchzyGgThresh);
-                    setMatchzyGgMinScoreDiff(newMatchzyGgMinDiff);
-                    setInitialMatchzyGgMinScoreDiff(newMatchzyGgMinDiff);
-                    setMatchzyFfwEnabled(newMatchzyFfw);
-                    setInitialMatchzyFfwEnabled(newMatchzyFfw);
-                    setMatchzyFfwTime(newMatchzyFfwT);
-                    setInitialMatchzyFfwTime(newMatchzyFfwT);
-                    setMatchzyDemoRecordingEnabled(newMatchzyDemo);
-                    setInitialMatchzyDemoRecordingEnabled(newMatchzyDemo);
-
-                    window.dispatchEvent(
-                      new CustomEvent<SettingsResponse['settings']>('matchzy:settingsUpdated', {
-                        detail: response.settings,
-                      })
-                    );
-                    showSuccess('Settings reset to defaults');
-                  } catch (err) {
-                    const message = err instanceof Error ? err.message : 'Failed to reset settings';
-                    showError(message);
-                  } finally {
-                    setResetDialogOpen(false);
-                  }
-                }}
-                autoFocus
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ px: 1.5, fontSize: 12 }}
+                data-testid="settings-version"
               >
-                {t('settingsPage.resetDialog.confirm')}
-              </Button>
-            </DialogActions>
-          </Dialog>
+                {t('settingsPage.footer.version')}{' '}
+                {typeof __APP_VERSION__ !== 'undefined'
+                  ? __APP_VERSION__
+                  : t('settingsPage.footer.unknownVersion')}
+              </Typography>
+            </Box>
+
+            <SettingsCard cardKey={open.key}>{open.body}</SettingsCard>
+          </Box>
 
           <Dialog
             open={resetApiDialogOpen}

@@ -1,7 +1,7 @@
 import { APIRequestContext } from '@playwright/test';
 import { getAuthHeader } from './auth';
 import { createTestTeams, type Team, createTeam } from './teams';
-import { createTestServer, type Server } from './servers';
+import { createTestServer, deleteServer, FAKE_SERVER_HOST, type Server } from './servers';
 import {
   createAndStartTournament,
   type CreateTournamentInput,
@@ -10,7 +10,7 @@ import {
 
 /**
  * Comprehensive tournament setup helper
- * Handles all prerequisites: webhook URL, servers, teams, and tournament creation
+ * Handles all prerequisites: servers, teams, and tournament creation
  */
 
 export interface TournamentSetupOptions {
@@ -26,17 +26,16 @@ export interface TournamentSetupOptions {
   teamCount?: number;
   /** Number of servers to create (defaults to 1) */
   serverCount?: number;
-  /** Webhook URL to configure (defaults to http://localhost:3069 to match test base URL) */
-  webhookUrl?: string;
   /** Prefix for generated resources (defaults to 'test') */
   prefix?: string;
+  /** Tournament settings passthrough (seedingMethod, grandFinalMode, ...) */
+  settings?: Record<string, unknown>;
 }
 
 export interface TournamentSetupResult {
   tournament: Tournament;
   teams: Team[];
   servers: Server[];
-  webhookUrl: string;
 }
 
 const DEFAULT_MAPS = [
@@ -50,34 +49,6 @@ const DEFAULT_MAPS = [
 ];
 
 /**
- * Set webhook URL in settings
- */
-async function setWebhookUrl(request: APIRequestContext, webhookUrl: string): Promise<boolean> {
-  try {
-    const response = await request.put('/api/settings', {
-      headers: getAuthHeader(),
-      data: { webhookUrl },
-    });
-
-    if (!response.ok()) {
-      const errorText = await response.text();
-      console.error('Failed to set webhook URL:', {
-        status: response.status(),
-        statusText: response.statusText(),
-        error: errorText,
-        webhookUrl,
-      });
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error('Failed to set webhook URL:', error);
-    return false;
-  }
-}
-
-/**
  * Get existing teams or create new ones
  */
 async function ensureTeams(
@@ -85,21 +56,24 @@ async function ensureTeams(
   count: number,
   prefix: string
 ): Promise<Team[]> {
-  // Try to get existing teams first
-  try {
-    const response = await request.get('/api/teams', {
-      headers: getAuthHeader(),
-    });
-    if (response.ok()) {
-      const data = await response.json();
-      const existingTeams = data.teams || [];
-      if (existingTeams.length >= count) {
-        return existingTeams.slice(0, count);
-      }
-    }
-  } catch (error) {
-    // Ignore errors, will create new teams
-  }
+  // Always create fresh teams. Reusing whatever teams happen to exist has
+  // repeatedly poisoned other specs, because "a team that exists" is not the
+  // same as "a team that can play a match":
+  //
+  //   - shuffle specs create players with synthetic ids (match-test-player-3-...)
+  //     that can never sign in or be impersonated;
+  //   - the teams UI spec creates a team whose only member (76561198000000000)
+  //     has no player row behind it;
+  //   - leaked duplicates could hand a match two teams with identical rosters,
+  //     which the veto API correctly rejects as ambiguous.
+  //
+  // Each of those was previously patched with a narrower reuse filter. The
+  // filters kept missing cases, so the reuse itself is the problem. Creating a
+  // fresh pair costs two API calls and makes setup deterministic.
+  //
+  // Rosters are disjoint within a pair, which is all the veto API requires; the
+  // same Steam IDs appearing on teams from earlier calls is harmless because
+  // team membership is only ever resolved against the two teams in a match.
 
   // Real Steam IDs for testing avatars - public profiles that should exist
   // These will cycle through as needed for multiple teams
@@ -144,6 +118,17 @@ async function ensureTeams(
 }
 
 /**
+ * Does this server look like one the E2E suite created?
+ *
+ * Matches `createTestServer`'s `<prefix>-server-<timestamp>` ids and the
+ * `ui_test_server_<timestamp>` id the app derives from the Servers-page test.
+ * Anything else is treated as the operator's real infrastructure.
+ */
+function isTestFixtureServer(server: Server): boolean {
+  return /-server-\d{10,}$/.test(server.id) || /^ui_test_server_\d{10,}$/.test(server.id);
+}
+
+/**
  * Get existing servers or create new ones
  */
 async function ensureServers(
@@ -158,10 +143,40 @@ async function ensureServers(
     });
     if (response.ok()) {
       const data = await response.json();
-      const existingServers = data.servers || [];
-      const enabledServers = existingServers.filter((s: Server) => s.enabled);
-      if (enabledServers.length >= count) {
-        return enabledServers.slice(0, count);
+      const existingServers: Server[] = data.servers || [];
+
+      // Tournament start refuses to run while any enabled server fails its RCON
+      // version check, so a leftover server with a real host makes every later
+      // tournament fail with `cs2_outdated_servers`.
+      //
+      // Only ever delete servers this suite created. Never touch a server we do
+      // not recognise: the tests may be pointed at an instance that has real CS2
+      // servers configured, and silently deleting those would be destructive.
+      const blocking = existingServers.filter(
+        (server) => server.enabled && server.host !== FAKE_SERVER_HOST
+      );
+
+      for (const server of blocking) {
+        if (isTestFixtureServer(server)) {
+          console.warn(
+            `[tournamentSetup] Removing leftover test server ${server.id} (${server.host}) ` +
+              'which would block tournament start'
+          );
+          await deleteServer(request, server.id);
+        } else {
+          console.warn(
+            `[tournamentSetup] Enabled server ${server.id} (${server.host}) is not a test ` +
+              'fixture and will not be modified. If it is unreachable, tournament start will ' +
+              `fail with cs2_outdated_servers — disable it, or use host ${FAKE_SERVER_HOST}.`
+          );
+        }
+      }
+
+      const usableServers = existingServers.filter(
+        (server) => server.enabled && server.host === FAKE_SERVER_HOST
+      );
+      if (usableServers.length >= count) {
+        return usableServers.slice(0, count);
       }
     }
   } catch (error) {
@@ -197,32 +212,24 @@ export async function setupTournament(
     maps = DEFAULT_MAPS,
     teamCount = 2,
     serverCount = 1,
-    webhookUrl = 'http://localhost:3069',
     prefix = 'test',
+    settings,
   } = options;
 
-  // Step 1: Set webhook URL (non-blocking - warn but continue)
-  const webhookSet = await setWebhookUrl(request, webhookUrl);
-  if (!webhookSet) {
-    console.warn(`Failed to set webhook URL to ${webhookUrl}, continuing anyway...`);
-    // Don't fail the test setup if webhook URL setting fails
-    // It's not strictly required for all test scenarios
-  }
-
-  // Step 2: Ensure teams exist
+  // Step 1: Ensure teams exist
   const teams = await ensureTeams(request, teamCount, prefix);
   if (teams.length < teamCount) {
     console.error(`Failed to create ${teamCount} teams (only got ${teams.length})`);
     return null;
   }
 
-  // Step 3: Ensure servers exist
+  // Step 2: Ensure servers exist
   const servers = await ensureServers(request, serverCount, prefix);
   if (servers.length < serverCount) {
     console.warn(`Warning: Only created ${servers.length} servers (requested ${serverCount})`);
   }
 
-  // Step 4: Create and start tournament
+  // Step 3: Create and start tournament
   const tournamentName = name || `${prefix} Tournament ${Date.now()}`;
   const tournamentInput: CreateTournamentInput = {
     name: tournamentName,
@@ -230,6 +237,7 @@ export async function setupTournament(
     format,
     maps,
     teamIds: teams.map((t) => t.id),
+    ...(settings ? { settings } : {}),
   };
 
   const tournament = await createAndStartTournament(request, tournamentInput);
@@ -242,6 +250,5 @@ export async function setupTournament(
     tournament,
     teams,
     servers,
-    webhookUrl,
   };
 }

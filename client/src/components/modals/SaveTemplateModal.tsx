@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -10,11 +10,12 @@ import {
   IconButton,
   Typography,
 } from '@mui/material';
-import CloseIcon from '@mui/icons-material/Close';
+import { XIcon } from '@phosphor-icons/react';
 import { api } from '../../utils/api';
 import { useSnackbar } from '../../contexts/SnackbarContext';
 import type { TournamentSettings } from '../../types/tournament.types';
 import { useTranslation } from 'react-i18next';
+import type { Untrusted } from '../../utils/untrusted';
 
 interface SaveTemplateModalProps {
   open: boolean;
@@ -24,13 +25,13 @@ interface SaveTemplateModalProps {
     name: string;
     type: string;
     format: string;
-    maps: string[];
-    mapPoolId?: number | null;
     teamIds?: string[];
     settings?: TournamentSettings;
-    maxRounds?: number;
-    overtimeMode?: 'enabled' | 'disabled';
-    overtimeSegments?: number | null;
+    /**
+     * The game module's own settings (CS2: `cs2`, with its pool, maps and
+     * round rules), saved into the template's settings as they are.
+     */
+    gameSettings?: Record<string, Untrusted>;
     grandFinalMode?: 'none' | 'simple' | 'double';
   };
 }
@@ -71,19 +72,11 @@ export default function SaveTemplateModal({
         seedingMethod: 'random',
       };
 
-      const settings: Partial<TournamentSettings> = {
+      const settings: Partial<TournamentSettings> & Record<string, Untrusted> = {
         ...baseSettings,
+        ...(tournamentData.gameSettings ?? {}),
       };
 
-      if (typeof tournamentData.maxRounds === 'number') {
-        settings.maxRounds = tournamentData.maxRounds;
-      }
-      if (tournamentData.overtimeMode) {
-        settings.overtimeMode = tournamentData.overtimeMode;
-      }
-      if (typeof tournamentData.overtimeSegments === 'number') {
-        settings.overtimeSegments = tournamentData.overtimeSegments ?? undefined;
-      }
       if (tournamentData.grandFinalMode) {
         settings.grandFinalMode = tournamentData.grandFinalMode;
       }
@@ -93,8 +86,6 @@ export default function SaveTemplateModal({
         description: templateDescription || undefined,
         type: tournamentData.type,
         format: tournamentData.format,
-        mapPoolId: tournamentData.mapPoolId,
-        maps: tournamentData.maps,
         teamIds: tournamentData.teamIds,
         settings,
       });
@@ -140,7 +131,7 @@ export default function SaveTemplateModal({
           {t('saveTemplateModal.title')}
         </Typography>
         <IconButton onClick={handleClose} size="small" aria-label="close">
-          <CloseIcon fontSize="small" />
+          <XIcon size={20} />
         </IconButton>
       </DialogTitle>
       <DialogContent>

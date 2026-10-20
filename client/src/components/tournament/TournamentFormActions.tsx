@@ -1,16 +1,18 @@
-import React from 'react';
 import { Box, Button, Tooltip, CircularProgress } from '@mui/material';
-import { DeleteForever as DeleteForeverIcon, Save as SaveIcon } from '@mui/icons-material';
-import { validateMapCount } from '../../utils/tournamentVerification';
+import { FloppyDiskIcon, TrashIcon } from '@phosphor-icons/react';
+import { useTranslation } from 'react-i18next';
 import { useSnackbar } from '../../contexts/SnackbarContext';
 
 interface TournamentFormActionsProps {
   tournamentExists: boolean;
   saving: boolean;
   hasChanges: boolean;
-  type: string;
-  format: string;
-  mapsCount: number;
+  /**
+   * Why the game's own settings cannot be saved yet, from its module (CS2: a
+   * map pool that does not fit the format), or null. A game with no settings
+   * of its own — a manually reported one — never has one (3.0 item 8b).
+   */
+  settingsError?: string | null;
   canEdit: boolean;
   onSave: () => void;
   onCancel?: () => void;
@@ -22,33 +24,32 @@ export function TournamentFormActions({
   tournamentExists,
   saving,
   hasChanges,
-  type,
-  format,
-  mapsCount,
+  settingsError = null,
   canEdit,
   onSave,
   onCancel,
   onDelete,
   onSaveTemplate,
 }: TournamentFormActionsProps) {
+  const { t } = useTranslation();
   const { showWarning } = useSnackbar();
 
   if (!canEdit) {
     return null;
   }
 
-  // Use verification rules system - create dummy array for validation
-  const dummyMaps = Array(mapsCount).fill('dummy');
-  const mapValidation = validateMapCount(dummyMaps, type, format);
-  const isValidMaps = mapValidation.valid;
+  const isValidMaps = settingsError === null;
 
   const handleSave = () => {
     if (!hasChanges) {
-      showWarning('No changes to save');
+      showWarning(t('tournament.toasts.noChangesToSave'));
+      // Nothing to regenerate: the bracket already matches the saved settings,
+      // so leave the wizard for the tournament view instead of staying put.
+      if (tournamentExists) onCancel?.();
       return;
     }
     if (!isValidMaps) {
-      showWarning(mapValidation.message || 'Invalid map selection');
+      showWarning(settingsError || t('tournament.toasts.invalidMapSelection'));
       return;
     }
     onSave();
@@ -56,7 +57,7 @@ export function TournamentFormActions({
 
   const handleSaveTemplate = () => {
     if (!isValidMaps) {
-      showWarning(mapValidation.message || 'Invalid map selection');
+      showWarning(settingsError || t('tournament.toasts.invalidMapSelection'));
       return;
     }
     onSaveTemplate?.();
@@ -86,34 +87,21 @@ export function TournamentFormActions({
           {saving ? (
             <CircularProgress size={24} />
           ) : tournamentExists ? (
-            'Save & Generate Brackets'
+            t('tournament.formActions.saveAndGenerate')
           ) : (
-            'Create Tournament'
+            t('tournament.common.createTournament')
           )}
         </Button>
         {tournamentExists && onCancel && (
           <Button variant="outlined" onClick={onCancel} disabled={saving}>
-            Cancel
+            {t('common.cancel')}
           </Button>
         )}
-        {tournamentExists && (
-          <Tooltip title="Permanently delete this tournament and all its data" enterDelay={500}>
-            <Button
-              variant="outlined"
-              color="error"
-              startIcon={<DeleteForeverIcon />}
-              onClick={onDelete}
-              disabled={saving}
-            >
-              Delete
-            </Button>
-          </Tooltip>
-        )}
         {onSaveTemplate && (
-          <Tooltip title="Save current tournament configuration as a template" enterDelay={500}>
+          <Tooltip title={t('tournament.formActions.saveTemplateTooltip')} enterDelay={500}>
             <Button
               variant="outlined"
-              startIcon={<SaveIcon />}
+              startIcon={<FloppyDiskIcon />}
               onClick={handleSaveTemplate}
               disabled={saving}
               sx={{
@@ -128,7 +116,23 @@ export function TournamentFormActions({
                 }),
               }}
             >
-              Save as Template
+              {t('tournament.formActions.saveAsTemplate')}
+            </Button>
+          </Tooltip>
+        )}
+        {/* Delete sits apart, at the far end of the row: it was between
+            Cancel and "Save as template", one slip from the save buttons. */}
+        {tournamentExists && (
+          <Tooltip title={t('tournament.tooltips.deleteTournament')} enterDelay={500}>
+            <Button
+              variant="outlined"
+              color="error"
+              startIcon={<TrashIcon />}
+              onClick={onDelete}
+              disabled={saving}
+              sx={{ ml: { sm: 'auto' } }}
+            >
+              {t('common.delete')}
             </Button>
           </Tooltip>
         )}

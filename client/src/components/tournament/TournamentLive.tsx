@@ -11,19 +11,32 @@ import {
   Tooltip,
   IconButton,
   TextField,
+  Stack,
+  Divider,
 } from '@mui/material';
-import VisibilityIcon from '@mui/icons-material/Visibility';
-import RestartAltIcon from '@mui/icons-material/RestartAlt';
-import DeleteForeverIcon from '@mui/icons-material/DeleteForever';
-import EmojiEventsIcon from '@mui/icons-material/EmojiEvents';
-import EditIcon from '@mui/icons-material/Edit';
-import CheckIcon from '@mui/icons-material/Check';
-import CloseIcon from '@mui/icons-material/Close';
+import {
+  ArrowCounterClockwiseIcon,
+  CheckIcon,
+  EyeIcon,
+  PencilSimpleIcon,
+  PlusIcon,
+  TrashIcon,
+  TrophyIcon,
+  XIcon,
+} from '@phosphor-icons/react';
+import { useTranslation } from 'react-i18next';
+import { scopedSocket } from '../../utils/sharedSocket';
+import { onSocketReconnect } from '../../utils/socketResync';
 import { TOURNAMENT_TYPES, MATCH_FORMATS } from '../../constants/tournament';
 import { RestartTournamentButton } from '../dashboard/RestartTournamentButton';
+import { EndTournamentButton } from '../dashboard/EndTournamentButton';
+import { ChampionBanner } from './ChampionBanner';
 import { api } from '../../utils/api';
-import type { Map } from '../../types/api.types';
+import type { Map, MatchesResponse } from '../../types/api.types';
+import type { Tournament } from '../../types';
 import { getMapDisplayName } from '../../constants/maps';
+import { radii } from '../../theme/tokens';
+import { tournamentTabPath } from '../../paths';
 
 interface TournamentLiveProps {
   tournament: {
@@ -36,9 +49,12 @@ interface TournamentLiveProps {
     mapSequence?: string[];
     teamSize?: number;
     maxRounds?: number;
+    /** The game module id (e.g. cs2); unset on older tournaments. */
+    game?: string;
     overtimeMode?: 'enabled' | 'disabled';
     overtimeSegments?: number;
     eloTemplateId?: string;
+    winner?: { id: string; name: string; tag?: string } | null;
   };
   tournamentId: number;
   onRename: (newName: string) => Promise<void> | void;
@@ -46,6 +62,8 @@ interface TournamentLiveProps {
   onViewBracket: () => void;
   onReset: () => void;
   onDelete: () => void;
+  /** A finished tournament: archive it (results stay) and start a new one. */
+  onNewTournament?: () => void;
   playerCount?: number;
 }
 
@@ -57,11 +75,17 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
   onViewBracket,
   onReset,
   onDelete,
+  onNewTournament,
   playerCount,
 }) => {
+  const { t } = useTranslation();
   const [isRenaming, setIsRenaming] = React.useState(false);
   const [nameInput, setNameInput] = React.useState(tournament.name);
   const [availableMaps, setAvailableMaps] = React.useState<Map[]>([]);
+  // Whether at least one match has actually reached a server. Until then the
+  // tournament is "in progress" but nothing is running yet (servers are being
+  // allocated / vetoes are still open).
+  const [hasStartedMatch, setHasStartedMatch] = React.useState(false);
 
   React.useEffect(() => {
     setNameInput(tournament.name);
@@ -81,15 +105,60 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
     loadMaps();
   }, []);
 
+  React.useEffect(() => {
+    let cancelled = false;
+
+    const loadMatches = async () => {
+      try {
+        const response = await api.get<MatchesResponse>('/api/matches');
+        if (cancelled || !response.matches) return;
+        setHasStartedMatch(
+          response.matches.some((match) => match.status === 'loaded' || match.status === 'live')
+        );
+      } catch (err) {
+        console.error('Error loading matches for live tournament view:', err);
+      }
+    };
+
+    void loadMatches();
+
+    const socket = scopedSocket();
+    const handleMatchUpdate = () => {
+      void loadMatches();
+    };
+    socket.on('match:update', handleMatchUpdate);
+    const offReconnect = onSocketReconnect(socket, handleMatchUpdate);
+
+    return () => {
+      cancelled = true;
+      offReconnect();
+      socket.off('match:update', handleMatchUpdate);
+      socket.close();
+    };
+  }, []);
+
   const isShuffle = tournament.type === 'shuffle';
+  const isCompleted = tournament.status !== 'in_progress';
+  const isRunning = !isCompleted && hasStartedMatch;
   const teamSize = tournament.teamSize || 5;
   const maxRounds = tournament.maxRounds || 24;
+  // Rounds and overtime are CS2 rules; other games have none to show.
+  const hasRoundRules = !tournament.game || tournament.game === 'cs2';
   const overtimeMode = tournament.overtimeMode ?? 'enabled';
   const overtimeSegments = tournament.overtimeSegments;
 
   const resolveDisplayName = (mapId: string): string => {
     const map = availableMaps.find((m) => m.id === mapId);
     return map ? map.displayName : getMapDisplayName(mapId);
+  };
+
+  const renderOvertimeLine = () => {
+    if (overtimeMode === 'enabled') {
+      return t('tournament.matchRules.overtimeEnabled');
+    }
+    return overtimeSegments === 0
+      ? t('tournament.matchRules.overtimeDisabledNoDraws')
+      : t('tournament.matchRules.overtimeDisabled');
   };
 
   const shuffleMaps: string[] =
@@ -127,6 +196,14 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
   return (
     <Card sx={{ mb: 3 }}>
       <CardContent>
+        <ChampionBanner
+          tournament={{
+            status: tournament.status as Tournament['status'],
+            type: tournament.type as Tournament['type'],
+            winner: tournament.winner ?? null,
+          }}
+        />
+
         <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
           <Box display="flex" alignItems="center" gap={1} sx={{ flex: 1, minWidth: 0 }}>
             {isRenaming ? (
@@ -143,21 +220,21 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
                   sx={{ maxWidth: 360 }}
                 />
                 <IconButton
-                  aria-label="Save tournament name"
+                  aria-label={t('tournament.live.saveNameAria')}
                   color="primary"
                   size="small"
                   onClick={handleConfirmRename}
                   disabled={saving}
                 >
-                  <CheckIcon fontSize="small" />
+                  <CheckIcon size={20} />
                 </IconButton>
                 <IconButton
-                  aria-label="Cancel tournament rename"
+                  aria-label={t('tournament.live.cancelRenameAria')}
                   size="small"
                   onClick={handleCancelRename}
                   disabled={saving}
                 >
-                  <CloseIcon fontSize="small" />
+                  <XIcon size={20} />
                 </IconButton>
               </>
             ) : (
@@ -166,18 +243,18 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
                   {tournament.name}
                 </Typography>
                 <Tooltip
-                  title="Rename tournament"
+                  title={t('tournament.live.renameTooltip')}
                   PopperProps={{ style: { zIndex: 1200 } }}
                   enterDelay={500}
                 >
                   <span>
                     <IconButton
-                      aria-label="Edit tournament name"
+                      aria-label={t('tournament.live.editNameAria')}
                       size="small"
                       onClick={handleStartRename}
                       disabled={saving}
                     >
-                      <EditIcon fontSize="small" />
+                      <PencilSimpleIcon size={20} />
                     </IconButton>
                   </span>
                 </Tooltip>
@@ -186,58 +263,85 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
           </Box>
           <Chip
             data-testid="tournament-status"
-            label={tournament.status === 'in_progress' ? 'LIVE' : 'COMPLETED'}
-          // Use the same pastel red/pink accent as other LIVE indicators,
-          // and mint green for completed tournaments.
-          color={tournament.status === 'in_progress' ? 'error' : 'success'}
+            label={
+              isCompleted
+                ? t('matchesPage.statusLabel.completed')
+                : t('matchesPage.statusLabel.live')
+            }
+            // Use the same pastel red/pink accent as other LIVE indicators,
+            // and mint green for completed tournaments.
+            color={isCompleted ? 'success' : 'error'}
           />
         </Box>
 
-        <Alert severity={tournament.status === 'in_progress' ? 'warning' : 'success'} sx={{ mb: 3 }}>
+        <Alert severity={isCompleted ? 'success' : isRunning ? 'warning' : 'info'} sx={{ mb: 3 }}>
           <Typography variant="body2" fontWeight={600} gutterBottom>
-            Tournament is {tournament.status === 'in_progress' ? 'Live' : 'Completed'}
+            {isCompleted
+              ? t('tournament.live.alert.completedTitle')
+              : isRunning
+                ? t('tournament.live.alert.liveTitle')
+                : t('tournament.live.alert.pendingTitle')}
           </Typography>
           <Typography variant="body2">
-            {tournament.status === 'in_progress'
-              ? 'Matches are currently running on servers. You cannot edit tournament settings while live (except the tournament name).'
-              : 'This tournament has finished all matches. Create a new tournament or reset this one to start over.'}
+            {isCompleted
+              ? t('tournament.live.alert.completedBody')
+              : isRunning
+                ? t('tournament.live.alert.liveBody')
+                : t('tournament.live.alert.pendingBody')}
           </Typography>
+          {isCompleted && onNewTournament && (
+            <Button
+              variant="contained"
+              size="small"
+              startIcon={<PlusIcon />}
+              onClick={onNewTournament}
+              disabled={saving}
+              sx={{ mt: 1.5 }}
+              data-testid="tournament-new-after-finish"
+            >
+              {t('tournament.live.newTournament')}
+            </Button>
+          )}
         </Alert>
 
         <Grid container spacing={2} sx={{ mb: 3 }}>
           <Grid size={{ xs: 12, sm: 6 }}>
             <Typography variant="subtitle2" color="text.secondary">
-              Format
+              {t('tournament.labels.format')}
             </Typography>
             <Typography variant="body2">
-              {TOURNAMENT_TYPES.find((t) => t.value === tournament.type)?.label} •{' '}
-              {MATCH_FORMATS.find((f) => f.value === tournament.format)?.label}
+              {TOURNAMENT_TYPES.some((tt) => tt.value === tournament.type)
+                ? t(`tournament.typeSelector.types.${tournament.type}.label`)
+                : tournament.type}{' '}
+              • {MATCH_FORMATS.find((f) => f.value === tournament.format)?.label}
             </Typography>
           </Grid>
           {!isShuffle && (
             <Grid size={{ xs: 12, sm: 6 }}>
               <Typography variant="subtitle2" color="text.secondary">
-                Teams
+                {t('tournament.labels.teams')}
               </Typography>
-              <Typography variant="body2">{tournament.teams.length} teams competing</Typography>
+              <Typography variant="body2">
+                {t('tournament.live.teamsCompeting', { count: tournament.teams.length })}
+              </Typography>
             </Grid>
           )}
           {isShuffle && (
             <Grid size={{ xs: 12, sm: 6 }}>
               <Typography variant="subtitle2" color="text.secondary">
-                Players
+                {t('tournament.labels.players')}
               </Typography>
               <Typography variant="body2">
                 {typeof playerCount === 'number'
-                  ? `${playerCount} player${playerCount === 1 ? '' : 's'} competing`
-                  : 'Players competing'}
+                  ? t('tournament.live.playersCompeting', { count: playerCount })
+                  : t('tournament.live.playersCompetingUnknown')}
               </Typography>
             </Grid>
           )}
           {!isShuffle && (
             <Grid size={{ xs: 12, sm: 6 }}>
               <Typography variant="subtitle2" color="text.secondary">
-                Maps
+                {t('tournament.labels.maps')}
               </Typography>
               <Box display="flex" flexWrap="wrap" gap={1} mt={0.5}>
                 {tournament.maps.map((mapId: string) => (
@@ -251,50 +355,60 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
               </Box>
             </Grid>
           )}
-          {!isShuffle && (
+          {!isShuffle && hasRoundRules && (
             <Grid size={{ xs: 12, sm: 6 }}>
               <Typography variant="subtitle2" color="text.secondary">
-                Match Rules
+                {t('tournament.labels.matchRules')}
               </Typography>
               <Typography variant="body2">
-                Max {maxRounds} rounds per map; winner is first to {Math.floor(maxRounds / 2) + 1}{' '}
-                rounds.
+                {t('tournament.matchRules.value', {
+                  maxRounds,
+                  winRounds: Math.floor(maxRounds / 2) + 1,
+                })}
               </Typography>
+              <Typography variant="body2">{renderOvertimeLine()}</Typography>
+              {overtimeMode === 'enabled' && typeof overtimeSegments === 'number' && (
+                <Typography variant="body2">
+                  {overtimeSegments > 0
+                    ? t('tournament.matchRules.overtimeSegments', { count: overtimeSegments })
+                    : t('tournament.matchRules.overtimeSegmentsDefault')}
+                </Typography>
+              )}
             </Grid>
           )}
           {isShuffle && (
             <>
               <Grid size={{ xs: 12, sm: 6 }}>
                 <Typography variant="subtitle2" color="text.secondary">
-                  Shuffle Settings
+                  {t('tournament.live.shuffleSettingsLabel')}
                 </Typography>
                 <Typography variant="body2">
-                  Team Size: {teamSize}v{teamSize}
+                  {t('tournament.matchRules.teamSizeValue', { size: teamSize })}
                 </Typography>
-                <Typography variant="body2">Max Rounds per Map: {maxRounds}</Typography>
-                <Typography variant="body2">
-                  Overtime:{' '}
-                  {overtimeMode === 'enabled' ? 'Enabled' : 'Disabled (No Overtime)'}
-                </Typography>
-                {overtimeMode === 'enabled' && typeof overtimeSegments === 'number' && (
+                {hasRoundRules && (
                   <Typography variant="body2">
-                    Overtime Segments:{' '}
-                    {overtimeSegments > 0
-                      ? `${overtimeSegments} ${
-                          overtimeSegments === 1 ? 'segment' : 'segments'
-                        }`
-                      : 'MatchZy default'}
+                    {t('tournament.live.maxRoundsPerMapValue', { rounds: maxRounds })}
                   </Typography>
                 )}
+                {hasRoundRules && <Typography variant="body2">{renderOvertimeLine()}</Typography>}
+                {hasRoundRules &&
+                  overtimeMode === 'enabled' &&
+                  typeof overtimeSegments === 'number' && (
+                    <Typography variant="body2">
+                      {overtimeSegments > 0
+                        ? t('tournament.matchRules.overtimeSegments', { count: overtimeSegments })
+                        : t('tournament.matchRules.overtimeSegmentsDefault')}
+                    </Typography>
+                  )}
                 {tournament.eloTemplateId && (
                   <Typography variant="body2">
-                    ELO Template: {tournament.eloTemplateId}
+                    {t('tournament.live.eloTemplateValue', { template: tournament.eloTemplateId })}
                   </Typography>
                 )}
               </Grid>
               <Grid size={{ xs: 12, sm: 6 }}>
                 <Typography variant="subtitle2" color="text.secondary">
-                  Map Sequence (Rounds)
+                  {t('tournament.live.mapSequenceLabel')}
                 </Typography>
                 <Box display="flex" flexWrap="wrap" gap={1} mt={0.5}>
                   {shuffleMaps.length > 0 ? (
@@ -308,7 +422,7 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
                     ))
                   ) : (
                     <Typography variant="body2" color="text.secondary">
-                      No maps configured yet.
+                      {t('tournament.live.noMapsConfigured')}
                     </Typography>
                   )}
                 </Box>
@@ -319,7 +433,7 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
 
         <Box display="flex" gap={2} flexWrap="wrap">
           <Tooltip
-            title="View the tournament bracket and match details"
+            title={t('tournament.live.viewBracketTooltip')}
             PopperProps={{ style: { zIndex: 1200 } }}
             enterDelay={500}
           >
@@ -328,15 +442,15 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
                 data-testid="view-bracket-button"
                 variant="contained"
                 fullWidth
-                startIcon={<VisibilityIcon />}
+                startIcon={<EyeIcon />}
                 onClick={onViewBracket}
               >
-                View Bracket
+                {t('tournament.live.viewBracket')}
               </Button>
             </span>
           </Tooltip>
           <Tooltip
-            title="Open the public leaderboard page to share with players"
+            title={t('tournament.live.leaderboardTooltip')}
             PopperProps={{ style: { zIndex: 1200 } }}
             enterDelay={500}
           >
@@ -344,60 +458,96 @@ export const TournamentLive: React.FC<TournamentLiveProps> = ({
               <Button
                 variant="outlined"
                 fullWidth
-                startIcon={<EmojiEventsIcon />}
-                onClick={() => window.open(`/tournament/${tournamentId}/leaderboard`, '_blank')}
+                startIcon={<TrophyIcon />}
+                onClick={() => window.open(tournamentTabPath(tournamentId, 'standings'), '_blank')}
               >
-                Leaderboard
+                {t('nav.leaderboard')}
               </Button>
             </span>
           </Tooltip>
-          {tournament.status === 'in_progress' && (
-            <Tooltip
-              title="End all active matches on servers and reload them (useful for stuck matches)"
-              PopperProps={{ style: { zIndex: 1200 } }}
-              enterDelay={500}
-            >
-              <Box flex={1} minWidth={200}>
-                <RestartTournamentButton fullWidth variant="outlined" size="medium" />
-              </Box>
-            </Tooltip>
-          )}
-          <Tooltip
-            title="End all matches and reset tournament to setup mode (keeps tournament settings but clears all match data)"
-            PopperProps={{ style: { zIndex: 1200 } }}
-            enterDelay={500}
+        </Box>
+
+        {/* What changes or ends the running tournament sits apart from the
+            everyday buttons above, each with a line saying what it does. It
+            used to be one row of five differently coloured buttons: filled
+            orange, outlined, outlined amber, and two outlined red. */}
+        <Box
+          component="section"
+          aria-labelledby="tournament-danger-zone-title"
+          data-testid="tournament-danger-zone"
+          sx={{
+            mt: 3,
+            p: 2,
+            border: 1,
+            borderColor: 'error.main',
+            borderRadius: radii.lg,
+          }}
+        >
+          <Typography
+            id="tournament-danger-zone-title"
+            variant="subtitle2"
+            fontWeight={600}
+            color="error.main"
+            gutterBottom
           >
-            <span>
+            {t('tournament.live.dangerZone')}
+          </Typography>
+          <Stack divider={<Divider flexItem />} spacing={1.5}>
+            {tournament.status === 'in_progress' && (
+              <DangerRow description={t('tournament.live.restartTooltip')}>
+                <RestartTournamentButton variant="outlined" size="small" />
+              </DangerRow>
+            )}
+            {tournament.status === 'in_progress' && (
+              <DangerRow description={t('tournament.end.tooltip')}>
+                <EndTournamentButton tournamentId={tournamentId} tournamentName={tournament.name} />
+              </DangerRow>
+            )}
+            <DangerRow description={t('tournament.live.resetTooltip')}>
               <Button
                 variant="outlined"
                 color="error"
-                startIcon={<RestartAltIcon />}
+                size="small"
+                startIcon={<ArrowCounterClockwiseIcon />}
                 onClick={onReset}
                 disabled={saving}
               >
-                Reset to Setup
+                {t('tournament.live.reset')}
               </Button>
-            </span>
-          </Tooltip>
-          <Tooltip
-            title="Permanently delete this tournament and all its data"
-            PopperProps={{ style: { zIndex: 1200 } }}
-            enterDelay={500}
-          >
-            <span>
+            </DangerRow>
+            <DangerRow description={t('tournament.tooltips.deleteTournament')}>
               <Button
                 variant="outlined"
                 color="error"
-                startIcon={<DeleteForeverIcon />}
+                size="small"
+                startIcon={<TrashIcon />}
                 onClick={onDelete}
                 disabled={saving}
               >
-                Delete
+                {t('common.delete')}
               </Button>
-            </span>
-          </Tooltip>
+            </DangerRow>
+          </Stack>
         </Box>
       </CardContent>
     </Card>
   );
 };
+
+/** One danger-zone action: what it does on the left, its button on the right. */
+function DangerRow({ description, children }: { description: string; children: React.ReactNode }) {
+  return (
+    <Box
+      display="flex"
+      alignItems={{ xs: 'flex-start', sm: 'center' }}
+      flexDirection={{ xs: 'column', sm: 'row' }}
+      justifyContent="space-between"
+      gap={1.5}
+    >
+      <Typography variant="body2" color="text.secondary" sx={{ flex: 1 }}>
+        {description}
+      </Typography>
+      <Box sx={{ flexShrink: 0, '& .MuiButton-root': { whiteSpace: 'nowrap' } }}>{children}</Box>
+    </Box>
+  );
+}

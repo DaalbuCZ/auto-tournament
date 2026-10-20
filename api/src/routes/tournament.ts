@@ -1,13 +1,21 @@
-import { Router, Request, Response } from 'express';
+import { noticeTournamentStarted } from '../services/tournamentNotices';
+import { licenseService } from '../services/license/licenseService';
+import type { Request, Response } from 'express';
+import express, { Router } from 'express';
 import { tournamentService } from '../services/tournamentService';
-import { matchAllocationService } from '../services/matchAllocationService';
-import { rconService } from '../services/rconService';
+import { scheduler } from '../core/scheduler';
 import { db } from '../config/database';
-import { requireAuth } from '../middleware/auth';
+import { bannerUrl, logoUrl } from '../services/teamSelfService';
+import { requestActorId, requireAuth } from '../middleware/auth';
+import { HOLD_FOREVER, pauseTournament, resumeTournament } from '../services/matchHolds';
+import { breakMinutesOf, computeNextRoundEta } from '../utils/nextRoundEta';
 import { log } from '../utils/logger';
-import { getWebhookBaseUrl } from '../utils/urlHelper';
-import type { CreateTournamentInput, UpdateTournamentInput } from '../types/tournament.types';
-import type { DbMatchRow } from '../types/database.types';
+import type {
+  BracketResponse,
+  CreateTournamentInput,
+  UpdateTournamentInput,
+} from '../types/tournament.types';
+import type { DbMatchRow, DbTournamentRow } from '../types/database.types';
 import type { MatchConfig } from '../types/match.types';
 import { emitTournamentUpdate, emitBracketUpdate } from '../services/socketService';
 import {
@@ -15,205 +23,96 @@ import {
   registerPlayers,
   setRegisteredPlayers,
   getRegisteredPlayers,
+  fillRoundFromBench,
+  getShuffleTournament,
   generateRoundMatches,
-  getPlayerLeaderboard,
   getTournamentLeaderboard,
   type ShuffleTournamentConfig,
 } from '../services/shuffleTournamentService';
 import { eloTemplateService } from '../services/eloTemplateService';
 import { settingsService } from '../services/settingsService';
-import { serverService } from '../services/serverService';
-import { serverInitializationService } from '../services/serverInitializationService';
 import { checkTournamentCompletion } from '../utils/matchProgression';
-import { cs2UpdateService } from '../services/cs2UpdateService';
-import { extractCs2StatusVersionLine, parseCs2BuildId } from '../utils/cs2Version';
+import { resolveTournamentId } from '../utils/tournamentRow';
+import { applyMatchTimes, matchTimesError } from '../services/matchTimes';
+import { validateTeamCount } from '../utils/tournamentHelpers';
+import { integrationForMatch } from '../integrations/registry';
+import { resolveGameRef } from '../services/gameCatalogService';
+import { teamMembers } from '../services/teamMembers';
+import { toPublicBracket } from '../utils/publicBracket';
+import {
+  BANNER_MAX_BYTES,
+  BannerError,
+  tournamentBannerService,
+} from '../services/tournamentBannerService';
+import type {
+  GameId,
+  TournamentSettingsInput,
+  TournamentSettingsValidation,
+} from '../integrations/types';
+import {
+  archiveCurrentTournament,
+  readableTournamentId,
+  TournamentArchiveError,
+} from '../services/currentTournament';
+import { shuffleTeamId } from '../utils/matchSlug';
+import type { Untrusted } from '../utils/untrusted';
 
 const router = Router();
 
-/**
- * Ensure MatchZy webhooks are configured for all enabled servers at the moment
- * a tournament is started. This mirrors the behaviour of the Servers page
- * (which configures webhooks when testing server status) so that admins don't
- * have to visit the Servers view before allocations begin.
- */
-async function bootstrapServerWebhooksForTournamentStart(): Promise<void> {
-  const serverToken = process.env.SERVER_TOKEN;
-  if (!serverToken) {
-    log.warn(
-      'SERVER_TOKEN is not set. Skipping automatic webhook bootstrap during tournament start.'
-    );
-    return;
-  }
-
-  const baseUrl = await settingsService.getWebhookUrl();
-  if (!baseUrl) {
-    log.warn(
-      'Webhook URL is not configured. Skipping automatic webhook bootstrap during tournament start.'
-    );
-    return;
-  }
-
-  const enabledServers = await serverService.getAllServers(true);
-  if (enabledServers.length === 0) {
-    return;
-  }
-
-  log.info(
-    `[WEBHOOK] Ensuring persistent config for ${enabledServers.length} server(s) before allocation...`
-  );
-
-  // Initialize servers with persistent configuration (idempotent - only sends if not already initialized)
-  for (const server of enabledServers) {
-    try {
-      await serverInitializationService.initializeServer(server.id, baseUrl);
-      log.success(`Initialized persistent config for ${server.id}`);
-    } catch (error) {
-      // Don't fail the start flow if a single server init fails.
-      log.warn(
-        `Failed to initialize server ${server.id} during tournament start`,
-        { error }
-      );
-    }
-  }
-}
-
-async function preflightServersUpToDateForTournamentStart(): Promise<
-  | { ok: true }
-  | {
-      ok: false;
-      servers: Array<{
-        id: string;
-        name: string;
-        installedBuildId: number | null;
-        requiredVersion: number | null;
-        reason: string;
-      }>;
-    }
-> {
-  const enabledServers = await serverService.getAllServers(true);
-  if (enabledServers.length === 0) {
-    return { ok: true };
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-  const problems: Array<{
-    id: string;
-    name: string;
-    installedBuildId: number | null;
-    requiredVersion: number | null;
-    reason: string;
-  }> = [];
-
-  for (const server of enabledServers) {
-    // Fake servers for screenshots/testing should not block tournament start.
-    if (server.host === '0.0.0.0') {
-      continue;
-    }
-
-    try {
-      const versionResult = await rconService.sendCommand(server.id, 'version');
-      if (!versionResult.success || typeof versionResult.response !== 'string') {
-        problems.push({
-          id: server.id,
-          name: server.name,
-          installedBuildId: server.cs2BuildId ?? null,
-          requiredVersion: null,
-          reason: `Could not fetch CS2 version via RCON: ${versionResult.error ?? 'no details'}`,
-        });
-        continue;
-      }
-
-      let installedBuildId = parseCs2BuildId(versionResult.response);
-      let cs2VersionString: string | null = versionResult.response;
-
-      if (!installedBuildId) {
-        // Fallback: some servers do not include BuildID in `version` output, but `status` includes
-        // `version  : 1.41.3.4/14134 ...` where the trailing number matches Steam required_version.
-        const statusResult = await rconService.sendCommand(server.id, 'status');
-        if (statusResult.success && typeof statusResult.response === 'string') {
-          installedBuildId = parseCs2BuildId(statusResult.response);
-          cs2VersionString = extractCs2StatusVersionLine(statusResult.response) ?? statusResult.response;
-        }
-      }
-
-      if (!installedBuildId) {
-        log.warn('[TOURNAMENT] Could not verify CS2 version via RCON for server', {
-          serverId: server.id,
-          versionExcerpt: String(versionResult.response).slice(0, 200),
-        });
-        problems.push({
-          id: server.id,
-          name: server.name,
-          installedBuildId: null,
-          requiredVersion: null,
-          reason: 'Could not verify CS2 version via RCON (`version`/`status` parsing failed)',
-        });
-        continue;
-      }
-
-      const check = await cs2UpdateService.upToDateCheck(installedBuildId);
-
-      // Persist latest known version output + build id (best-effort) and the UpToDateCheck outcome.
-      if (check.upToDate) {
-        await db.updateAsync(
-          'servers',
-          {
-            cs2_build_id: installedBuildId,
-            cs2_version_string: cs2VersionString,
-            cs2_version_fetched_at: now,
-            cs2_required_version: null,
-            cs2_update_phase: null,
-            cs2_update_required_at: null,
-            cs2_update_checked_at: now,
-            updated_at: now,
-          },
-          'id = ?',
-          [server.id]
-        );
-      } else {
-        await db.updateAsync(
-          'servers',
-          {
-            cs2_build_id: installedBuildId,
-            cs2_version_string: cs2VersionString,
-            cs2_version_fetched_at: now,
-            cs2_required_version: check.requiredVersion ?? null,
-            cs2_update_phase: 'available',
-            cs2_update_required_at: now,
-            cs2_update_checked_at: now,
-            updated_at: now,
-          },
-          'id = ?',
-          [server.id]
-        );
-
-        problems.push({
-          id: server.id,
-          name: server.name,
-          installedBuildId,
-          requiredVersion: check.requiredVersion ?? null,
-          reason: 'Server is out of date according to Steam UpToDateCheck',
-        });
-      }
-    } catch (error) {
-      problems.push({
-        id: server.id,
-        name: server.name,
-        installedBuildId: server.cs2BuildId ?? null,
-        requiredVersion: server.cs2RequiredVersion ?? null,
-        reason: `Failed to verify CS2 build against Steam: ${error instanceof Error ? error.message : String(error)}`,
-      });
-    }
-  }
-
-  if (problems.length > 0) {
-    return { ok: false, servers: problems };
-  }
-
-  return { ok: true };
-}
-
 // Public routes (before auth middleware)
+/**
+ * @openapi
+ * /api/tournament/current-id:
+ *   get:
+ *     tags:
+ *       - Tournament
+ *     summary: Which tournament is current (public)
+ *     description: |
+ *       No session. The id the public pages and the top bar link to. When the
+ *       last tournament was archived it is the id the next one gets, which has
+ *       no tournament yet.
+ *     responses:
+ *       200:
+ *         description: "{ id }"
+ */
+router.get('/current-id', (_req: Request, res: Response) => {
+  return res.json({ success: true, id: resolveTournamentId() });
+});
+
+/**
+ * @openapi
+ * /api/tournament/archive:
+ *   post:
+ *     tags:
+ *       - Tournament
+ *     summary: Archive the finished tournament so a new one can be created
+ *     description: |
+ *       The tournament keeps its matches, results and stats, and its public
+ *       pages stay at its id. The next tournament gets the next id. Only a
+ *       finished tournament (`completed`) can be archived.
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: "{ archivedId, currentId }"
+ *       404:
+ *         description: No tournament
+ *       409:
+ *         description: Not finished
+ */
+router.post('/archive', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const result = await archiveCurrentTournament(resolveTournamentId(req));
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    if (error instanceof TournamentArchiveError) {
+      return res.status(error.status).json({ success: false, error: error.message });
+    }
+    log.error('Error archiving the tournament', { error });
+    return res.status(500).json({ success: false, error: 'Failed to archive the tournament' });
+  }
+});
+
 /**
  * @openapi
  * /api/tournament/{id}/leaderboard:
@@ -221,7 +120,7 @@ async function preflightServersUpToDateForTournamentStart(): Promise<
  *     tags:
  *       - Tournament
  *     summary: Get tournament leaderboard (public)
- *     description: Public endpoint to get tournament leaderboard and current round status. No authentication required.
+ *     description: Public endpoint to get tournament leaderboard and current round status. No authentication required. For Swiss tournaments `teams` is in server standings order (wins, losses, Buchholz, round differential, seed) and each entry carries `rank`, `buchholz` and `roundDiff`. Round robin `teams` is in server standings order too (wins, head-to-head, round differential, rounds won, seed) with `rank` and `roundDiff`.
  *     parameters:
  *       - in: path
  *         name: id
@@ -237,18 +136,114 @@ async function preflightServersUpToDateForTournamentStart(): Promise<
  *       500:
  *         description: Server error
  */
+/**
+ * @openapi
+ * /api/tournament/{id}/teams:
+ *   get:
+ *     tags: [Tournament]
+ *     summary: The tournament's teams with their rosters, logos and banners (public)
+ *     description: |
+ *       No session. What the tournament page's Teams tab draws: each team in
+ *       seed order with its logo and banner URLs and its players (name and
+ *       Steam picture).
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: The teams }
+ *       404: { description: Tournament not found }
+ */
+router.get('/:id/teams', async (req: Request, res: Response) => {
+  try {
+    const tournamentId = await readableTournamentId(req.params.id);
+    if (tournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
+    }
+    const row = await db.queryOneAsync<{ team_ids: string | null }>(
+      'SELECT team_ids FROM tournament WHERE id = ?',
+      [tournamentId]
+    );
+    const teamIds: string[] = row?.team_ids ? JSON.parse(row.team_ids) : [];
+    if (teamIds.length === 0) return res.json({ success: true, teams: [] });
+    const rows = await db.queryAsync<{
+      id: string;
+      name: string;
+      tag: string | null;
+      players: string | null;
+      logo_updated_at: number | null;
+      banner_updated_at: number | null;
+    }>(
+      `SELECT id, name, tag, players, logo_updated_at, banner_updated_at FROM teams WHERE id IN (${teamIds.map(() => '?').join(',')})`,
+      teamIds
+    );
+    const rosters = new Map<string, Array<{ steamId: string; name: string }>>();
+    const allIds = new Set<string>();
+    for (const team of rows) {
+      let list: Array<{ steamId?: string; steamid?: string; name?: string }> = [];
+      try {
+        list = team.players ? JSON.parse(team.players) : [];
+      } catch {
+        list = [];
+      }
+      const roster = list
+        .map((p) => ({ steamId: String(p.steamId ?? p.steamid ?? ''), name: p.name ?? '' }))
+        .filter((p) => p.steamId);
+      roster.forEach((p) => allIds.add(p.steamId));
+      rosters.set(team.id, roster);
+    }
+    const ids = [...allIds];
+    const people = ids.length
+      ? await db.queryAsync<{ id: string; name: string; avatar_url: string | null }>(
+          `SELECT id, name, avatar_url FROM players WHERE id IN (${ids.map(() => '?').join(',')})`,
+          ids
+        )
+      : [];
+    const personById = new Map(people.map((p) => [p.id, p]));
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const teams = teamIds
+      .map((id) => byId.get(id))
+      .filter((team): team is NonNullable<typeof team> => !!team)
+      .map((team) => ({
+        id: team.id,
+        name: team.name,
+        tag: team.tag,
+        logoUrl: logoUrl(team.id, team.logo_updated_at),
+        bannerUrl: bannerUrl(team.id, team.banner_updated_at),
+        players: (rosters.get(team.id) ?? []).map((p) => ({
+          steamId: p.steamId,
+          name: personById.get(p.steamId)?.name || p.name,
+          avatar: personById.get(p.steamId)?.avatar_url ?? null,
+        })),
+      }));
+    return res.json({ success: true, teams });
+  } catch (error) {
+    log.error('Error fetching tournament teams', { error });
+    return res.status(500).json({ success: false, error: 'Could not read the teams' });
+  }
+});
+
 router.get('/:id/leaderboard', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
+    // The current tournament, or an archived one (its results stay public).
+    const tournamentId = await readableTournamentId(req.params.id);
+    if (tournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
     }
 
-    const standings = await getTournamentLeaderboard();
+    const standings = await getTournamentLeaderboard(tournamentId);
+
+    // The game's own per-player numbers (CS2: rating, clutches), when it has any.
+    const integration = integrationForMatch({ game: standings.tournament.game });
+    if (integration.tournamentPlayerExtras && standings.leaderboard.length) {
+      try {
+        const extras = await integration.tournamentPlayerExtras(tournamentId);
+        standings.leaderboard = standings.leaderboard.map((p) => ({
+          ...p,
+          ...(extras[p.playerId] ?? {}),
+        }));
+      } catch (error) {
+        log.warn("Could not read the game's tournament player numbers", { error, tournamentId });
+      }
+    }
 
     return res.json({
       success: true,
@@ -270,9 +265,10 @@ router.get('/:id/leaderboard', async (req: Request, res: Response) => {
  * during veto / match wait. Returns only countdown-related fields; full
  * server-availability remains admin-only.
  */
-router.get('/allocation-status', async (_req: Request, res: Response) => {
+router.get('/allocation-status', async (req: Request, res: Response) => {
   try {
-    const status = await matchAllocationService.getAllocationStatus();
+    const tournamentId = resolveTournamentId(req);
+    const status = await scheduler.getAllocationStatus(tournamentId);
     return res.json({
       success: true,
       availableServerCount: status.availableServerCount,
@@ -288,8 +284,392 @@ router.get('/allocation-status', async (_req: Request, res: Response) => {
   }
 });
 
+/**
+ * @openapi
+ * /api/tournament/game:
+ *   get:
+ *     tags: [Tournament]
+ *     summary: Which game the current tournament is for (public)
+ *     description: |
+ *       Two fields, no session. `GET /api/tournament` is admin-only, but a
+ *       player's own profile has to know whether this instance is running a
+ *       game that measures kills and ADR or one that measures nothing, so it
+ *       can leave those columns out rather than fill them with "N/A"
+ *       (3.0 phase D, PR D10). Same split as `/allocation-status`: the one
+ *       fact a non-admin page needs, carved out of an admin-only resource.
+ *
+ *       The tournament's id comes with it, so the profile can show that
+ *       tournament's statistics in the game module's own words (for manual
+ *       reporting, the custom field totals) where CS2's columns do not apply.
+ *
+ *       Both are `null` when no tournament exists.
+ *     responses:
+ *       200:
+ *         description: The game, as `tournament.game` stores it
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean }
+ *                 game:
+ *                   type: string
+ *                   nullable: true
+ *                   example: 'rocket-league'
+ *                 tournamentId:
+ *                   type: integer
+ *                   nullable: true
+ *                   example: 1
+ */
+router.get('/game', async (req: Request, res: Response) => {
+  try {
+    const tournamentId = resolveTournamentId(req);
+    const row = await db.queryOneAsync<{ game: GameId | null }>(
+      'SELECT game FROM tournament WHERE id = ?',
+      [tournamentId]
+    );
+    return res.json({
+      success: true,
+      game: row?.game ?? null,
+      tournamentId: row ? tournamentId : null,
+    });
+  } catch (error) {
+    log.error('Error fetching the tournament game', error);
+    return res.status(500).json({ success: false, error: 'Failed to fetch the tournament game' });
+  }
+});
+
+/** When the next round is expected to open, while the tournament runs (null: nothing to say). */
+async function nextRoundEtaFor(tournamentId: number, bracket: BracketResponse) {
+  if (bracket.tournament.status !== 'in_progress') return null;
+  try {
+    const held = await db.queryAsync<{ slug: string; held_until: number }>(
+      `SELECT slug, held_until FROM matches
+        WHERE tournament_id = ? AND status IN ('pending', 'ready')
+          AND held_until > EXTRACT(EPOCH FROM NOW())::INTEGER AND held_until < ?`,
+      [tournamentId, HOLD_FOREVER]
+    );
+    return computeNextRoundEta({
+      matches: bracket.matches,
+      totalRounds: bracket.totalRounds,
+      maxRounds: bracket.tournament.maxRounds,
+      breakMinutes: breakMinutesOf(await settingsService.getSetting('at_match_break_minutes')),
+      heldUntil: Object.fromEntries(held.map((row) => [row.slug, Number(row.held_until)])),
+      nowMs: Date.now(),
+    });
+  } catch (error) {
+    log.warn('Could not estimate the next round', { error });
+    return null;
+  }
+}
+
+/**
+ * @openapi
+ * /api/tournament/{id}/bracket:
+ *   get:
+ *     tags:
+ *       - Tournament
+ *     summary: Get the tournament's bracket and matches (public)
+ *     description: |
+ *       No session. What the public tournament page's Bracket and Matches tabs
+ *       draw: every match with its round, status, teams, winner and score, the
+ *       round count, and the Swiss or round robin standings.
+ *
+ *       A read-only, allow-listed copy of the admin `GET /api/tournament/bracket`.
+ *       Each match carries only `id`, `slug`, `round`, `matchNumber`, `status`,
+ *       `nextMatchId`, the timestamps, `team1` / `team2` / `winner` (id, name,
+ *       tag), the score fields and `mapResults`. Never the game server
+ *       (`serverId`), the game module's match `config` (Steam IDs, in-game
+ *       admins, cvars) or per-player stats. The tournament object is the one
+ *       `GET /api/tournament/{id}/leaderboard` already returns.
+ *
+ *       Unlike the admin route it does not run the completion check; it only
+ *       reads.
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Tournament ID (this instance's one tournament)
+ *     responses:
+ *       200:
+ *         description: The bracket
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean }
+ *                 tournament: { type: object }
+ *                 totalRounds: { type: integer }
+ *                 matches:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id: { type: integer }
+ *                       slug: { type: string, example: 'r1m1' }
+ *                       round: { type: integer }
+ *                       matchNumber: { type: integer }
+ *                       status:
+ *                         type: string
+ *                         enum: [pending, ready, loaded, live, completed]
+ *                       nextMatchId: { type: integer, nullable: true }
+ *                       team1:
+ *                         type: object
+ *                         nullable: true
+ *                         properties:
+ *                           id: { type: string }
+ *                           name: { type: string }
+ *                           tag: { type: string }
+ *                       team2: { type: object, nullable: true }
+ *                       winner: { type: object, nullable: true }
+ *                       team1Score: { type: integer }
+ *                       team2Score: { type: integer }
+ *                       mapResults: { type: array, items: { type: object } }
+ *                 swissStandings: { type: array, items: { type: object } }
+ *                 roundRobinStandings: { type: array, items: { type: object } }
+ *       400:
+ *         description: Not this instance's tournament
+ *       404:
+ *         description: No tournament exists
+ *       500:
+ *         description: Server error
+ */
+router.get('/:id/bracket', async (req: Request, res: Response) => {
+  try {
+    const tournamentId = await readableTournamentId(req.params.id);
+    if (tournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
+    }
+
+    const bracket = await tournamentService.getBracket(tournamentId);
+    if (!bracket) {
+      return res.status(404).json({ success: false, error: 'No tournament bracket exists' });
+    }
+
+    const nextRoundEta = await nextRoundEtaFor(tournamentId, bracket);
+    return res.json({
+      success: true,
+      ...toPublicBracket(bracket),
+      ...(nextRoundEta ? { nextRoundEta } : {}),
+    });
+  } catch (error) {
+    log.error('Error fetching the public bracket', error);
+    return res.status(500).json({ success: false, error: 'Failed to fetch bracket' });
+  }
+});
+
+/**
+ * GET /api/tournament/:id/shuffle-round
+ * A shuffle tournament's current round (public, like the bracket): who plays in
+ * which match and who sits it out, so the overview can tell each player.
+ * { round, maps, finished, matches: [{ slug, status, teams: [{ name, steamIds }] }], sittingOut: steamIds }
+ */
+router.get('/:id/shuffle-round', async (req: Request, res: Response) => {
+  try {
+    const tournamentId = await readableTournamentId(req.params.id);
+    if (tournamentId === null)
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
+    const shuffle = await getShuffleTournament(tournamentId);
+    // The rounds' maps in order (one map a round), for the overview's timeline.
+    const maps = shuffle ? shuffle.mapSequence || shuffle.maps || [] : [];
+    const finished = shuffle?.status === 'completed';
+    const top = await db.queryOneAsync<{ round: number | null }>(
+      'SELECT MAX(round) AS round FROM matches WHERE tournament_id = ?',
+      [tournamentId]
+    );
+    const round = top?.round ?? null;
+    if (round === null)
+      return res.json({ success: true, round: null, maps, finished, matches: [], sittingOut: [] });
+    const rows = await db.queryAsync<{
+      slug: string;
+      status: string;
+      held_until: number | null;
+      hold_reason: string | null;
+      t1_name: string | null;
+      t1_players: string | null;
+      t2_name: string | null;
+      t2_players: string | null;
+    }>(
+      `SELECT m.slug, m.status, m.held_until, m.hold_reason, t1.name AS t1_name, t1.players AS t1_players,
+              t2.name AS t2_name, t2.players AS t2_players
+         FROM matches m
+         LEFT JOIN teams t1 ON t1.id = m.team1_id
+         LEFT JOIN teams t2 ON t2.id = m.team2_id
+        WHERE m.tournament_id = ? AND m.round = ?
+        ORDER BY m.slug`,
+      [tournamentId, round]
+    );
+    const ids = (json: string | null) =>
+      (JSON.parse(json || '[]') as Array<{ steamId: string }>).map((p) => p.steamId);
+    const matches = rows.map((r) => ({
+      slug: r.slug,
+      status: r.status,
+      teams: [
+        { name: r.t1_name, steamIds: ids(r.t1_players) },
+        { name: r.t2_name, steamIds: ids(r.t2_players) },
+      ],
+    }));
+    const playing = new Set(matches.flatMap((m) => m.teams.flatMap((t) => t.steamIds)));
+    const registered = await getRegisteredPlayers(tournamentId, { active: true });
+    const sittingOut = registered.map((p) => p.id).filter((id) => !playing.has(id));
+    // A break before this round (shuffleTournamentService holdRoundForBreak): when it ends.
+    const now = Math.floor(Date.now() / 1000);
+    const breakUntil =
+      rows
+        .filter(
+          (r) => r.held_until && Number(r.held_until) > now && /^Break/.test(r.hold_reason ?? '')
+        )
+        .reduce<number | null>((max, r) => Math.max(max ?? 0, Number(r.held_until)), null) ?? null;
+    return res.json({ success: true, round, maps, finished, matches, sittingOut, breakUntil });
+  } catch (error) {
+    log.error('Error reading the shuffle round', { error });
+    return res.status(500).json({ success: false, error: 'Could not read the round' });
+  }
+});
+
+/**
+ * GET /api/tournament/:id/pause
+ * Whether the bracket is paused (public: the bracket shows it): { pausedAt, reason, resumeAt }.
+ */
+router.get('/:id/pause', async (req: Request, res: Response) => {
+  try {
+    const tournamentId = await readableTournamentId(req.params.id);
+    if (tournamentId === null)
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
+    const row = await db.queryOneAsync<{
+      paused_at: number | null;
+      pause_reason: string | null;
+      resume_at: number | null;
+    }>('SELECT paused_at, pause_reason, resume_at FROM tournament WHERE id = ?', [tournamentId]);
+    return res.json({
+      success: true,
+      pausedAt: row?.paused_at ?? null,
+      reason: row?.pause_reason ?? null,
+      resumeAt: row?.resume_at ?? null,
+    });
+  } catch (error) {
+    log.error('Error reading the tournament pause', { error });
+    return res.status(500).json({ success: false, error: 'Could not read the pause' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/tournament/{id}/banner:
+ *   get:
+ *     tags:
+ *       - Tournament
+ *     summary: The tournament page's banner image (public)
+ *     description: |
+ *       No session. The wide image behind the tournament page header, as the
+ *       PNG, JPEG or WEBP the admin uploaded. The tournament's `bannerUrl`
+ *       carries a version (`?v=`), so the response is cached for good.
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: The image
+ *       404:
+ *         description: No banner
+ */
+router.get('/:id/banner', async (req: Request, res: Response) => {
+  try {
+    const tournamentId = await readableTournamentId(req.params.id);
+    if (tournamentId === null) return res.status(404).end();
+    const banner = await tournamentBannerService.get(tournamentId);
+    if (!banner) return res.status(404).end();
+    res.setHeader('Content-Type', banner.type);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    return res.send(banner.data);
+  } catch (error) {
+    log.error('Error reading the tournament banner', { error });
+    return res.status(500).end();
+  }
+});
+
 // Protect all routes
 router.use(requireAuth);
+
+/**
+ * @openapi
+ * /api/tournament/banner:
+ *   put:
+ *     tags:
+ *       - Tournament
+ *     summary: Set the tournament page's banner
+ *     description: The request body is the image itself (PNG, JPEG or WEBP, at most 2 MB).
+ *     security:
+ *       - BearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         image/png: {}
+ *         image/jpeg: {}
+ *         image/webp: {}
+ *     responses:
+ *       200:
+ *         description: Stored; `bannerUrl` is the new address
+ *       404:
+ *         description: No tournament exists
+ *       413:
+ *         description: Larger than 2 MB
+ *       415:
+ *         description: Not a PNG, JPEG or WEBP image
+ *   delete:
+ *     tags:
+ *       - Tournament
+ *     summary: Remove the tournament page's banner
+ *     security:
+ *       - BearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Removed
+ */
+router.put(
+  '/banner',
+  express.raw({ type: ['image/png', 'image/jpeg', 'image/webp'], limit: BANNER_MAX_BYTES }),
+  async (req: Request, res: Response) => {
+    const tournamentId = resolveTournamentId(req);
+    await bannerAction(res, tournamentId, async () => {
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        throw new BannerError(415, 'Send the banner as a PNG, JPEG or WEBP image.');
+      }
+      await tournamentBannerService.set(tournamentId, req.body);
+    });
+  }
+);
+router.delete('/banner', async (req: Request, res: Response) => {
+  const tournamentId = resolveTournamentId(req);
+  await bannerAction(res, tournamentId, () => tournamentBannerService.set(tournamentId, null));
+});
+
+async function bannerAction(
+  res: Response,
+  tournamentId: number,
+  run: () => Promise<void>
+): Promise<void> {
+  try {
+    await run();
+    const tournament = await tournamentService.getTournament(tournamentId);
+    if (tournament) emitTournamentUpdate({ action: 'tournament_updated', ...tournament });
+    res.json({ success: true, bannerUrl: tournament?.bannerUrl ?? null });
+  } catch (error) {
+    if (error instanceof BannerError) {
+      res.status(error.status).json({ success: false, error: error.message });
+      return;
+    }
+    log.error('Error saving the tournament banner', { error });
+    res.status(500).json({ success: false, error: 'Failed to save the banner' });
+  }
+}
 
 /**
  * @openapi
@@ -307,9 +687,10 @@ router.use(requireAuth);
  *       404:
  *         description: No tournament exists
  */
-router.get('/', async (_req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   try {
-    const tournament = await tournamentService.getTournament();
+    const tournamentId = resolveTournamentId(req);
+    const tournament = await tournamentService.getTournament(tournamentId);
 
     if (!tournament) {
       return res.status(404).json({
@@ -318,17 +699,17 @@ router.get('/', async (_req: Request, res: Response) => {
       });
     }
 
-    log.info(`[TOURNAMENT API] GET /api/tournament - Current status: ${tournament.status}`);
+    log.debug(`[TOURNAMENT API] GET /api/tournament - Current status: ${tournament.status}`);
 
     // Automatically check if tournament should be marked as completed
     // This ensures the status is always up-to-date when fetched
     if (tournament.status === 'in_progress') {
-      log.info(`[TOURNAMENT API] Tournament is in_progress, checking completion...`);
+      log.debug(`[TOURNAMENT API] Tournament is in_progress, checking completion...`);
       await checkTournamentCompletion(tournament.id);
       // Re-fetch tournament to get updated status
-      const updatedTournament = await tournamentService.getTournament();
+      const updatedTournament = await tournamentService.getTournament(tournamentId);
       if (updatedTournament) {
-        log.info(`[TOURNAMENT API] After completion check - Status: ${updatedTournament.status}`);
+        log.debug(`[TOURNAMENT API] After completion check - Status: ${updatedTournament.status}`);
         return res.json({
           success: true,
           tournament: updatedTournament,
@@ -379,6 +760,17 @@ router.get('/', async (_req: Request, res: Response) => {
  *                 type: string
  *                 enum: [single_elimination, double_elimination, round_robin, swiss]
  *                 example: "single_elimination"
+ *               game:
+ *                 type: string
+ *                 description: |
+ *                   The game to run, as a catalogue slug from
+ *                   `/api/games/playable` ("rocket-league") or an installed
+ *                   module's id ("cs2"). Omitted, the tournament is CS2, the
+ *                   `game` column default. A game this instance does not know
+ *                   is a 400; the module that runs it then decides what the
+ *                   rest of the body must contain (CS2 wants maps, manual
+ *                   reporting does not).
+ *                 example: "rocket-league"
  *               format:
  *                 type: string
  *                 enum: [bo1, bo3, bo5]
@@ -405,39 +797,353 @@ router.get('/', async (_req: Request, res: Response) => {
  *                   seedingMethod:
  *                     type: string
  *                     enum: [random, manual]
+ *                   description:
+ *                     type: string
+ *                     maxLength: 4000
+ *                     description: Organizer-written event page text (public Overview tab).
+ *                   location:
+ *                     type: string
+ *                     maxLength: 120
+ *                     example: "On site, Trondheim"
+ *                   rules:
+ *                     type: array
+ *                     maxItems: 20
+ *                     items:
+ *                       type: string
+ *                       maxLength: 500
+ *                   rulebookUrl:
+ *                     type: string
+ *                     format: uri
+ *                     description: Must be an https URL, or empty/omitted.
+ *                   prizes:
+ *                     type: array
+ *                     maxItems: 5
+ *                     items:
+ *                       type: object
+ *                       properties:
+ *                         place:
+ *                           type: string
+ *                           example: "1st"
+ *                         prize:
+ *                           type: string
+ *                           example: "$500"
+ *                   schedule:
+ *                     type: array
+ *                     maxItems: 20
+ *                     items:
+ *                       type: object
+ *                       properties:
+ *                         at:
+ *                           type: string
+ *                           format: date-time
+ *                         label:
+ *                           type: string
+ *                           example: "Grand final, on stage"
  *     responses:
  *       200:
  *         description: Tournament created successfully
  *       400:
  *         description: Invalid input
  */
+
+/**
+ * Validate a tournament request's game fields through its integration (CS2:
+ * the map pool, the shuffle map sequence and max rounds, and the optional
+ * `settings.customVetoOrder`). The lists are always present; the caller
+ * reports them in the order `TournamentSettingsValidation` describes.
+ */
+function validateGameSettings(
+  game: GameId | null | undefined,
+  input: TournamentSettingsInput
+): Required<Omit<TournamentSettingsValidation, 'valid'>> {
+  const result = integrationForMatch({ game }).validateTournamentSettings?.(input);
+  return {
+    errors: result?.errors ?? [],
+    missingFields: result?.missingFields ?? [],
+    fieldErrors: result?.fieldErrors ?? [],
+    requiredFields: result?.requiredFields ?? [],
+  };
+}
+
+/**
+ * Validate a tournament's optional event-page settings (the public "Overview"
+ * tab's organizer-written content): `description`, `location`, `rules`,
+ * `rulebookUrl`, `prizes`, `schedule`.
+ *
+ * All fields are optional; the page hides a section when its data is empty.
+ * Length caps here are what keep an organizer's paste from blowing up the
+ * page (or the settings JSON column) rather than a hard product limit.
+ */
+function validateEventPageSettings(
+  settings: Untrusted
+): { valid: true } | { valid: false; error: string } {
+  if (!settings || typeof settings !== 'object') {
+    return { valid: true };
+  }
+
+  const s = settings as Record<string, Untrusted>;
+
+  // Sign-up and check-in (tournament sign-up): a switch, a team cap and three times.
+  if (s.registrationOpen !== undefined && typeof s.registrationOpen !== 'boolean') {
+    return { valid: false, error: 'settings.registrationOpen must be true or false' };
+  }
+  if (s.maxTeams !== undefined && s.maxTeams !== null) {
+    if (
+      typeof s.maxTeams !== 'number' ||
+      !Number.isInteger(s.maxTeams) ||
+      s.maxTeams < 2 ||
+      s.maxTeams > 256
+    ) {
+      return { valid: false, error: 'settings.maxTeams must be a whole number from 2 to 256' };
+    }
+  }
+  // Groups, then playoffs (services/groupsTournament.ts): its settings, the team count at start.
+  for (const key of ['groupCount', 'advancePerGroup'] as const) {
+    if (s[key] !== undefined && ![1, 2, 3, 4].includes(Number(s[key]))) {
+      return { valid: false, error: `settings.${key} is out of range` };
+    }
+  }
+  // Match times (services/matchTimes.ts): round start times, the veto lead, the reminder.
+  const timesError = matchTimesError(s.matchTimes);
+  if (timesError) return { valid: false, error: timesError };
+  // The start time: reminders before it and, with autoStart, the start (services/tournamentSchedule.ts).
+  if (s.autoStart !== undefined && typeof s.autoStart !== 'boolean') {
+    return { valid: false, error: 'settings.autoStart must be true or false' };
+  }
+  if (s.startReminders !== undefined && s.startReminders !== null) {
+    const r = s.startReminders;
+    if (
+      !Array.isArray(r) ||
+      r.length > 6 ||
+      r.some((m) => typeof m !== 'number' || !Number.isInteger(m) || m < 1 || m > 10080)
+    ) {
+      return {
+        valid: false,
+        error: 'settings.startReminders must be up to 6 whole numbers of minutes (1 to 10080)',
+      };
+    }
+  }
+  if (s.autoStart === true && (typeof s.startsAt !== 'string' || !s.startsAt)) {
+    return { valid: false, error: 'settings.autoStart needs settings.startsAt' };
+  }
+  for (const key of [
+    'registrationClosesAt',
+    'checkInOpensAt',
+    'checkInClosesAt',
+    'startsAt',
+  ] as const) {
+    const value = s[key];
+    if (value === undefined || value === null || value === '') continue;
+    if (typeof value !== 'string' || Number.isNaN(new Date(value).getTime())) {
+      return { valid: false, error: `settings.${key} must be a date and time` };
+    }
+  }
+
+  if (s.description !== undefined && s.description !== null) {
+    if (typeof s.description !== 'string') {
+      return { valid: false, error: 'settings.description must be a string' };
+    }
+    if (s.description.length > 4000) {
+      return { valid: false, error: 'settings.description must be at most 4000 characters' };
+    }
+  }
+
+  if (s.location !== undefined && s.location !== null) {
+    if (typeof s.location !== 'string') {
+      return { valid: false, error: 'settings.location must be a string' };
+    }
+    if (s.location.length > 120) {
+      return { valid: false, error: 'settings.location must be at most 120 characters' };
+    }
+  }
+
+  if (s.organizer !== undefined && s.organizer !== null) {
+    if (typeof s.organizer !== 'string') {
+      return { valid: false, error: 'settings.organizer must be a string' };
+    }
+    if (s.organizer.length > 80) {
+      return { valid: false, error: 'settings.organizer must be at most 80 characters' };
+    }
+  }
+
+  if (s.rules !== undefined && s.rules !== null) {
+    if (!Array.isArray(s.rules)) {
+      return { valid: false, error: 'settings.rules must be an array of strings' };
+    }
+    if (s.rules.length > 20) {
+      return { valid: false, error: 'settings.rules must have at most 20 items' };
+    }
+    for (const rule of s.rules) {
+      if (typeof rule !== 'string') {
+        return { valid: false, error: 'settings.rules items must be strings' };
+      }
+      if (rule.length > 500) {
+        return { valid: false, error: 'settings.rules items must be at most 500 characters' };
+      }
+    }
+  }
+
+  if (s.rulebookUrl !== undefined && s.rulebookUrl !== null && s.rulebookUrl !== '') {
+    if (typeof s.rulebookUrl !== 'string') {
+      return { valid: false, error: 'settings.rulebookUrl must be a string' };
+    }
+    try {
+      const url = new URL(s.rulebookUrl);
+      if (url.protocol !== 'https:') {
+        return { valid: false, error: 'settings.rulebookUrl must be an https URL' };
+      }
+    } catch {
+      return { valid: false, error: 'settings.rulebookUrl must be a valid https URL' };
+    }
+  }
+
+  if (s.prizes !== undefined && s.prizes !== null) {
+    if (!Array.isArray(s.prizes)) {
+      return { valid: false, error: 'settings.prizes must be an array' };
+    }
+    if (s.prizes.length > 5) {
+      return { valid: false, error: 'settings.prizes must have at most 5 items' };
+    }
+    for (const prize of s.prizes) {
+      if (!prize || typeof prize !== 'object') {
+        return {
+          valid: false,
+          error: 'settings.prizes items must be objects with place and prize',
+        };
+      }
+      const p = prize as Record<string, Untrusted>;
+      if (typeof p.place !== 'string' || p.place.length === 0 || p.place.length > 40) {
+        return { valid: false, error: 'settings.prizes items need a place (1-40 characters)' };
+      }
+      if (typeof p.prize !== 'string' || p.prize.length > 200) {
+        return {
+          valid: false,
+          error: 'settings.prizes items need a prize string (0-200 characters)',
+        };
+      }
+    }
+  }
+
+  if (s.schedule !== undefined && s.schedule !== null) {
+    if (!Array.isArray(s.schedule)) {
+      return { valid: false, error: 'settings.schedule must be an array' };
+    }
+    if (s.schedule.length > 20) {
+      return { valid: false, error: 'settings.schedule must have at most 20 items' };
+    }
+    for (const item of s.schedule) {
+      if (!item || typeof item !== 'object') {
+        return { valid: false, error: 'settings.schedule items must be objects with at and label' };
+      }
+      const row = item as Record<string, Untrusted>;
+      if (typeof row.at !== 'string' || Number.isNaN(new Date(row.at).getTime())) {
+        return { valid: false, error: 'settings.schedule items need a valid ISO datetime "at"' };
+      }
+      if (typeof row.label !== 'string' || row.label.length === 0 || row.label.length > 200) {
+        return { valid: false, error: 'settings.schedule items need a label (1-200 characters)' };
+      }
+    }
+  }
+
+  return { valid: true };
+}
+
 router.post('/', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     const input: CreateTournamentInput = req.body;
 
+    // The game the organizer picked, as a value the `game` column may hold.
+    // Absent means CS2 (the column default), which is what every tournament
+    // created before 3.0 phase D was.
+    let game: GameId | null = null;
+    if (input?.game !== undefined && input.game !== null && input.game !== '') {
+      if (typeof input.game !== 'string') {
+        return res.status(400).json({ success: false, error: 'game must be a string' });
+      }
+      game = await resolveGameRef(input.game);
+      if (!game) {
+        return res.status(400).json({
+          success: false,
+          error: `Unknown game '${input.game}'; use a slug from /api/games/playable`,
+        });
+      }
+    }
+
+    // 2v2 and 1v1 are short: no map veto unless the request asks for one (each match
+    // draws its map from the pool), as the setup page's wingman preset does.
+    const smallTeams = Number((input as { teamSize?: Untrusted }).teamSize);
+    const cs2Input = (input?.settings as { cs2?: Record<string, Untrusted> } | undefined)?.cs2;
+    if (cs2Input && smallTeams > 0 && smallTeams <= 2 && typeof cs2Input.veto !== 'boolean') {
+      cs2Input.veto = false;
+    }
+
+    // What the request must carry is the picked game's module's business: CS2
+    // wants a map pool, manual reporting wants none.
+    const gameCheck = validateGameSettings(game, {
+      mode: 'create',
+      // `?.`: a missing body still fails on `input.name` below, as before.
+      settings: input?.settings,
+      body: { ...input },
+    });
+
     // Validate input
-    if (!input.name || !input.type || !input.format || !input.maps || !input.teamIds) {
+    if (
+      !input.name ||
+      !input.type ||
+      !input.format ||
+      gameCheck.missingFields.length > 0 ||
+      !input.teamIds
+    ) {
+      const required = ['name', 'type', 'format', ...gameCheck.requiredFields, 'teamIds'];
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: name, type, format, maps, teamIds',
+        error: `Missing required fields: ${required.join(', ')}`,
       });
     }
 
-    if (input.maps.length === 0) {
+    if (gameCheck.fieldErrors.length > 0) {
       return res.status(400).json({
         success: false,
-        error: 'At least one map is required',
+        error: gameCheck.fieldErrors[0],
       });
     }
 
-    if (input.teamIds.length < 2) {
+    // With sign-up open the teams arrive later; the count is checked at start.
+    const signupOpen =
+      (input.settings as { registrationOpen?: Untrusted } | undefined)?.registrationOpen === true;
+    // A draft made from the tournament list (POST /api/tournaments) may start
+    // with no teams; they are picked, or sign up, before it starts.
+    const draft =
+      (req as Request & { atDraft?: boolean }).atDraft === true &&
+      (input.teamIds?.length ?? 0) === 0;
+    // A shuffle has no teams: its players are drawn into teams each round.
+    if (input.teamIds.length < 2 && !signupOpen && !draft && input.type !== 'shuffle') {
       return res.status(400).json({
         success: false,
         error: 'At least 2 teams are required',
       });
     }
 
-    const tournament = await tournamentService.createTournament(input);
+    if (gameCheck.errors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: gameCheck.errors[0],
+      });
+    }
+
+    const eventPageCheck = validateEventPageSettings(input.settings);
+    if (!eventPageCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        error: eventPageCheck.error,
+      });
+    }
+
+    const tournament = await tournamentService.createTournament(tournamentId, input, {
+      ...(game ? { game } : {}),
+      ...(draft ? { draft: true } : {}),
+    });
 
     return res.json({
       success: true,
@@ -470,6 +1176,47 @@ router.post('/', async (req: Request, res: Response) => {
  *         application/json:
  *           schema:
  *             type: object
+ *             properties:
+ *               settings:
+ *                 type: object
+ *                 description: Merged with the tournament's existing settings.
+ *                 properties:
+ *                   description:
+ *                     type: string
+ *                     maxLength: 4000
+ *                   location:
+ *                     type: string
+ *                     maxLength: 120
+ *                   rules:
+ *                     type: array
+ *                     maxItems: 20
+ *                     items:
+ *                       type: string
+ *                       maxLength: 500
+ *                   rulebookUrl:
+ *                     type: string
+ *                     format: uri
+ *                   prizes:
+ *                     type: array
+ *                     maxItems: 5
+ *                     items:
+ *                       type: object
+ *                       properties:
+ *                         place:
+ *                           type: string
+ *                         prize:
+ *                           type: string
+ *                   schedule:
+ *                     type: array
+ *                     maxItems: 20
+ *                     items:
+ *                       type: object
+ *                       properties:
+ *                         at:
+ *                           type: string
+ *                           format: date-time
+ *                         label:
+ *                           type: string
  *     responses:
  *       200:
  *         description: Tournament updated successfully
@@ -478,8 +1225,46 @@ router.post('/', async (req: Request, res: Response) => {
  */
 router.put('/', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     const input: UpdateTournamentInput = req.body;
-    const tournament = await tournamentService.updateTournament(input);
+
+    if (input.settings) {
+      // The stored row lets the integration fall back to the stored values
+      // the update leaves alone (CS2: the map pool the veto order runs on).
+      const existing = await db.queryOneAsync<DbTournamentRow>(
+        'SELECT * FROM tournament WHERE id = ?',
+        [tournamentId]
+      );
+      const gameCheck = validateGameSettings(existing?.game, {
+        mode: 'update',
+        settings: input.settings,
+        body: input as Record<string, Untrusted>,
+        stored: existing ?? null,
+      });
+      const gameError = [...gameCheck.fieldErrors, ...gameCheck.errors][0];
+      if (gameError) {
+        return res.status(400).json({
+          success: false,
+          error: gameError,
+        });
+      }
+
+      const eventPageCheck = validateEventPageSettings(input.settings);
+      if (!eventPageCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          error: eventPageCheck.error,
+        });
+      }
+    }
+
+    const tournament = await tournamentService.updateTournament(tournamentId, input);
+    // New match times move the holds of the matches that have not begun.
+    if (input.settings && 'matchTimes' in (input.settings as Record<string, Untrusted>)) {
+      await applyMatchTimes(tournamentId).catch((error) =>
+        log.warn('[MATCH-TIMES] could not apply the new times', { error })
+      );
+    }
 
     // Emit updates to all clients
     emitTournamentUpdate({ action: 'tournament_updated', ...tournament });
@@ -507,24 +1292,33 @@ router.put('/', async (req: Request, res: Response) => {
  *     tags:
  *       - Tournament
  *     summary: Delete tournament
- *     description: Ends all matches on servers and deletes the current tournament and all associated data
+ *     description: |
+ *       Ends all matches on servers and deletes the tournament and its data.
+ *       With `keepPlayed=1` its finished matches stay (with stats and demos),
+ *       listed under /api/matches/played with the tournament's name.
  *     security:
  *       - BearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: keepPlayed
+ *         schema: { type: string, enum: ['1'] }
  *     responses:
  *       200:
  *         description: Tournament deleted successfully
  */
-router.delete('/', async (_req: Request, res: Response) => {
+router.delete('/', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     log.info('Deleting tournament...');
 
     // First, end all matches on servers (same as reset)
     const loadedMatches = await db.queryAsync<DbMatchRow>(
       `SELECT * FROM matches 
-       WHERE tournament_id = 1 
+       WHERE tournament_id = ? 
        AND status IN ('loaded', 'live')
        AND server_id IS NOT NULL 
-       AND server_id != ''`
+       AND server_id != ''`,
+      [tournamentId]
     );
 
     let matchesEnded = 0;
@@ -533,39 +1327,20 @@ router.delete('/', async (_req: Request, res: Response) => {
     if (loadedMatches.length > 0) {
       log.info(`Ending ${loadedMatches.length} active match(es) on servers before deletion...`);
 
-      const serverIds = new Set<string>();
-      for (const match of loadedMatches) {
-        if (match.server_id) {
-          serverIds.add(match.server_id);
-        }
-      }
-
-      for (const serverId of serverIds) {
-        try {
-          log.info(`Ending match on server: ${serverId}`);
-          const result = await rconService.sendCommand(serverId, 'css_restart');
-
-          if (result.success) {
-            log.success(`Match ended on server ${serverId}`);
-            matchesEnded++;
-          } else {
-            log.error(`Failed to end match on server ${serverId}`, undefined, {
-              error: result.error,
-            });
-            matchesEndedFailed++;
-          }
-        } catch (error) {
-          log.error(`Error ending match on server ${serverId}`, error);
-          matchesEndedFailed++;
-        }
-      }
+      const outcome = await scheduler.endMatchesOnResources(loadedMatches, {
+        reason: 'tournament-delete',
+      });
+      matchesEnded = outcome.ended;
+      matchesEndedFailed = outcome.failed;
 
       // Wait a moment for servers to clean up
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
 
-    // Now delete the tournament (will also delete matches via CASCADE)
-    await tournamentService.deleteTournament();
+    // Now delete the tournament (will also delete matches via CASCADE). The
+    // admin UI asks to keep the played ones (?keepPlayed=1).
+    const keepPlayed = req.query.keepPlayed === '1' || req.query.keepPlayed === 'true';
+    await tournamentService.deleteTournament(tournamentId, { keepPlayed });
 
     log.success(`Tournament deleted successfully. ${matchesEnded} match(es) ended on servers.`);
 
@@ -597,7 +1372,7 @@ router.delete('/', async (_req: Request, res: Response) => {
  *     tags:
  *       - Tournament
  *     summary: Get tournament bracket
- *     description: Returns the tournament bracket with all matches
+ *     description: Returns the tournament bracket with all matches. Swiss tournaments also get `swissStandings` - the standings the round pairing uses (wins, losses, Buchholz, round differential, then seed), best first. Round robin tournaments get `roundRobinStandings` (wins, head-to-head, round differential, rounds won, then seed), best first; the top team is the champion.
  *     security:
  *       - BearerAuth: []
  *     responses:
@@ -606,16 +1381,17 @@ router.delete('/', async (_req: Request, res: Response) => {
  *       404:
  *         description: No tournament exists
  */
-router.get('/bracket', async (_req: Request, res: Response) => {
+router.get('/bracket', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     // Automatically check if tournament should be marked as completed
     // This ensures the status is always up-to-date when bracket is fetched
-    const tournament = await tournamentService.getTournament();
+    const tournament = await tournamentService.getTournament(tournamentId);
     if (tournament && tournament.status === 'in_progress') {
       await checkTournamentCompletion(tournament.id);
     }
 
-    const bracket = await tournamentService.getBracket();
+    const bracket = await tournamentService.getBracket(tournamentId);
 
     if (!bracket) {
       return res.status(404).json({
@@ -664,8 +1440,9 @@ router.get('/bracket', async (_req: Request, res: Response) => {
  */
 router.post('/bracket/regenerate', requireAuth, async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     const { force } = req.body;
-    const bracket = await tournamentService.regenerateBracket(force === true);
+    const bracket = await tournamentService.regenerateBracket(tournamentId, force === true);
 
     // Emit updates to all clients
     emitBracketUpdate({ action: 'bracket_regenerated' });
@@ -700,17 +1477,19 @@ router.post('/bracket/regenerate', requireAuth, async (req: Request, res: Respon
  *       200:
  *         description: Tournament reset successfully
  */
-router.post('/reset', requireAuth, async (_req: Request, res: Response) => {
+router.post('/reset', requireAuth, async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     log.info('Resetting tournament to setup mode...');
 
     // First, end all matches on servers
     const loadedMatches = await db.queryAsync<DbMatchRow>(
       `SELECT * FROM matches 
-       WHERE tournament_id = 1 
+       WHERE tournament_id = ? 
        AND status IN ('loaded', 'live')
        AND server_id IS NOT NULL 
-       AND server_id != ''`
+       AND server_id != ''`,
+      [tournamentId]
     );
 
     let matchesEnded = 0;
@@ -719,39 +1498,18 @@ router.post('/reset', requireAuth, async (_req: Request, res: Response) => {
     if (loadedMatches.length > 0) {
       log.info(`Ending ${loadedMatches.length} active match(es) on servers...`);
 
-      const serverIds = new Set<string>();
-      for (const match of loadedMatches) {
-        if (match.server_id) {
-          serverIds.add(match.server_id);
-        }
-      }
-
-      for (const serverId of serverIds) {
-        try {
-          log.info(`Ending match on server: ${serverId}`);
-          const result = await rconService.sendCommand(serverId, 'css_restart');
-
-          if (result.success) {
-            log.success(`Match ended on server ${serverId}`);
-            matchesEnded++;
-          } else {
-            log.error(`Failed to end match on server ${serverId}`, undefined, {
-              error: result.error,
-            });
-            matchesEndedFailed++;
-          }
-        } catch (error) {
-          log.error(`Error ending match on server ${serverId}`, error);
-          matchesEndedFailed++;
-        }
-      }
+      const outcome = await scheduler.endMatchesOnResources(loadedMatches, {
+        reason: 'tournament-reset',
+      });
+      matchesEnded = outcome.ended;
+      matchesEndedFailed = outcome.failed;
 
       // Wait a moment for servers to clean up
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
 
     // Now reset the tournament in the database
-    const tournament = await tournamentService.resetTournament();
+    const tournament = await tournamentService.resetTournament(tournamentId);
 
     log.success(`Tournament reset to setup mode. ${matchesEnded} match(es) ended on servers.`);
 
@@ -812,9 +1570,10 @@ router.post('/reset', requireAuth, async (_req: Request, res: Response) => {
  *       200:
  *         description: Server availability retrieved successfully
  */
-router.get('/server-availability', requireAuth, async (_req: Request, res: Response) => {
+router.get('/server-availability', requireAuth, async (req: Request, res: Response) => {
   try {
-    const status = await matchAllocationService.getAllocationStatus();
+    const tournamentId = resolveTournamentId(req);
+    const status = await scheduler.getAllocationStatus(tournamentId);
     const simulationEnabled = await settingsService.isSimulationModeEnabled();
 
     return res.json({
@@ -823,6 +1582,7 @@ router.get('/server-availability', requireAuth, async (_req: Request, res: Respo
       gracePeriodSeconds: status.gracePeriodSeconds,
       nextAllocationInSeconds: status.nextAllocationInSeconds,
       requiredServerCount: status.requiredServerCount,
+      startableServerCount: status.startableServerCount,
       servers: status.servers,
       simulationEnabled,
     });
@@ -835,14 +1595,58 @@ router.get('/server-availability', requireAuth, async (_req: Request, res: Respo
   }
 });
 
+/**
+ * POST /api/tournament/pause
+ * Pause the bracket (authenticated): { minutes?: number (until resumed
+ * without), reason?: string }. Matches being played finish; no new match is
+ * loaded or auto-started, and the walkover clocks are off.
+ */
+router.post('/pause', requireAuth, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { minutes?: Untrusted; reason?: Untrusted };
+  const minutes = body.minutes === undefined || body.minutes === null ? null : Number(body.minutes);
+  if (minutes !== null && !(Number.isFinite(minutes) && minutes > 0 && minutes <= 24 * 60)) {
+    return res
+      .status(400)
+      .json({ success: false, error: 'minutes: 1 to 1440, or none until resumed' });
+  }
+  const id = requestActorId(req) ?? 'admin';
+  try {
+    await pauseTournament(
+      resolveTournamentId(req),
+      { minutes, reason: typeof body.reason === 'string' ? body.reason : null },
+      { userId: id, name: id }
+    );
+    return res.json({ success: true });
+  } catch (error) {
+    log.error('Error pausing the tournament', error);
+    return res.status(500).json({ success: false, error: 'Could not pause the tournament' });
+  }
+});
+
+/**
+ * POST /api/tournament/resume
+ * Resume a paused bracket (authenticated): waiting matches go ahead, their countdowns afresh.
+ */
+router.post('/resume', requireAuth, async (req: Request, res: Response) => {
+  const id = requestActorId(req) ?? 'admin';
+  try {
+    await resumeTournament(resolveTournamentId(req), { userId: id, name: id });
+    return res.json({ success: true });
+  } catch (error) {
+    log.error('Error resuming the tournament', error);
+    return res.status(500).json({ success: false, error: 'Could not resume the tournament' });
+  }
+});
+
 router.post('/start', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { enableSimulation } = (req.body ?? {}) as { enableSimulation?: unknown };
+    const tournamentId = resolveTournamentId(req);
+    const { enableSimulation } = (req.body ?? {}) as { enableSimulation?: Untrusted };
 
     // Optional one-shot toggle to enable simulation mode at the moment the
     // tournament is started (dev-only safety; ignored in production unless explicitly enabled).
     const simulationAllowedInProd =
-      process.env.MATCHZY_ENABLE_SIMULATION_IN_PROD?.toLowerCase() === 'true';
+      process.env.AT_ENABLE_SIMULATION_IN_PROD?.toLowerCase() === 'true';
     if (
       enableSimulation === true &&
       (process.env.NODE_ENV !== 'production' || simulationAllowedInProd)
@@ -858,24 +1662,43 @@ router.post('/start', requireAuth, async (req: Request, res: Response) => {
       }
     }
 
+    // Teams that signed themselves up were never counted on the way in: the
+    // bracket needs a count its format can draw.
+    const toStart = await tournamentService.getTournament(tournamentId);
+    if (toStart && toStart.type !== 'shuffle') {
+      try {
+        validateTeamCount(toStart.type, toStart.teamIds.length);
+        if (toStart.type === 'groups') {
+          const { groupsError } = await import('../services/groupsTournament');
+          const problem = groupsError(toStart.settings, toStart.teamIds.length);
+          if (problem) throw new Error(problem);
+        }
+      } catch (countError) {
+        return res.status(400).json({
+          success: false,
+          errorCode: 'team_count',
+          message: countError instanceof Error ? countError.message : String(countError),
+        });
+      }
+    }
+
     // One last preflight: verify enabled servers are up to date (RCON BuildID + Steam UpToDateCheck).
-    const preflight = await preflightServersUpToDateForTournamentStart();
+    const preflight = await scheduler.checkStart(tournamentId);
     if (!preflight.ok) {
       return res.status(409).json({
         success: false,
-        errorCode: 'cs2_outdated_servers',
-        message:
-          'One or more enabled servers are out of date (or could not be verified). Update or disable the affected servers before starting the tournament.',
-        servers: preflight.servers,
+        errorCode: preflight.errorCode,
+        message: preflight.message,
+        ...preflight.details,
       });
     }
 
     // Get base URL for webhook configuration
-    // Proactively configure MatchZy webhooks for all enabled servers using the
+    // Proactively configure MatchZy Enhanced webhooks for all enabled servers using the
     // latest settings so that allocator connectivity checks (css_te events)
     // succeed without requiring a manual visit to the Servers page.
     try {
-      await bootstrapServerWebhooksForTournamentStart();
+      await scheduler.prepareStart(tournamentId);
     } catch (err) {
       log.warn(
         'Failed to bootstrap server webhooks during tournament start; continuing with allocation.',
@@ -889,7 +1712,7 @@ router.post('/start', requireAuth, async (req: Request, res: Response) => {
     // task has finished. This ensures tests and UIs consistently see the
     // tournament as non‑setup as soon as start is requested.
     try {
-      const tournament = await tournamentService.getTournament();
+      const tournament = await tournamentService.getTournament(tournamentId);
       if (
         tournament &&
         tournament.type === 'shuffle' &&
@@ -903,7 +1726,7 @@ router.post('/start', requireAuth, async (req: Request, res: Response) => {
             updated_at: Math.floor(Date.now() / 1000),
           },
           'id = ?',
-          [1]
+          [tournamentId]
         );
       }
     } catch (err) {
@@ -916,12 +1739,18 @@ router.post('/start', requireAuth, async (req: Request, res: Response) => {
     // Kick off tournament start + server allocation in the background so the
     // HTTP request can return immediately and the UI doesn't sit in a pending
     // state while RCON/webhook calls are in flight.
-    const baseUrl = await getWebhookBaseUrl(req);
+    //
+    // The integration says what its resources need to reach us on. CS2 asks
+    // for the webhook URL from Settings and rejects when it is unset, which
+    // fails the start (500) with that message; a game with no servers needs
+    // nothing and starts without one.
+    const baseUrl = await scheduler.resolveBaseUrl(tournamentId);
     void (async () => {
       try {
-        const result = await matchAllocationService.startTournament(baseUrl);
+        const result = await scheduler.startTournament(tournamentId, baseUrl);
 
         if (result.success) {
+          void noticeTournamentStarted(tournamentId);
           log.success(result.message, {
             allocated: result.allocated,
             failed: result.failed,
@@ -948,9 +1777,23 @@ router.post('/start', requireAuth, async (req: Request, res: Response) => {
 
     // Respond immediately so the frontend can update UI state without waiting
     // for all allocations / RCON calls to complete.
+    // A paid license with fewer servers than round one needs: say so (matches wait for a free server).
+    const licenseNote = await (async () => {
+      try {
+        const standing = await licenseService.standing();
+        const needed = Math.ceil((toStart?.teamIds.length ?? 0) / 2);
+        if (!standing.paid || standing.maxServers === null || needed <= standing.maxServers)
+          return null;
+        return `Round one has ${needed} matches, but your license covers ${standing.maxServers} servers: the rest wait for a free server. Add servers in the console to run them all at once.`;
+      } catch {
+        return null;
+      }
+    })();
+
     return res.json({
       success: true,
       message: 'Tournament start requested. Servers will be allocated shortly.',
+      ...(licenseNote ? { licenseNote } : {}),
     });
   } catch (error) {
     log.error('Error starting tournament', error as Error);
@@ -980,12 +1823,55 @@ router.post('/start', requireAuth, async (req: Request, res: Response) => {
  *       404:
  *         description: No tournament exists
  */
+/**
+ * @openapi
+ * /api/tournament/cancel:
+ *   post:
+ *     tags: [Tournament]
+ *     summary: End a running tournament without a result
+ *     description: |
+ *       Ends the matches on their servers, cancels every match not finished
+ *       and marks the tournament `cancelled` (no winner, no placement
+ *       rewards). It can be archived afterwards. `confirm` must be the
+ *       tournament's name.
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema: { type: object, properties: { confirm: { type: string } } }
+ *     responses:
+ *       200: { description: "{ ended, cancelled }" }
+ *       400: { description: The name does not match }
+ *       409: { description: Not running }
+ */
+router.post('/cancel', requireAuth, async (req: Request, res: Response) => {
+  const tournamentId = resolveTournamentId(req);
+  try {
+    const tournament = await tournamentService.getTournament(tournamentId);
+    if (!tournament) return res.status(404).json({ success: false, error: 'No tournament' });
+    if (tournament.status !== 'in_progress' && tournament.status !== 'ready') {
+      return res
+        .status(409)
+        .json({ success: false, error: 'Only a running tournament can be ended.' });
+    }
+    const confirm = typeof req.body?.confirm === 'string' ? req.body.confirm.trim() : '';
+    if (confirm !== tournament.name.trim()) {
+      return res.status(400).json({ success: false, error: 'Type the tournament name to end it.' });
+    }
+    const result = await scheduler.cancelTournament(tournamentId);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    log.error('Error ending the tournament', error);
+    return res.status(500).json({ success: false, error: 'Could not end the tournament' });
+  }
+});
+
 router.post('/restart', requireAuth, async (req: Request, res: Response) => {
   try {
-    // Get base URL for webhook configuration
-    const baseUrl = await getWebhookBaseUrl(req);
+    const tournamentId = resolveTournamentId(req);
+    // What the tournament's integration needs its resources to reach us on.
+    const baseUrl = await scheduler.resolveBaseUrl(tournamentId);
 
-    const result = await matchAllocationService.restartTournament(baseUrl);
+    const result = await scheduler.restartTournament(tournamentId, baseUrl);
 
     if (result.success) {
       log.success(result.message, {
@@ -1051,6 +1937,12 @@ router.post('/wipe-database', async (_req: Request, res: Response) => {
 
     // Reset database: drops all tables and reinitializes schema with default data
     await db.resetDatabase();
+    // The wipe emptied game_packs, and the cache the catalogue reads still
+    // held what used to be there. Re-seed from the packs the image ships
+    // (the wipe cleared which ones had been seen, so all of them), which also
+    // refreshes that cache.
+    const { seedBundledPacks } = await import('../services/gamePackService');
+    await seedBundledPacks();
 
     log.success('[DATABASE] Database reset successfully - all tables recreated with default data');
 
@@ -1092,6 +1984,7 @@ router.post('/wipe-database', async (_req: Request, res: Response) => {
  */
 router.post('/wipe-table/:table', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     const { table } = req.params;
     const allowedTables = [
       'teams',
@@ -1124,7 +2017,7 @@ router.post('/wipe-table/:table', async (req: Request, res: Response) => {
 
     // Handle special cases for foreign key constraints
     if (table === 'tournament') {
-      await tournamentService.deleteTournament();
+      await tournamentService.deleteTournament(tournamentId);
     } else if (table === 'matches') {
       // Delete related data first
       await db.execAsync('DELETE FROM match_events');
@@ -1138,9 +2031,15 @@ router.post('/wipe-table/:table', async (req: Request, res: Response) => {
       await db.execAsync('DELETE FROM shuffle_tournament_players');
       await db.execAsync('DELETE FROM players');
     } else if (table === 'map_pools') {
-      // Delete related data first
-      await db.execAsync('DELETE FROM tournament_templates WHERE map_pool_id IS NOT NULL');
-      await db.execAsync('DELETE FROM map_pools');
+      // Delete the templates saved with a pool first, as this always has. The
+      // pool id is CS2's own template field now (settings.cs2), so it is read
+      // through the template view rather than a column.
+      const { templateService } = await import('../services/templateService');
+      for (const template of await templateService.getAllTemplates()) {
+        if (template.mapPoolId)
+          await db.runAsync('DELETE FROM tournament_templates WHERE id = ?', [template.id]);
+      }
+      await db.execAsync('DELETE FROM cs2_map_pools');
     } else if (table === 'tournament_templates') {
       await db.execAsync('DELETE FROM tournament_templates');
     } else if (table === 'elo_calculation_templates') {
@@ -1150,7 +2049,13 @@ router.post('/wipe-table/:table', async (req: Request, res: Response) => {
       );
       await db.execAsync("DELETE FROM elo_calculation_templates WHERE id != 'pure-win-loss'");
     } else {
-      await db.execAsync(`DELETE FROM ${table}`);
+      // The path keeps the names it has always had; CS2's tables are
+      // `cs2_servers` and `cs2_maps` since CS2 owns them (cs2/migrations.ts).
+      const WIPE_TABLE_NAMES: Record<string, string> = {
+        servers: 'cs2_servers',
+        maps: 'cs2_maps',
+      };
+      await db.execAsync(`DELETE FROM ${WIPE_TABLE_NAMES[table] ?? table}`);
     }
 
     log.success(`[DATABASE] Table ${table} wiped successfully`);
@@ -1190,8 +2095,9 @@ router.post('/wipe-table/:table', async (req: Request, res: Response) => {
  *       500:
  *         description: Failed to reset simulation state
  */
-router.post('/dev/reset-simulation-state', async (_req: Request, res: Response) => {
+router.post('/dev/reset-simulation-state', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     log.warn(
       '[DEV] Reset simulation state requested - clearing matches & stats but keeping servers, teams, maps, and tournament config'
     );
@@ -1203,10 +2109,11 @@ router.post('/dev/reset-simulation-state', async (_req: Request, res: Response) 
 
     const loadedMatches = await db.queryAsync<DbMatchRow>(
       `SELECT * FROM matches 
-       WHERE tournament_id = 1 
+       WHERE tournament_id = ? 
          AND status IN ('loaded', 'live')
          AND server_id IS NOT NULL 
-         AND server_id != ''`
+         AND server_id != ''`,
+      [tournamentId]
     );
 
     if (loadedMatches.length > 0) {
@@ -1214,35 +2121,11 @@ router.post('/dev/reset-simulation-state', async (_req: Request, res: Response) 
         `[DEV] Ending ${loadedMatches.length} active match(es) on servers before simulation reset`
       );
 
-      const serverIds = new Set<string>();
-      for (const match of loadedMatches) {
-        if (match.server_id) {
-          serverIds.add(match.server_id);
-        }
-      }
-
-      let serversEnded = 0;
-      let serversEndFailed = 0;
-
-      for (const serverId of serverIds) {
-        try {
-          log.info(`[DEV] Ending match on server: ${serverId}`);
-          const result = await rconService.sendCommand(serverId, 'css_restart');
-
-          if (result.success) {
-            log.success(`[DEV] Match ended on server ${serverId}`);
-            serversEnded++;
-          } else {
-            log.error(`Failed to end match on server ${serverId}`, undefined, {
-              error: result.error,
-            });
-            serversEndFailed++;
-          }
-        } catch (error) {
-          log.error(`Error ending match on server ${serverId}`, error);
-          serversEndFailed++;
-        }
-      }
+      const { ended: serversEnded, failed: serversEndFailed } =
+        await scheduler.endMatchesOnResources(loadedMatches, {
+          reason: 'simulation-reset',
+          logPrefix: '[DEV]',
+        });
 
       log.info(
         `[DEV] Ended matches on ${serversEnded} server(s) before simulation reset${
@@ -1253,8 +2136,10 @@ router.post('/dev/reset-simulation-state', async (_req: Request, res: Response) 
 
     // 2) Clear all match-related data so no previous matches or allocations interfere.
 
-    // Delete all matches and let foreign keys cascade to match_events, match_map_results,
-    // and player_match_stats / player_rating_history that reference match slugs.
+    // Delete all matches and let foreign keys cascade to match_events, match_map_results
+    // and player_match_stats. Rating history survives match deletion (SET NULL), so
+    // it is cleared explicitly; ratings are reset to starting values below.
+    await db.execAsync('DELETE FROM player_rating_history');
     await db.execAsync('DELETE FROM matches');
 
     // 3) Reset tournament status back to setup so the existing config can be reused.
@@ -1268,19 +2153,13 @@ router.post('/dev/reset-simulation-state', async (_req: Request, res: Response) 
         updated_at: now,
       },
       'id = ?',
-      [1]
+      [tournamentId]
     );
 
     // 4) Reset player ratings to their starting values and clear match counters.
     // This keeps players but forgets prior ELO changes from simulations.
-    await db.execAsync(`
-      UPDATE players
-         SET current_elo = starting_elo,
-             match_count = 0,
-             openskill_mu = 25.0,
-             openskill_sigma = 8.333,
-             updated_at = ${now}
-    `);
+    // Every game's rating goes: a player without one stands at their seed.
+    await db.execAsync('DELETE FROM player_game_ratings');
 
     // 5) Clear shuffle tournament player registrations so new simulations can
     // register a fresh pool if desired.
@@ -1356,17 +2235,22 @@ router.post('/dev/reset-simulation-state', async (_req: Request, res: Response) 
  */
 router.post('/shuffle', async (req: Request, res: Response) => {
   try {
+    const tournamentId = resolveTournamentId(req);
     const config: ShuffleTournamentConfig = req.body;
 
-    if (
-      !config.name ||
-      !config.mapSequence ||
-      typeof config.maxRounds !== 'number' ||
-      !config.overtimeMode
-    ) {
+    // Shuffle tournaments are created as CS2 too.
+    const gameCheck = validateGameSettings(null, {
+      mode: 'create-shuffle',
+      // No veto in shuffle, so no settings to check.
+      settings: undefined,
+      body: { ...config },
+    });
+
+    if (!config.name || gameCheck.missingFields.length > 0) {
+      const required = ['name', ...gameCheck.requiredFields];
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: name, mapSequence, maxRounds, overtimeMode',
+        error: `Missing required fields: ${required.join(', ')}`,
       });
     }
 
@@ -1378,7 +2262,22 @@ router.post('/shuffle', async (req: Request, res: Response) => {
       });
     }
 
-    const tournament = await createShuffleTournament(config);
+    if (config.name.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'Tournament name is required. Please provide a name for your shuffle tournament.',
+      });
+    }
+
+    const gameError = [...gameCheck.fieldErrors, ...gameCheck.errors][0];
+    if (gameError) {
+      return res.status(400).json({
+        success: false,
+        error: gameError,
+      });
+    }
+
+    const tournament = await createShuffleTournament(tournamentId, config);
 
     return res.status(201).json({
       success: true,
@@ -1404,8 +2303,8 @@ router.post('/shuffle', async (req: Request, res: Response) => {
  * part of the shuffle tournament (ELO, leaderboards, allocation, etc.).
  *
  * Behaviour:
- * - Matches are created with tournament_id = 1 and round = 0 so they are
- *   treated as "manual" by the MatchZy config endpoint but still counted for
+ * - Matches are created with the shuffle tournament's id and round = 0 so they are
+ *   treated as "manual" by the MatchZy Enhanced config endpoint but still counted for
  *   the shuffle tournament’s stats and server allocation.
  * - Each match gets two temporary team rows with players derived from the
  *   registered player list.
@@ -1414,16 +2313,15 @@ router.post('/shuffle', async (req: Request, res: Response) => {
  */
 router.post('/:id/manual-matches', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    // The tournament in the URL: any that exists.
+    const urlTournamentId = await readableTournamentId(req.params.id);
 
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
+    if (urlTournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
     }
+    const tournamentId = urlTournamentId;
 
-    const tournament = await tournamentService.getTournament();
+    const tournament = await tournamentService.getTournament(tournamentId);
     if (!tournament || tournament.type !== 'shuffle') {
       return res.status(400).json({
         success: false,
@@ -1474,8 +2372,7 @@ router.post('/:id/manual-matches', async (req: Request, res: Response) => {
         return maxRounds;
       }
       const raw = tournament.maxRounds;
-      const parsed =
-        typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : undefined;
+      const parsed = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : undefined;
       const value =
         typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0 ? parsed : 24;
       return value;
@@ -1484,7 +2381,7 @@ router.post('/:id/manual-matches', async (req: Request, res: Response) => {
     const effectiveMaxRounds = resolveMaxRounds();
 
     // Load registered players once so we can validate and build teams.
-    const registeredPlayers = await getRegisteredPlayers();
+    const registeredPlayers = await getRegisteredPlayers(tournamentId);
     const registeredById = new Map(registeredPlayers.map((p) => [p.id, p]));
 
     if (registeredPlayers.length === 0) {
@@ -1575,15 +2472,15 @@ router.post('/:id/manual-matches', async (req: Request, res: Response) => {
       }
 
       // For manual shuffle matches we want players_per_team to reflect the actual
-      // lineup size so MatchZy’s ready logic matches reality (3v3, 4v4, etc.).
+      // lineup size so MatchZy Enhanced’s ready logic matches reality (3v3, 4v4, etc.).
       const playersPerTeam = Math.max(team1Players.length, team2Players.length, 1);
 
       const cvars: Record<string, string | number> = {
         mp_maxrounds: resolvedMaxRounds,
       };
 
-      const team1Id = `shuffle-r0-m${index + 1}-team1`;
-      const team2Id = `shuffle-r0-m${index + 1}-team2`;
+      const team1Id = shuffleTeamId(tournamentId, 0, index + 1, 1);
+      const team2Id = shuffleTeamId(tournamentId, 0, index + 1, 2);
 
       const defaultTeam1Name = matchDef.team1Name || matchDef.label || `Shuffle Team ${index + 1}A`;
       const defaultTeam2Name = matchDef.team2Name || matchDef.label || `Shuffle Team ${index + 1}B`;
@@ -1620,7 +2517,18 @@ router.post('/:id/manual-matches', async (req: Request, res: Response) => {
         updated_at: now,
       });
 
-      // Build MatchZy‑style player dictionaries for config.
+      // Mirror both rosters into team_members (3.0 phase D), as a team written
+      // through teamService would. Best effort.
+      await teamMembers.syncFromRoster(
+        team1Id,
+        team1Players.map((p) => p.id)
+      );
+      await teamMembers.syncFromRoster(
+        team2Id,
+        team2Players.map((p) => p.id)
+      );
+
+      // Build MatchZy Enhanced‑style player dictionaries for config.
       const toMatchPlayers = (teamPlayers: typeof team1Players) =>
         teamPlayers.reduce<Record<string, string>>((acc, p) => {
           acc[p.id] = p.name;
@@ -1635,11 +2543,12 @@ router.post('/:id/manual-matches', async (req: Request, res: Response) => {
 
       const slug = (matchDef.slug || '').trim() || generateSlug(index);
 
-      // Construct a minimal manual‑match config. The MatchZy config endpoint for
+      // TODO: this builds a MatchZy Enhanced config in core; route it through the CS2
+      // integration's standalone buildMatchConfig in a follow-up.
+      // Construct a minimal manual‑match config. The MatchZy Enhanced config endpoint for
       // manual matches will normalize this further (matchid, spectators, etc.).
       const config: MatchConfig = {
         matchid: 0,
-        skip_veto: true,
         players_per_team: playersPerTeam,
         num_maps: 1,
         maplist: [resolvedMap],
@@ -1669,7 +2578,7 @@ router.post('/:id/manual-matches', async (req: Request, res: Response) => {
 
       await db.insertAsync('matches', {
         slug,
-        tournament_id: 1,
+        tournament_id: tournamentId,
         round: 0, // 0 = manual / non‑bracket match, but still tied to the shuffle tournament
         match_number: 0,
         team1_id: team1Id,
@@ -1758,15 +2667,14 @@ router.post('/:id/manual-matches', async (req: Request, res: Response) => {
  */
 router.post('/:id/register-players', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    // The tournament in the URL: any that exists.
+    const urlTournamentId = await readableTournamentId(req.params.id);
     const { playerIds } = req.body;
 
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
+    if (urlTournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
     }
+    const tournamentId = urlTournamentId;
 
     if (!Array.isArray(playerIds) || playerIds.length === 0) {
       return res.status(400).json({
@@ -1775,7 +2683,9 @@ router.post('/:id/register-players', async (req: Request, res: Response) => {
       });
     }
 
-    const result = await registerPlayers(playerIds);
+    const result = await registerPlayers(tournamentId, playerIds);
+    // Added to a running shuffle: enough players waiting get a match now.
+    if (result.registered > 0) await fillRoundFromBench(tournamentId).catch(() => []);
 
     const statusCode = result.errors.length > 0 ? 207 : 200; // 207 Multi-Status if some failed
 
@@ -1837,15 +2747,14 @@ router.post('/:id/register-players', async (req: Request, res: Response) => {
  */
 router.put('/:id/set-players', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    // The tournament in the URL: any that exists.
+    const urlTournamentId = await readableTournamentId(req.params.id);
     const { playerIds } = req.body;
 
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
+    if (urlTournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
     }
+    const tournamentId = urlTournamentId;
 
     if (!Array.isArray(playerIds)) {
       return res.status(400).json({
@@ -1854,7 +2763,10 @@ router.put('/:id/set-players', async (req: Request, res: Response) => {
       });
     }
 
-    const result = await setRegisteredPlayers(playerIds);
+    const result = await setRegisteredPlayers(tournamentId, playerIds);
+    // Added (or brought back) to a running shuffle: enough players waiting get a match now, as
+    // with register-players. Re-adding players by hand left them sitting out (NTLAN, 2026-10-16).
+    if (result.registered > 0) await fillRoundFromBench(tournamentId).catch(() => []);
 
     const statusCode = result.errors.length > 0 ? 207 : 200; // 207 Multi-Status if some failed
 
@@ -1904,16 +2816,15 @@ router.put('/:id/set-players', async (req: Request, res: Response) => {
  */
 router.get('/:id/players', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    // The tournament in the URL: any that exists.
+    const urlTournamentId = await readableTournamentId(req.params.id);
 
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
+    if (urlTournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
     }
+    const tournamentId = urlTournamentId;
 
-    const players = await getRegisteredPlayers();
+    const players = await getRegisteredPlayers(tournamentId);
 
     return res.json({
       success: true,
@@ -1923,58 +2834,6 @@ router.get('/:id/players', async (req: Request, res: Response) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     log.error('Error fetching registered players', { error });
-    return res.status(500).json({
-      success: false,
-      error: message,
-    });
-  }
-});
-
-/**
- * @openapi
- * /api/tournament/{id}/leaderboard:
- *   get:
- *     tags:
- *       - Tournament
- *     summary: Get player leaderboard for shuffle tournament
- *     description: Returns leaderboard sorted by match wins, then ELO. Includes player stats (wins, losses, win rate, ELO change).
- *     security:
- *       - BearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *         description: Tournament ID (currently only "1" is supported)
- *     responses:
- *       200:
- *         description: Leaderboard retrieved successfully
- *       400:
- *         description: Invalid tournament ID
- *       500:
- *         description: Server error
- */
-router.get('/:id/leaderboard', async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
-    }
-
-    const leaderboard = await getPlayerLeaderboard();
-
-    return res.json({
-      success: true,
-      leaderboard,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    log.error('Error fetching leaderboard', { error });
     return res.status(500).json({
       success: false,
       error: message,
@@ -2009,16 +2868,15 @@ router.get('/:id/leaderboard', async (req: Request, res: Response) => {
  */
 router.get('/:id/round-status', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    // The tournament in the URL: any that exists.
+    const urlTournamentId = await readableTournamentId(req.params.id);
 
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
+    if (urlTournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
     }
+    const tournamentId = urlTournamentId;
 
-    const leaderboardData = await getTournamentLeaderboard();
+    const leaderboardData = await getTournamentLeaderboard(tournamentId);
 
     return res.json({
       success: true,
@@ -2043,15 +2901,14 @@ router.get('/:id/round-status', async (req: Request, res: Response) => {
  */
 router.post('/:id/generate-round', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    // The tournament in the URL: any that exists.
+    const urlTournamentId = await readableTournamentId(req.params.id);
     const { roundNumber } = req.body;
 
-    if (id !== '1') {
-      return res.status(400).json({
-        success: false,
-        error: 'Only tournament ID 1 is supported',
-      });
+    if (urlTournamentId === null) {
+      return res.status(404).json({ success: false, error: 'Tournament not found' });
     }
+    const tournamentId = urlTournamentId;
 
     if (!roundNumber || typeof roundNumber !== 'number') {
       return res.status(400).json({
@@ -2060,7 +2917,7 @@ router.post('/:id/generate-round', async (req: Request, res: Response) => {
       });
     }
 
-    const result = await generateRoundMatches(roundNumber);
+    const result = await generateRoundMatches(tournamentId, roundNumber);
 
     return res.json({
       success: true,

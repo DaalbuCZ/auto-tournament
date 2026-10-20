@@ -1,6 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { api } from '../utils/api';
-import { io, type Socket } from 'socket.io-client';
+import type { Socket } from 'socket.io-client';
+import { scopedSocket } from '../utils/sharedSocket';
+import { onSocketReconnect } from '../utils/socketResync';
 import type { MatchLiveStats } from '../types';
 
 const SNAPSHOT_CACHE_MS = 5000;
@@ -36,7 +38,9 @@ export function useLiveStats(matchSlug: string | null) {
 
       try {
         setLoading(true);
-        const response = await api.get<MatchLiveStats & { success: boolean }>(`/api/events/live/${matchSlug}`);
+        const response = await api.get<MatchLiveStats & { success: boolean }>(
+          `/api/events/live/${matchSlug}`
+        );
         if (response?.success) {
           setStats({
             matchSlug,
@@ -68,7 +72,7 @@ export function useLiveStats(matchSlug: string | null) {
 
   useEffect(() => {
     if (!matchSlug) return;
-    const socket: Socket = io();
+    const socket: Socket = scopedSocket();
 
     const handleMatchUpdate = (payload: {
       slug?: string;
@@ -88,8 +92,10 @@ export function useLiveStats(matchSlug: string | null) {
     };
 
     socket.on('match:update', handleMatchUpdate);
+    const offReconnect = onSocketReconnect(socket, () => loadStats({ force: true }));
 
     return () => {
+      offReconnect();
       socket.off('match:update', handleMatchUpdate);
       socket.close();
     };
@@ -101,4 +107,3 @@ export function useLiveStats(matchSlug: string | null) {
     refresh: () => loadStats({ force: true }),
   };
 }
-

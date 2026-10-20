@@ -1,4 +1,3 @@
-import React from 'react';
 import {
   Box,
   Card,
@@ -13,91 +12,43 @@ import {
   TableHead,
   TableRow,
 } from '@mui/material';
-import { getStatusColor, getStatusLabel } from '../../utils/matchUtils';
-import type { Match, MatchLiveStats, Team } from '../../types';
+import {
+  getStatusColor,
+  getStatusLabel,
+  isUnpairedSwissMatch,
+  waitingForPairingLabel,
+} from '../../utils/matchUtils';
+import type { Match, MatchLiveStats, SwissStanding, Team } from '../../types';
 import { deriveSeriesScore } from '../../utils/matchScoreDisplay';
 import { TeamNameLink } from '../team/TeamNameLink';
+import { useTranslation } from 'react-i18next';
+import { tokens, mono, withAlpha } from '../../theme/tokens';
 
 interface SwissViewProps {
   matches: Match[];
   teams: Team[];
+  /** Server standings (GET /api/tournament/bracket `swissStandings`), best first. */
+  standings: SwissStanding[];
   totalRounds: number;
   onMatchClick?: (match: Match) => void;
 }
 
-interface SwissTeamRecord {
-  team: Team;
-  wins: number;
-  losses: number;
-  roundsWon: number;
-  roundsLost: number;
-  roundDiff: number;
-  opponents: string[];
-}
-
-export default function SwissView({ matches, teams, totalRounds, onMatchClick }: SwissViewProps) {
+export default function SwissView({
+  matches,
+  teams,
+  standings,
+  totalRounds,
+  onMatchClick,
+}: SwissViewProps) {
+  const { t } = useTranslation();
   type SwissMatch = Match & { liveStats?: MatchLiveStats | null };
 
-  // Calculate team records
-  const calculateRecords = (): SwissTeamRecord[] => {
-    const records: { [teamId: string]: SwissTeamRecord } = {};
-
-    // Initialize
-    teams.forEach((team) => {
-      records[team.id] = {
-        team,
-        wins: 0,
-        losses: 0,
-        roundsWon: 0,
-        roundsLost: 0,
-        roundDiff: 0,
-        opponents: [],
-      };
-    });
-
-    // Process matches
-    matches
-      .filter((m) => m.status === 'completed' && m.team1 && m.team2)
-      .forEach((match) => {
-        const team1Id = match.team1!.id;
-        const team2Id = match.team2!.id;
-
-        if (records[team1Id] && records[team2Id]) {
-          const team1Score = match.team1Score || 0;
-          const team2Score = match.team2Score || 0;
-
-          records[team1Id].roundsWon += team1Score;
-          records[team1Id].roundsLost += team2Score;
-          records[team1Id].opponents.push(match.team2!.name);
-
-          records[team2Id].roundsWon += team2Score;
-          records[team2Id].roundsLost += team1Score;
-          records[team2Id].opponents.push(match.team1!.name);
-
-          if (match.winner?.id === team1Id) {
-            records[team1Id].wins++;
-            records[team2Id].losses++;
-          } else if (match.winner?.id === team2Id) {
-            records[team2Id].wins++;
-            records[team1Id].losses++;
-          }
-        }
-      });
-
-    // Calculate differential
-    Object.values(records).forEach((record) => {
-      record.roundDiff = record.roundsWon - record.roundsLost;
-    });
-
-    // Sort by wins, then round diff
-    return Object.values(records).sort((a, b) => {
-      if (b.wins !== a.wins) return b.wins - a.wins;
-      if (b.roundDiff !== a.roundDiff) return b.roundDiff - a.roundDiff;
-      return b.roundsWon - a.roundsWon;
-    });
-  };
-
-  const records = calculateRecords();
+  // The server computes the standings the pairing uses; only attach team info.
+  const teamsById = new Map(teams.map((team) => [team.id, team]));
+  const records = standings.flatMap((standing) => {
+    const team = teamsById.get(standing.teamId);
+    return team ? [{ ...standing, team }] : [];
+  });
 
   // Group matches by round
   const matchesByRound: { [round: number]: Match[] } = {};
@@ -116,33 +67,46 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
           <Card>
             <CardContent>
               <Typography variant="h6" fontWeight={600} mb={2}>
-                🏆 Current Leaderboard
+                {t('bracket.swiss.standings')}
               </Typography>
               <TableContainer>
                 <Table size="small">
                   <TableHead>
                     <TableRow>
                       <TableCell sx={{ fontWeight: 600 }}>#</TableCell>
-                      <TableCell sx={{ fontWeight: 600 }}>Team</TableCell>
+                      <TableCell sx={{ fontWeight: 600 }}>{t('bracket.swiss.team')}</TableCell>
                       <TableCell align="center" sx={{ fontWeight: 600 }}>
-                        Record
+                        {t('bracket.swiss.record')}
                       </TableCell>
-                      <TableCell align="center" sx={{ fontWeight: 600 }}>
-                        RD
+                      <TableCell
+                        align="center"
+                        sx={{ fontWeight: 600 }}
+                        title={t('bracket.swiss.buchholzHint')}
+                      >
+                        {t('bracket.swiss.buchholz')}
+                      </TableCell>
+                      <TableCell
+                        align="center"
+                        sx={{ fontWeight: 600 }}
+                        title={t('bracket.swiss.roundDiffHint')}
+                      >
+                        {t('bracket.swiss.roundDiff')}
                       </TableCell>
                     </TableRow>
                   </TableHead>
                   <TableBody>
                     {records.map((record, index) => (
                       <TableRow
-                        key={record.team.id}
+                        key={record.teamId}
                         sx={{
+                          // Top two advance (green wash), next two are close (faint wash).
                           bgcolor:
                             index < 2
-                              ? 'success.main'
+                              ? withAlpha(tokens.color.live, 0.12)
                               : index < 4
-                              ? 'action.selected'
+                              ? tokens.color.paper3
                               : 'transparent',
+                          boxShadow: index < 2 ? `inset 3px 0 0 ${tokens.color.live}` : 'none',
                           opacity: index < 4 ? 1 : 0.7,
                         }}
                       >
@@ -160,9 +124,12 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
                           />
                         </TableCell>
                         <TableCell align="center">
-                          <Typography variant="body2" fontWeight={600}>
+                          <Typography variant="body2" fontWeight={600} sx={mono}>
                             {record.wins}-{record.losses}
                           </Typography>
+                        </TableCell>
+                        <TableCell align="center">
+                          <Typography variant="body2">{record.buchholz}</Typography>
                         </TableCell>
                         <TableCell align="center">
                           <Typography
@@ -201,9 +168,9 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
                   <CardContent>
                     <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
                       <Typography variant="h6" fontWeight={600}>
-                        Round {round}
+                        {t('rounds.roundN', { n: round })}
                       </Typography>
-                      {!hasMatches && <Chip label="Not Generated" size="small" color="default" />}
+                      {!hasMatches && <Chip label={t('bracket.swiss.notGenerated')} size="small" color="default" />}
                     </Box>
 
                     {hasMatches ? (
@@ -232,11 +199,12 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
                             variant="outlined"
                             sx={{
                               cursor: onMatchClick ? 'pointer' : 'default',
-                              transition: 'all 0.2s',
+                              bgcolor: tokens.color.paper3,
+                              borderColor: 'transparent',
+                              borderRadius: `${tokens.radius.sm}px`,
                               '&:hover': onMatchClick
                                 ? {
-                                    transform: 'translateY(-2px)',
-                                    boxShadow: 2,
+                                    borderColor: tokens.color.rule,
                                   }
                                 : {},
                             }}
@@ -253,7 +221,7 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
                                     {match.team1?.name || 'TBD'}
                                   </Typography>
                                   {left !== null ? (
-                                    <Typography variant="body2" fontWeight={600}>
+                                    <Typography variant="body2" fontWeight={600} sx={mono}>
                                       {left}
                                     </Typography>
                                   ) : (
@@ -277,7 +245,7 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
                                   flex={1}
                                 >
                                   {right !== null ? (
-                                    <Typography variant="body2" fontWeight={600}>
+                                    <Typography variant="body2" fontWeight={600} sx={mono}>
                                       {right}
                                     </Typography>
                                   ) : (
@@ -289,11 +257,18 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
                                     variant="body2"
                                     sx={{ minWidth: 120, textAlign: 'right' }}
                                   >
-                                    {match.team2?.name || 'TBD'}
+                                    {match.team2?.name ||
+                                      (match.team1 && match.status === 'completed'
+                                        ? t('bracket.swiss.bye')
+                                        : 'TBD')}
                                   </Typography>
                                 </Box>
                                 <Chip
-                                  label={getStatusLabel(match.status)}
+                                  label={
+                                    isUnpairedSwissMatch(match)
+                                      ? waitingForPairingLabel()
+                                      : getStatusLabel(match.status)
+                                  }
                                   size="small"
                                   color={getStatusColor(match.status)}
                                   sx={{ ml: 2, minWidth: 90 }}
@@ -311,7 +286,7 @@ export default function SwissView({ matches, teams, totalRounds, onMatchClick }:
                         color="text.secondary"
                         sx={{ fontStyle: 'italic' }}
                       >
-                        Matches will be generated after Round {round - 1} completes
+                        {t('bracket.swiss.generatedAfter', { round: round - 1 })}
                       </Typography>
                     )}
                   </CardContent>

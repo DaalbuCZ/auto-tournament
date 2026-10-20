@@ -8,6 +8,7 @@ import type {
   TournamentResponse,
   TournamentBracketResponse,
 } from '../types';
+import type { Untrusted } from '../utils/untrusted';
 
 // Extended Tournament with teams array
 interface TournamentDetailed extends Tournament {
@@ -85,14 +86,27 @@ export const useTournament = () => {
 
   const saveTournament = async (payload: {
     name: string;
+    /**
+     * The game to run, on create only ('cs2', 'rocket-league'). The update
+     * route does not take one: a tournament's matches were built by the
+     * module that owns it (3.0 phase D, PR D9).
+     */
+    game?: string;
     type: string;
     format: string;
-    maps: string[];
-    teamIds: string[];
-    settings: { seedingMethod: string; grandFinalMode?: 'none' | 'simple' | 'double' };
-    maxRounds?: number;
-    overtimeMode?: 'enabled' | 'disabled';
-    overtimeSegments?: number;
+    /** On create only: a saved tournament's teams change one at a time. */
+    teamIds?: string[];
+    /** Players per team, when teams sign themselves up. */
+    teamSize?: number;
+    settings: {
+      seedingMethod: string;
+      grandFinalMode?: 'none' | 'simple' | 'double';
+      /**
+       * A game module's own object (CS2: `cs2`, the map pool and round
+       * rules), stored and forwarded unread by the core.
+       */
+      [moduleKey: string]: Untrusted;
+    };
   }) => {
     const response = await api[tournament ? 'put' : 'post']<
       TournamentResponse & { tournament: TournamentDetailed }
@@ -102,8 +116,23 @@ export const useTournament = () => {
     return response;
   };
 
+  /**
+   * Save just a settings patch (e.g. the "Event page" fields) without
+   * re-sending the whole wizard payload. The server merges it into the
+   * tournament's existing settings.
+   */
+  const updateSettings = async (settingsPatch: Record<string, Untrusted>) => {
+    const response = await api.put<TournamentResponse & { tournament: TournamentDetailed }>(
+      '/api/tournament',
+      { settings: settingsPatch }
+    );
+    setTournament(response.tournament);
+    return response;
+  };
+
   const deleteTournament = async () => {
-    await api.delete('/api/tournament');
+    // Played matches stay (with their demos) under All matches.
+    await api.delete('/api/tournament?keepPlayed=1');
     setTournament(null);
   };
 
@@ -125,7 +154,7 @@ export const useTournament = () => {
   };
 
   const startTournament = async (baseUrl: string, options?: { enableSimulation?: boolean }) => {
-    const payload: Record<string, unknown> = { baseUrl };
+    const payload: Record<string, Untrusted> = { baseUrl };
     if (options && typeof options.enableSimulation === 'boolean') {
       payload.enableSimulation = options.enableSimulation;
     }
@@ -135,12 +164,16 @@ export const useTournament = () => {
       allocated?: number;
       failed?: number;
       results?: Array<{ matchSlug: string; serverId?: string; success: boolean; error?: string }>;
+      /** A paid license with fewer servers than round one needs (api routes/tournament.ts). */
+      licenseNote?: string;
     }>('/api/tournament/start', payload);
     // Reload tournament data after starting; the backend may update status to
     // 'in_progress' asynchronously, so this ensures the wizard view reflects
     // the latest state.
     await loadData();
-    return response;
+    return response.licenseNote
+      ? { ...response, message: `${response.message} ${response.licenseNote}` }
+      : response;
   };
 
   const restartTournament = async (baseUrl: string) => {
@@ -164,6 +197,7 @@ export const useTournament = () => {
     error,
     setError,
     saveTournament,
+    updateSettings,
     deleteTournament,
     regenerateBracket,
     resetTournament,
