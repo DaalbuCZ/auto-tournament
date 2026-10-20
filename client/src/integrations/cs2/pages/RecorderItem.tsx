@@ -1,3 +1,4 @@
+import { RecorderBenchmarkStat, RecorderBenchmarkDetails } from './RecorderBenchmark';
 import { RecorderControls, type RecorderGroup } from '../settings/RecorderFleetControls';
 /**
  * CS2's part of the Highlights page. Four tabs:
@@ -134,7 +135,7 @@ export function RecorderItem({
               <Chip size="small" color="warning" label={t('highlightsAdmin.paused')} />
             ) : r.working ? (
               <Chip size="small" color="success" label={t('highlightsAdmin.recording')} />
-            ) : r.online ? (
+            ) : r.online && !r.progress ? (
               <Chip
                 size="small"
                 color="success"
@@ -257,58 +258,10 @@ export function RecorderItem({
           >
             <Stat label={t('highlightsAdmin.stat.perClip')} value={duration(r.avgClipSeconds)} />
             <Stat label={t('highlightsAdmin.stat.kept')} value={String(r.clipsOk)} />
-            <Stat
-              label={t('highlightsAdmin.stat.benchmark')}
-              value={
-                r.benchmarkWanted
-                  ? t('highlightsAdmin.benchmarkPending')
-                  : r.gamescopeHz
-                    ? t('highlightsAdmin.benchmarkPick', { hz: r.gamescopeHz })
-                    : r.benchmarkAt
-                      ? t('highlightsAdmin.benchmarkNone')
-                      : '—'
-              }
-            />
+            <RecorderBenchmarkStat r={r} />
           </Box>
-          {r.benchmark && r.benchmark.tries.length > 0 && (
-            <Box sx={{ overflowX: 'auto' }}>
-              <Box
-                component="table"
-                sx={{
-                  borderCollapse: 'collapse',
-                  fontSize: 13,
-                  '& td, & th': {
-                    px: 1,
-                    py: 0.25,
-                    textAlign: 'left',
-                    whiteSpace: 'nowrap',
-                  },
-                  fontVariantNumeric: 'tabular-nums',
-                }}
-              >
-                <thead>
-                  <tr>
-                    <th>{t('highlightsAdmin.bench.hz')}</th>
-                    <th>{t('highlightsAdmin.bench.time')}</th>
-                    <th>{t('highlightsAdmin.bench.fps')}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {r.benchmark.tries.map((b) => (
-                    <tr key={b.gamescopeHz}>
-                      <td>
-                        {b.gamescopeHz} Hz
-                        {b.gamescopeHz === r.benchmark?.pick ? ' ✓' : ''}
-                      </td>
-                      <td>{b.ok ? duration(b.seconds) : (b.error ?? '—')}</td>
-                      <td>{b.captureFps != null ? Math.round(b.captureFps) : '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </Box>
-            </Box>
-          )}
-          {r.lastError && (
+          <RecorderBenchmarkDetails r={r} />
+          {r.lastError && !(r.benchmark?.error && r.lastError.startsWith(r.benchmark.error)) && (
             <Typography variant="caption" color="error" sx={{ overflowWrap: 'anywhere' }}>
               {t('highlightsAdmin.lastError', { error: r.lastError })}
             </Typography>
