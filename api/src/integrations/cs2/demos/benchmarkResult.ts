@@ -23,48 +23,48 @@ export interface BenchmarkResult extends StoredBenchmark {
   error: string | null;
 }
 
-function object(value: Untrusted): Record<string, Untrusted> {
+function readObject(value: Untrusted): Record<string, Untrusted> {
   if (value == null || typeof value !== 'object' || Array.isArray(value)) return {};
   return value as Record<string, Untrusted>;
 }
 
-function number(value: Untrusted): number | null {
+function nonNegativeNumber(value: Untrusted): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-const errorText = (value: string) =>
+const errorSummary = (value: string) =>
   value.split('\n--- gamescope log, last lines ---')[0].slice(0, 300);
 
 /** Check the recorder's message once; native export can finish below playback speed. */
 export function benchmarkResult(input: Untrusted): BenchmarkResult {
-  const body = object(input);
+  const body = readObject(input);
   const backend = body.backend === 'native' ? 'native' : 'stream';
   const tries: BenchmarkTry[] = [];
   for (const value of (Array.isArray(body.tries) ? body.tries : []).slice(0, 8)) {
-    const attempt = object(value);
-    const seconds = number(attempt.seconds);
-    const gamescopeHz = backend === 'native' ? 0 : (number(attempt.gamescopeHz) ?? 0);
+    const attempt = readObject(value);
+    const seconds = nonNegativeNumber(attempt.seconds);
+    const gamescopeHz = backend === 'native' ? 0 : (nonNegativeNumber(attempt.gamescopeHz) ?? 0);
     if (backend === 'stream' && gamescopeHz <= 0) continue;
     tries.push({
       gamescopeHz,
       seconds,
-      captureFps: number(attempt.captureFps),
+      captureFps: nonNegativeNumber(attempt.captureFps),
       ok: attempt.ok === true && seconds != null,
-      ...(typeof attempt.error === 'string' ? { error: errorText(attempt.error) } : {}),
+      ...(typeof attempt.error === 'string' ? { error: errorSummary(attempt.error) } : {}),
     });
   }
-  const finished = tries.filter((attempt) => attempt.ok);
-  finished.sort((a, b) => (a.seconds ?? Infinity) - (b.seconds ?? Infinity));
-  const ok = finished.length > 0;
+  const successfulAttempts = tries.filter((attempt) => attempt.ok);
+  successfulAttempts.sort((a, b) => (a.seconds ?? Infinity) - (b.seconds ?? Infinity));
+  const ok = successfulAttempts.length > 0;
   let error: string | null = null;
   if (!ok) {
     error = tries.find((attempt) => attempt.error)?.error ?? 'No benchmark attempt finished';
-    if (typeof body.error === 'string' && body.error) error = errorText(body.error);
+    if (typeof body.error === 'string' && body.error) error = errorSummary(body.error);
   }
   return {
     backend,
     tries,
-    pick: backend === 'stream' ? (finished[0]?.gamescopeHz ?? null) : null,
+    pick: backend === 'stream' ? (successfulAttempts[0]?.gamescopeHz ?? null) : null,
     source: body.source === 'bundled' ? 'bundled' : 'match',
     ok,
     error,
