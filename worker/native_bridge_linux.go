@@ -6,13 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/coder/websocket"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // CS:DM's plugin is a WebSocket client. A loopback-only, ephemeral server
@@ -33,50 +34,59 @@ func newNativeBridge() (*nativeBridge, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &nativeBridge{port: strconv.Itoa(listener.Addr().(*net.TCPAddr).Port), ready: make(chan struct{}), changed: make(chan struct{})}
-	b.server = &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The plugin's easywsclient build can omit the query when its URL
-		// has no slash before '?'. Both root handshakes are game clients on
-		// this dedicated loopback endpoint; other roles/paths are rejected.
-		role := r.URL.Query().Get("process")
-		if r.URL.Path != "/" || (role != "" && role != "game") {
-			http.Error(w, "game client required", http.StatusForbidden)
-			return
-		}
-		c, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			log.Printf("native plugin WebSocket handshake: %v", err)
-			return
-		}
-		b.mu.Lock()
-		if b.conn != nil {
-			b.mu.Unlock()
-			c.CloseNow()
-			return
-		}
-		b.conn = c
-		close(b.changed)
-		b.changed = make(chan struct{})
-		b.mu.Unlock()
-		b.once.Do(func() { close(b.ready) })
-		defer c.CloseNow()
-		defer func() {
-			b.mu.Lock()
-			defer b.mu.Unlock()
-			if b.conn == c {
-				b.conn = nil
-				close(b.changed)
-				b.changed = make(chan struct{})
-			}
-		}()
-		for {
-			if _, _, err := c.Read(context.Background()); err != nil {
-				return
-			}
-		}
-	})}
+	b := &nativeBridge{
+		port:    strconv.Itoa(listener.Addr().(*net.TCPAddr).Port),
+		ready:   make(chan struct{}),
+		changed: make(chan struct{}),
+	}
+	b.server = &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+		Handler:           http.HandlerFunc(b.handlePluginConnection),
+	}
 	go func() { _ = b.server.Serve(listener) }()
 	return b, nil
+}
+
+func (b *nativeBridge) handlePluginConnection(w http.ResponseWriter, r *http.Request) {
+	// The plugin's easywsclient build can omit the query when its URL
+	// has no slash before '?'. Both root handshakes are game clients on
+	// this dedicated loopback endpoint; other roles/paths are rejected.
+	role := r.URL.Query().Get("process")
+	if r.URL.Path != "/" || (role != "" && role != "game") {
+		http.Error(w, "game client required", http.StatusForbidden)
+		return
+	}
+	c, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		log.Printf("native plugin WebSocket handshake: %v", err)
+		return
+	}
+	b.mu.Lock()
+	if b.conn != nil {
+		b.mu.Unlock()
+		c.CloseNow()
+		return
+	}
+	b.conn = c
+	close(b.changed)
+	b.changed = make(chan struct{})
+	b.mu.Unlock()
+	b.once.Do(func() { close(b.ready) })
+	defer c.CloseNow()
+	defer func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.conn == c {
+			b.conn = nil
+			close(b.changed)
+			b.changed = make(chan struct{})
+		}
+	}()
+	for {
+		if _, _, err := c.Read(context.Background()); err != nil {
+			return
+		}
+	}
 }
 
 func (b *nativeBridge) close() {
