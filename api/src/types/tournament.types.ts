@@ -1,3 +1,4 @@
+import type { MatchStateView, MatchStatus } from './matchState.types';
 /**
  * Tournament Types
  */
@@ -239,6 +240,7 @@ export interface UpdateTournamentInput {
 }
 
 export interface BracketMatch {
+  state?: MatchStateView;
   id: number;
   slug: string;
   round: number;
@@ -264,7 +266,7 @@ export interface BracketMatch {
     tag?: string;
   } | null;
   serverId?: string | null;
-  status: 'pending' | 'ready' | 'loaded' | 'live' | 'completed';
+  status: MatchStatus;
   nextMatchId?: number | null;
   /** 'WB', 'LB', 'GF' in a double elimination; absent otherwise. */
   bracket?: string | null;

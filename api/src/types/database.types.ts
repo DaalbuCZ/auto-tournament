@@ -2,6 +2,8 @@
  * Database row types for PostgreSQL queries
  */
 
+import type { MatchStatus } from './matchState.types';
+
 export interface DbMatchRow {
   id: number;
   slug: string;
@@ -12,8 +14,10 @@ export interface DbMatchRow {
   team1_id?: string;
   team2_id?: string;
   winner_id?: string;
+  winner_side?: 'team1' | 'team2' | 'none' | null;
+  state_version?: number;
   server_id?: string;
-  status: 'pending' | 'ready' | 'live' | 'completed';
+  status: MatchStatus;
   config?: string;
   /** Game integration that owns the match (integrations/registry); 'cs2' by default. */
   game?: string;
@@ -33,6 +37,7 @@ export interface DbMatchRow {
   held_until?: number | null;
   hold_reason?: string | null;
   countdown_from?: number | null;
+  starts_at?: number | null;
   current_map?: string | null;
   map_number?: number | null;
   team1_name?: string | null;

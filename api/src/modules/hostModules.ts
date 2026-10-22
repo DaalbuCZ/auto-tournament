@@ -21,6 +21,7 @@ export const HOST_MODULES: readonly string[] = [
   'config/trustProxy',
   'core/allocationQueue',
   'core/matchLifecycle',
+  'core/projectMatchState',
   'core/scheduler',
   'middleware/auth',
   'middleware/serverAuth',
