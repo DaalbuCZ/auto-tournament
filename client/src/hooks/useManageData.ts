@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
+import { onSocketReconnect } from '../utils/socketResync';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { scopedSocket } from '../utils/sharedSocket';
 import { api } from '../utils/api';
 import { useIntegrationFor } from '../integrations/registry';
@@ -42,9 +43,13 @@ export function useManageData(
   const tournamentIntegration = useIntegrationFor(tournament);
   const [matches, setMatches] = useState<Match[]>([]);
 
+  const requests = useRef({ matches: 0, tournament: 0 });
+
   const fetchMatches = useCallback(async () => {
+    const id = ++requests.current.matches;
     try {
       const data = await api.get<MatchesResponse>('/api/matches');
+      if (id !== requests.current.matches) return;
       if (data.success) {
         setMatches(data.matches || []);
       }
@@ -55,11 +60,11 @@ export function useManageData(
   }, []);
 
   const fetchTournament = useCallback(async () => {
+    const id = ++requests.current.tournament;
     try {
       const data = await api.get<TournamentResponse>('/api/tournament');
-      if (data.success && data.tournament) {
-        setTournament(data.tournament);
-      }
+      if (id !== requests.current.tournament) return;
+      setTournament(data.success ? (data.tournament ?? null) : null);
     } catch {
       // No tournament configured yet - not an error state for this page.
     }
@@ -96,12 +101,24 @@ export function useManageData(
   // live without a second, independent realtime channel.
   useEffect(() => {
     const socket = scopedSocket();
-    socket.on('match:update', () => void fetchMatches());
-    socket.on('bracket:update', () => void fetchMatches());
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const reload = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        refresh();
+      }, 100);
+    };
+    const events = ['match:update', 'bracket:update', 'tournament:update', 'veto:update'];
+    for (const event of events) socket.on(event, reload);
+    const offReconnect = onSocketReconnect(socket, reload);
     return () => {
+      if (timer) clearTimeout(timer);
+      offReconnect();
+      for (const event of events) socket.off(event, reload);
       socket.disconnect();
     };
-  }, [fetchMatches]);
+  }, [refresh]);
 
   return { loading, error, tournament, matches, availability, refresh };
 }
