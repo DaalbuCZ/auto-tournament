@@ -1,3 +1,4 @@
+import type { MatchObservation } from '../types/matchState.types';
 /**
  * Game integration interface.
  *
@@ -881,6 +882,8 @@ export interface GameIntegration<D extends IntegrationData = IntegrationData> {
    * `Scheduler.startTournament` (`capabilities.veto` and usesPreMatchPhase).
    */
   isReadyToAllocate?(ctx: MatchContext): Promise<boolean>;
+  /** Module-owned observation for the common server-side match state projection. */
+  matchObservation?(match: DbMatchRow): Promise<MatchObservation | null>;
   /**
    * Whether this tournament runs the pre-match phase at all (CS2: the map
    * veto; `settings.cs2.veto: false` turns it off and each match plays maps
