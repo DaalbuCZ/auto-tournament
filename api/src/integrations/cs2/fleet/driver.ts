@@ -1,3 +1,4 @@
+import { transitionMatch, canTransitionMatch } from '../../../core/matchTransitions';
 /**
  * The fleet driver: the platform plays a match on a Ready Up server over the
  * fleet link (FLEET.md §7, §10, §11; Ready Up's
@@ -494,6 +495,9 @@ export async function assignMatch(
     matchSlug,
   ]);
   if (!match) return { success: false, error: 'Match not found' };
+  const command = options.resume ? 'resume_assignment' : 'accept_assignment';
+  if (match.server_id !== cs2ServerId || !canTransitionMatch(match, command))
+    return { success: false, error: 'The match no longer accepts this assignment' };
 
   let config: AssignConfig;
   let served: MatchConfig;
@@ -583,8 +587,10 @@ export async function assignMatch(
   silentUntil.delete(cs2ServerId);
   await storeAckedConfig(matchSlug, epoch, config);
   if (!options.resume) matchLiveStatsService.reset(matchSlug);
-  const status = options.resume && match.status === 'live' ? 'live' : 'loaded';
-  await db.updateAsync('matches', { status, loaded_at: nowS() }, 'slug = ?', [matchSlug]);
+  if (!(await transitionMatch(match, command, { loaded_at: nowS() }))) {
+    await unassignEpoch(fleetServerId, matchSlug, epoch, 'superseded');
+    return { success: false, error: 'The match changed before the server accepted it' };
+  }
   log.matchLoaded(matchSlug, cs2ServerId, true);
   const updated = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
     matchSlug,
