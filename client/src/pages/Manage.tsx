@@ -105,8 +105,8 @@ export default function Manage() {
   }, [t]);
 
   const statusCounts = useMemo(
-    () => computeStatusCounts(matches, summary?.waitingMatches ?? 0, tournament?.type),
-    [matches, summary, tournament?.type]
+    () => computeStatusCounts(matches, tournament?.type),
+    [matches, tournament?.type]
   );
   const needsYouItems = useMemo(
     () =>

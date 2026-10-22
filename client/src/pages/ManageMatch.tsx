@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import type { MatchAction, MatchStateView } from '../types/matchState.types';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link as RouterLink, useParams } from 'react-router-dom';
 import {
   Alert,
@@ -118,6 +119,7 @@ interface ManageView {
   match: {
     slug: string;
     status: string;
+    state: MatchStateView;
     tournamentId: number | null;
     round: number;
     matchNumber: number | null;
@@ -352,7 +354,9 @@ export default function ManageMatch() {
   const { slug = '', id = '' } = useParams<{ slug: string; id: string }>();
   const socket = useSocket();
   const { showError, showSuccess } = useSnackbar();
-  const [view, setView] = useState<ManageView | null>(null);
+  const [snapshot, setView] = useState<ManageView | null>(null);
+  const view = snapshot?.match.slug === slug ? snapshot : null;
+  const request = useRef({ id: 0 });
   const [failed, setFailed] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmActionSpec | null>(null);
   const [connected, setConnected] = useState(socket.connected);
@@ -389,19 +393,21 @@ export default function ManageMatch() {
   const ModulePanel = integration.matchPanels.adminMatchView;
 
   const load = useCallback(async () => {
+    const id = ++request.current.id;
     try {
       const res = await api.get<ManageView & { success: boolean }>(
         `/api/game/cs2/matches/${encodeURIComponent(slug)}/manage`
       );
+      if (id !== request.current.id) return;
       setView(res);
       setFailed(false);
     } catch {
-      setFailed(true);
+      if (id === request.current.id) setFailed(true);
     }
   }, [slug]);
 
   // The veto, while there is no server yet: whose turn, which step, what is banned.
-  const preServerStatus = view && ['pending', 'ready'].includes(view.match.status) && !view.server;
+  const preServerStatus = view?.match.state.actions.includes('restart_veto') ?? false;
   useEffect(() => {
     if (!preServerStatus) return;
     let live = true;
@@ -415,7 +421,11 @@ export default function ManageMatch() {
   }, [preServerStatus, slug, view]);
 
   useEffect(() => {
+    const pending = request.current;
     void load();
+    return () => {
+      pending.id++;
+    };
   }, [load]);
 
   // Live: every change to the match or its server reloads the view.
@@ -507,12 +517,9 @@ export default function ManageMatch() {
     [state, view]
   );
   const shownRound = rounds.find((r) => r.round_number === selectedRound) ?? null;
-  const live =
-    state?.phase === 'live' || state?.phase === 'overtime' || state?.phase === 'halftime';
-  const paused = state?.pause?.active === true || state?.phase === 'paused';
-  const warmup = state?.phase === 'warmup' || state?.phase === 'loading';
+  const activity = view?.match.state.activity;
+  const live = view?.match.state.roomPhase === 'live';
   const onReadyUp = Boolean(view?.server?.fleet);
-  const preServer = view ? ['pending', 'ready'].includes(view.match.status) && !view.server : false;
   const playerName = (pid: string) =>
     state?.teams.team1.players[pid]?.name || state?.teams.team2.players[pid]?.name || pid;
 
@@ -527,6 +534,7 @@ export default function ManageMatch() {
     );
   }
 
+  const can = (action: MatchAction) => view.match.state.actions.includes(action);
   const log = view.log.filter(
     (l) => levels.includes(l.level) && (source === 'all' || l.source === source)
   );
@@ -792,8 +800,9 @@ export default function ManageMatch() {
   const turnTeam = veto ? (veto.currentTurn === 'team1' ? t1 : t2) : '';
   const lastRound = rounds.length ? rounds[rounds.length - 1] : null;
   let banner: Parameters<typeof MatchStateBanner>[0] | null = null;
-  if (view.match.status === 'completed') {
-    const winner = mapsWon[0] > mapsWon[1] ? t1 : mapsWon[1] > mapsWon[0] ? t2 : null;
+  if (activity === 'completed') {
+    const winner =
+      view.match.state.winner === 'team1' ? t1 : view.match.state.winner === 'team2' ? t2 : null;
     banner = {
       name: 'Finished',
       tone: 'done',
@@ -811,7 +820,7 @@ export default function ManageMatch() {
           ]
         : [],
     };
-  } else if (view.server && view.server.online === false) {
+  } else if (activity === 'offline' && view.server) {
     banner = {
       name: 'Server offline',
       tone: 'problem',
@@ -829,7 +838,7 @@ export default function ManageMatch() {
         },
       ],
     };
-  } else if (state && live && state.game?.warmup === true) {
+  } else if (activity === 'inconsistent') {
     // CS2 and Ready Up disagree (the MatchStates board): e.g. bots joined an empty
     // server after the map went live and CS2 started its own warmup.
     banner = {
@@ -857,7 +866,7 @@ export default function ManageMatch() {
         },
       ],
     };
-  } else if (state && paused) {
+  } else if (state && activity === 'paused') {
     const since = state.pause?.started_at;
     banner = {
       name: 'Paused',
@@ -868,7 +877,7 @@ export default function ManageMatch() {
       body: `${state.round ? `Round ${state.round.number}. ` : ''}Unpauses when both teams type .unpause, or when an admin does.`,
       buttons: [{ label: 'Unpause now…', tone: 'primary', onClick: askUnpause }],
     };
-  } else if (state && warmup) {
+  } else if (state && activity === 'warmup') {
     const all = [...roster('team1'), ...roster('team2')];
     banner = {
       name: 'Warmup',
@@ -876,11 +885,13 @@ export default function ManageMatch() {
       title: `On ${view.server?.name ?? 'the server'} · warmup · ${all.filter((p) => p.ready).length} of ${all.length} ready`,
       body: `Players are joining. ${readyLine('team1')}; ${readyLine('team2')}.`,
       buttons: [
-        { label: 'Force ready…', onClick: askForceReady },
-        { label: 'Start map now…', tone: 'primary', onClick: () => askStart() },
+        ...(can('force_ready') ? [{ label: 'Force ready…', onClick: askForceReady }] : []),
+        ...(can('start')
+          ? [{ label: 'Start map now…', tone: 'primary' as const, onClick: () => askStart() }]
+          : []),
       ],
     };
-  } else if (preServer && veto && veto.status !== 'completed') {
+  } else if (activity === 'veto' && veto) {
     const banned = (veto.actions ?? [])
       .filter((a) => a.action === 'ban' && a.mapName)
       .map((a) => `${mapLabel(a.mapName)} (${a.team === 'team1' ? t1 : t2})`);
@@ -900,31 +911,62 @@ export default function ManageMatch() {
         { label: 'Restart veto', onClick: askRestartVeto },
       ],
     };
-  } else if (preServer) {
+  } else if (activity === 'queued') {
     const picked = (veto?.pickedMaps ?? []).map((m) => mapLabel(m.mapName));
     banner = {
       name: 'Waiting for a server',
       tone: 'progress',
-      title:
-        view.match.status === 'ready'
+      title: can('allocate')
+        ? view.match.state.requiresPreMatch
           ? 'Veto done · waiting for a free server'
-          : 'Waiting for the teams',
+          : 'Waiting for a free server'
+        : 'Waiting for the teams',
+      body: can('allocate')
+        ? `${picked.length ? `Maps: ${picked.join(', ')}. ` : ''}Every server is busy; the next free one is taken automatically. You can give it one now.`
+        : 'Both teams need to be known before the veto starts.',
+      buttons: can('allocate')
+        ? [
+            {
+              label: 'Pick a server…',
+              tone: 'server',
+              onClick: () => setDialog({ kind: 'allocate' }),
+              testId: 'manage-state-allocate',
+            },
+            { label: 'Restart veto', onClick: askRestartVeto },
+          ]
+        : [],
+    };
+  } else {
+    const labels: Partial<Record<MatchStateView['activity'], string>> = {
+      cancelled: 'Cancelled',
+      needs_decision: 'Needs admin decision',
+      held: 'Match on hold',
+      waiting_team: 'Waiting for a team to finish',
+      veto: 'Veto',
+      scheduled: 'Scheduled',
+      not_started: 'Tournament not started',
+      waiting_opponent: 'Waiting for teams',
+      live: 'Live',
+      halftime: 'Halftime',
+      overtime: 'Overtime',
+      knife: 'Knife round',
+      side_pick: 'Choosing sides',
+      between_maps: 'Between maps',
+      loading: 'Loading',
+      reporting: 'Waiting for a result',
+      unknown: 'Waiting for server state',
+    };
+    const label = labels[view.match.state.activity] ?? 'Waiting for server state';
+    banner = {
+      name: label,
+      title: label,
+      tone: can('decide') ? 'attention' : activity === 'cancelled' ? 'done' : 'progress',
       body:
-        view.match.status === 'ready'
-          ? `${picked.length ? `Maps: ${picked.join(', ')}. ` : ''}Every server is busy; the next free one is taken automatically. You can give it one now.`
-          : 'Both teams need to be known before the veto starts.',
-      buttons:
-        view.match.status === 'ready'
-          ? [
-              {
-                label: 'Pick a server…',
-                tone: 'server',
-                onClick: () => setDialog({ kind: 'allocate' }),
-                testId: 'manage-state-allocate',
-              },
-              { label: 'Restart veto', onClick: askRestartVeto },
-            ]
-          : [],
+        view.match.state.blockers
+          .map((b) => b.reason)
+          .filter(Boolean)
+          .join(' · ') || undefined,
+      buttons: [],
     };
   }
 
@@ -1044,7 +1086,7 @@ export default function ManageMatch() {
             </Typography>
             <Typography sx={{ color: color.muted }}>{t2}</Typography>
           </Box>
-          {paused && (
+          {can('unpause') && (
             <Typography sx={{ color: color.warning }}>
               Paused{state.pause?.type ? ` (${state.pause.type})` : ''}
               {state.pause?.by ? `, by ${state.pause.by}` : ''}
@@ -1237,20 +1279,20 @@ export default function ManageMatch() {
         </Section>
       )}
 
-      {onReadyUp && state && (
+      {onReadyUp && state && view.match.state.lifecycle === 'active' && (
         <Target
           dot={color.accent}
           title="Match"
           who="sent to the Ready Up plugin on the server"
           state={state.phase}
         >
-          {warmup && (
+          {can('force_ready') && (
             <Group label="Ready-up">
               <Button onClick={askForceReady}>Force ready</Button>
               <Button onClick={() => askStart()}>Start map</Button>
             </Group>
           )}
-          {live && !paused && (
+          {can('pause') && (
             <Group label="Pause">
               <Button
                 onClick={() =>
@@ -1271,12 +1313,12 @@ export default function ManageMatch() {
               </Button>
             </Group>
           )}
-          {paused && (
+          {can('unpause') && (
             <Group label="Pause">
               <Button onClick={askUnpause}>Unpause</Button>
             </Group>
           )}
-          {(live || paused || warmup) && (
+          {can('change_map') && (
             <Group label="Map">
               <Button
                 onClick={() =>
@@ -1346,7 +1388,7 @@ export default function ManageMatch() {
             </Button>
             <Button onClick={() => setDialog({ kind: 'message' })}>Message all</Button>
           </Group>
-          {(live || paused || warmup) && (
+          {can('change_map') && (
             <Group label="End">
               {(['team1', 'team2'] as const).map((w) => (
                 <Button
@@ -1460,15 +1502,15 @@ export default function ManageMatch() {
       )}
 
       <Target dot={color.live} title="Tournament" who="changes the platform: veto, result, chat">
-        {['pending', 'ready'].includes(view.match.status) && !view.server && (
+        {can('restart_veto') && (
           <Group label="Veto">
             <Button onClick={askRestartVeto}>Restart veto</Button>
             <Button onClick={() => setDialog({ kind: 'actFor' })}>Act for a team</Button>
           </Group>
         )}
-        {!['completed', 'cancelled'].includes(view.match.status) && (
+        {can('hold') || can('decide') ? (
           <Group label="Result">
-            {['pending', 'ready', 'loaded'].includes(view.match.status) && (
+            {can('hold') && (
               <Button
                 onClick={() =>
                   document
@@ -1479,7 +1521,7 @@ export default function ManageMatch() {
                 Hold match
               </Button>
             )}
-            {view.match.status === 'needs_decision' &&
+            {can('decide') &&
               (['team1', 'team2'] as const).map((w) => (
                 <Button
                   key={w}
@@ -1504,11 +1546,11 @@ export default function ManageMatch() {
                 </Button>
               ))}
           </Group>
-        )}
+        ) : null}
         <Group label="Chat">
           <Button onClick={() => openChat(`match:${slug}`, matchName)}>Open match chat</Button>
         </Group>
-        {view.match.status !== 'completed' && view.match.status !== 'cancelled' && (
+        {can('cancel') && (
           <Group label="Cancel">
             <Button
               color="error"
@@ -1537,7 +1579,7 @@ export default function ManageMatch() {
         )}
       </Target>
 
-      {['pending', 'ready', 'loaded'].includes(view.match.status) && (
+      {can('hold') && (
         <Section title="Hold this match" testId="manage-hold">
           <MatchHoldPanel
             matchSlug={slug}
@@ -1548,11 +1590,9 @@ export default function ManageMatch() {
         </Section>
       )}
 
-      {['pending', 'ready', 'loaded', 'live'].includes(view.match.status) && (
-        <LineupPanel matchSlug={slug} admin />
-      )}
+      {can('edit_lineup') && <LineupPanel matchSlug={slug} admin />}
 
-      {onReadyUp && (
+      {onReadyUp && can('edit_lineup') && (
         <Section title="Roster" testId="manage-roster">
           <FleetRosterEditor matchSlug={slug} onSuccess={showSuccess} />
         </Section>
@@ -1909,7 +1949,7 @@ export default function ManageMatch() {
       </Section>
 
       <Menu open={Boolean(menu)} anchorEl={menu?.anchor} onClose={() => setMenu(null)}>
-        {warmup && (
+        {can('force_ready') && (
           <MenuItem
             onClick={() => {
               const m = menu;
