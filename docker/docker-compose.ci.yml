@@ -19,4 +19,5 @@ services:
   # limit failed every shard (2026-10-09), then ECR Public's anonymous data
   # limit did (2026-10-12). Same image, another registry.
   postgres:
+    ports: ['127.0.0.1:55482:5432']
     image: mirror.gcr.io/library/postgres:16-alpine
