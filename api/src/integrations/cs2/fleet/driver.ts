@@ -1,3 +1,4 @@
+import { withMatchCommandLock } from '../../../core/matchCommandLock';
 import { transitionMatch, canTransitionMatch } from '../../../core/matchTransitions';
 /**
  * The fleet driver: the platform plays a match on a Ready Up server over the
@@ -518,32 +519,47 @@ export async function assignMatch(
     return { success: false, error: message };
   }
 
-  const record = await liveStateStore.beginAssignment(matchSlug, fleetServerId, 1);
-  const epoch = record.epoch;
-  if (!options.resume) {
-    // A fresh start: round backups under this slug are an earlier match's (a
-    // recreated tournament reuses the slugs). Left, a failover would resume
-    // from them (NTLAN trial run 2: r1m1 resumed at round 11 of the previous
-    // tournament's r1m1).
-    const stale = await roundBackupStore.forget(matchSlug);
-    if (stale > 0)
-      log.info(
-        `[FLEET] ${matchSlug}: ${stale} round backup(s) from an earlier match with this slug removed`
-      );
-  }
-  await saveAssignment({ matchSlug, epoch, serverId: fleetServerId, cs2ServerId, password });
-
+  let epoch = 0;
   let sent;
   try {
-    sent = await sendReliable(fleetServerId, {
-      type: 'match.assign',
-      payload: {
-        match_id: matchSlug,
-        epoch,
-        config_rev: 1,
-        config,
-        ...(options.resume ? { resume: options.resume } : {}),
-      },
+    sent = await withMatchCommandLock(matchSlug, async () => {
+      const current = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
+        matchSlug,
+      ]);
+      if (
+        !current ||
+        current.status !== match.status ||
+        current.server_id !== cs2ServerId ||
+        (current.state_version ?? 0) !== (match.state_version ?? 0)
+      ) {
+        throw new Error('The match changed before assignment could be sent');
+      }
+      const record = await liveStateStore.beginAssignment(matchSlug, fleetServerId, 1);
+      epoch = record.epoch;
+      if (!options.resume) {
+        // A fresh start: round backups under this slug are an earlier match's (a
+        // recreated tournament reuses the slugs). Left, a failover would resume
+        // from them (NTLAN trial run 2: r1m1 resumed at round 11 of the previous
+        // tournament's r1m1).
+        const stale = await roundBackupStore.forget(matchSlug);
+        if (stale > 0)
+          log.info(
+            `[FLEET] ${matchSlug}: ${stale} round backup(s) from an earlier match with this slug removed`
+          );
+      }
+      await saveAssignment({ matchSlug, epoch, serverId: fleetServerId, cs2ServerId, password });
+      if (!options.resume) matchLiveStatsService.reset(matchSlug);
+
+      return sendReliable(fleetServerId, {
+        type: 'match.assign',
+        payload: {
+          match_id: matchSlug,
+          epoch,
+          config_rev: 1,
+          config,
+          ...(options.resume ? { resume: options.resume } : {}),
+        },
+      });
     });
   } catch (error) {
     await markEnded(matchSlug, epoch);
@@ -586,8 +602,21 @@ export async function assignMatch(
 
   silentUntil.delete(cs2ServerId);
   await storeAckedConfig(matchSlug, epoch, config);
-  if (!options.resume) matchLiveStatsService.reset(matchSlug);
-  if (!(await transitionMatch(match, command, { loaded_at: nowS() }))) {
+  let accepted = await transitionMatch(match, command, { loaded_at: nowS() });
+  if (!accepted) {
+    // Current-epoch telemetry can prove acceptance before cmd.result reaches us.
+    const [current, assignment] = await Promise.all([
+      db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [matchSlug]),
+      getAssignment(matchSlug),
+    ]);
+    accepted =
+      current?.server_id === cs2ServerId &&
+      (current.status === 'loaded' || current.status === 'live') &&
+      assignment?.epoch === epoch &&
+      assignment.serverId === fleetServerId &&
+      assignment.endedAt === null;
+  }
+  if (!accepted) {
     await unassignEpoch(fleetServerId, matchSlug, epoch, 'superseded');
     return { success: false, error: 'The match changed before the server accepted it' };
   }

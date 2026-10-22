@@ -98,6 +98,8 @@ export async function transitionMatch(
   if (command === 'complete' || command === 'cancel')
     values.completed_at = Math.floor(Date.now() / 1000);
   if (command === 'accept_assignment') values.loaded_at = Math.floor(Date.now() / 1000);
+  if (command === 'start_play' && !match.loaded_at)
+    values.loaded_at = Math.floor(Date.now() / 1000);
   const entries = Object.entries(values);
   return withMatchCommandLock(match.slug, async () => {
     const rows = await db.queryAsync<{ id: number }>(
