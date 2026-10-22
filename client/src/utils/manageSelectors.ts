@@ -19,14 +19,7 @@ import { getRoundLabel } from './matchUtils';
 
 /** Mirrors the "does this match have real, assigned teams" check Matches.tsx uses. */
 export function hasAssignedTeams(match: Match): boolean {
-  if (match.round === 0) {
-    const cfgTeam1Name = (match.config?.team1 as { name?: string } | undefined)?.name;
-    const cfgTeam2Name = (match.config?.team2 as { name?: string } | undefined)?.name;
-    return Boolean(
-      cfgTeam1Name && cfgTeam1Name !== 'TBD' && cfgTeam2Name && cfgTeam2Name !== 'TBD'
-    );
-  }
-  return Boolean(match.team1 && match.team2);
+  return match.state?.participantsReady ?? false;
 }
 
 export interface ManageStatusCounts {
@@ -45,8 +38,6 @@ export interface ManageStatusCounts {
  */
 export function computeStatusCounts(
   matches: Match[],
-  /** Matches waiting for a resource, from the module's `summarizeAvailability` (0 without one). */
-  queued: number,
   /**
    * The tournament's type: only an elimination bracket names its last rounds
    * (Finals, Semi-finals); a shuffle, Swiss or round robin round is "Round N",
@@ -54,22 +45,14 @@ export function computeStatusCounts(
    */
   type?: string
 ): ManageStatusCounts {
-  const live = matches.filter(
-    (m) => (m.status === 'live' || m.status === 'loaded') && hasAssignedTeams(m)
-  ).length;
+  const live = matches.filter((m) => m.state?.lifecycle === 'active' && hasAssignedTeams(m)).length;
 
-  const inVeto = matches.filter(
-    (m) =>
-      type !== 'shuffle' &&
-      (m.status === 'pending' || m.status === 'ready') &&
-      m.vetoCompleted === false &&
-      hasAssignedTeams(m)
-  ).length;
+  const inVeto = matches.filter((m) => m.state?.activity === 'veto').length;
 
   const bracketMatches = matches.filter((m) => m.round > 0);
   const maxRound = bracketMatches.reduce((max, m) => Math.max(max, m.round), 0);
   const unfinished = bracketMatches.filter(
-    (m) => m.status !== 'completed' && m.status !== 'cancelled'
+    (m) => m.state?.lifecycle !== 'completed' && m.state?.lifecycle !== 'cancelled'
   );
   const currentRound =
     unfinished.length > 0 ? Math.min(...unfinished.map((m) => m.round)) : maxRound;
@@ -81,7 +64,8 @@ export function computeStatusCounts(
   return {
     live,
     inVeto,
-    queued,
+    queued: matches.filter((m) => m.state?.activity === 'queued' && m.state.requiresResource)
+      .length,
     roundLabel,
   };
 }
@@ -125,7 +109,7 @@ export function computeNeedsYouItems(
   const items: NeedsYouItem[] = [];
 
   for (const match of matches) {
-    if ((match.status as string) !== 'needs_decision') continue;
+    if (match.state?.activity !== 'needs_decision') continue;
     items.push({
       id: `decision-${match.slug}`,
       severity: 'warn',
@@ -166,7 +150,7 @@ export function computeRecentEvents(matches: Match[], limit = 8): RecentEvent[] 
   const events: RecentEvent[] = [];
 
   for (const match of matches) {
-    if (match.status !== 'completed') continue;
+    if (match.state?.lifecycle !== 'completed') continue;
     const t1 =
       match.team1?.name ?? match.config?.team1?.name ?? i18n.t('managePage.recent.team1Fallback');
     const t2 =

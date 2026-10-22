@@ -60,15 +60,11 @@ export function MatchesTable({
   const attentionOf = (match: Match): string | null => {
     const call = calls.filter((c) => c.matchSlug === match.slug).length;
     if (call > 0) return t('matchesPage.table.attention.calls', { count: call });
-    if ((match.status as string) === 'needs_decision')
-      return t('matchesPage.table.attention.decide');
+    if (match.state?.activity === 'needs_decision') return t('matchesPage.table.attention.decide');
     return null;
   };
 
-  const vetoing = (m: Match) =>
-    (m.status === 'pending' || m.status === 'ready') &&
-    m.vetoCompleted === false &&
-    Boolean(m.team1 && m.team2);
+  const vetoing = (m: Match) => m.state?.activity === 'veto';
   const all = useMemo(() => [...live, ...upcoming, ...history], [live, upcoming, history]);
   const counts: Record<Filter, number> = {
     attention: all.filter((m) => attentionOf(m) !== null).length,
@@ -116,38 +112,22 @@ export function MatchesTable({
       m.team2?.name ?? m.config?.team2?.name ?? t('matchesPage.table.tbd')
     }`;
   const phaseOf = (m: Match): { text: string; tone: 'ok' | 'warn' | 'muted' | 'info' } => {
-    if (live.includes(m)) {
-      const map = typeof m.mapNumber === 'number' ? m.mapNumber + 1 : 1;
-      const score =
-        typeof m.team1MapScore === 'number' && typeof m.team2MapScore === 'number'
-          ? ` · ${m.team1MapScore}–${m.team2MapScore}`
-          : '';
+    const activity = m.state?.activity ?? 'unknown';
+    const score =
+      typeof m.team1MapScore === 'number' && typeof m.team2MapScore === 'number'
+        ? ` · ${m.team1MapScore}–${m.team2MapScore}`
+        : '';
+    if (activity === 'live' || activity === 'overtime' || activity === 'halftime') {
       const event = latestEvent(m);
       return {
-        text: `${t('matchesPage.table.phase.live', { map })}${score}${event ? ` · ${event}` : ''}`,
+        text: `${t(`matchState.${activity}`)}${score}${event ? ` · ${event}` : ''}`,
         tone: 'ok',
       };
     }
-    if (history.includes(m)) {
-      const s1 = m.team1SeriesScore ?? m.team1Score;
-      const s2 = m.team2SeriesScore ?? m.team2Score;
-      return {
-        text:
-          typeof s1 === 'number' && typeof s2 === 'number'
-            ? t('matchesPage.table.phase.finishedScore', { score: `${s1}–${s2}` })
-            : t('matchesPage.table.phase.finished'),
-        tone: 'muted',
-      };
-    }
-    if (vetoing(m)) return { text: t('matchesPage.table.phase.veto'), tone: 'warn' };
-    if (!m.team1 || !m.team2)
-      return { text: t('matchesPage.table.phase.waitingTeams'), tone: 'muted' };
-    if (typeof m.queuePosition === 'number')
-      return {
-        text: t('matchesPage.table.phase.queued', { position: m.queuePosition }),
-        tone: 'info',
-      };
-    return { text: t('matchesPage.table.phase.waiting'), tone: 'muted' };
+    return {
+      text: t(`matchState.${activity}`),
+      tone: activity === 'needs_decision' ? 'warn' : 'muted',
+    };
   };
 
   const filters: Filter[] = ['attention', 'live', 'veto', 'waiting', 'finished', 'all'];

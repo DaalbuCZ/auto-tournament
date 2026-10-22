@@ -84,7 +84,7 @@ test(
 );
 
 test(
-  'a live map stuck in CS2’s warmup shows the mismatch; players show ping and a fresh join',
+  'the server reports disagreement; UI does not infer it from raw telemetry',
   { tag: ['@ui', '@manage'] },
   async ({ page, request }) => {
     test.setTimeout(120_000);
@@ -149,6 +149,20 @@ test(
       },
     });
     expect(snap.ok(), await snap.text()).toBe(true);
+    // This is a renderer fixture, not a real fleet assignment. The API's canonical
+    // activity must win even when its diagnostic telemetry says something else.
+    await page.route(`**/api/game/cs2/matches/${slug}/manage`, async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.match.state = {
+        ...body.match.state,
+        activity: 'inconsistent',
+        roomPhase: 'blocked',
+        actions: ['start'],
+      };
+      body.live.state.game.warmup = false;
+      await route.fulfill({ response, json: body });
+    });
     await page.goto(`/manage/tournaments/${setup!.tournament.id}/matches/${slug}`);
     const state = page.getByTestId('manage-state');
     await expect(state).toHaveAttribute('data-state', 'Game and Ready Up disagree', {
