@@ -65,8 +65,7 @@ export function NextMatchCard({
   const { t } = useTranslation();
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
   // Only waiting on another match needs the bracket.
-  const waiting =
-    !match.opponent || (match.status !== 'loaded' && match.status !== 'live' && !match.server);
+  const waiting = match.state.activity === 'waiting_opponent' || match.state.activity === 'queued';
   const bracket = usePublicBracket(waiting ? tournamentId : undefined);
   const card = nextMatchCard(
     match,

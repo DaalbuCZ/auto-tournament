@@ -181,6 +181,10 @@ export const SharedNavBar: React.FC<SharedNavBarProps> = ({ adminArea = false })
     veto_soon: t('nav.matchStatus.vetoSoon', 'Veto soon'),
     waiting_server: t('nav.matchStatus.waitingServer'),
     match_ready: t('nav.matchStatus.matchReady'),
+    on_hold: t('matchState.held'),
+    report_result: t('matchState.reporting'),
+    needs_decision: t('matchState.needs_decision'),
+    state_unknown: t('matchState.unknown'),
   };
 
   const { pathname } = location;

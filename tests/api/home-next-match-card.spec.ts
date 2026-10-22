@@ -1,99 +1,91 @@
 import { test, expect } from '@playwright/test';
+import { projectNextMatchCard } from '../../api/src/core/projectNextMatchCard';
+import { projectMatchState, type MatchStateFacts } from '../../api/src/core/projectMatchState';
 import { nextMatchCard } from '../../client/src/components/home/nextMatchState';
 import type { TeamMatchInfo } from '../../client/src/types';
 
-/**
- * The home page's next-match card: which state it shows, from the team's current match.
- *
- * @tag api
- */
 const NOW = 1_800_000_000;
-const base = {
-  slug: 'm',
-  round: 2,
-  matchNumber: 1,
+const base: MatchStateFacts = {
   status: 'pending',
-  isTeam1: true,
-  opponent: { id: 'b', name: 'B' },
-  server: null,
-  maps: [],
-  mapResults: [],
-  matchFormat: 'bo3',
-} as unknown as TeamMatchInfo;
-const card = (m: Partial<TeamMatchInfo>) => nextMatchCard({ ...base, ...m } as TeamMatchInfo, NOW);
+  participantsReady: true,
+  tournamentStatus: 'in_progress',
+  tournamentPaused: false,
+  resumeAt: null,
+  heldUntil: null,
+  holdReason: null,
+  opensAt: null,
+  teamBusy: false,
+  requiresResource: true,
+  assigned: false,
+  requiresPreMatch: true,
+  preMatchCompleted: false,
+  observation: null,
+  winner: null,
+  now: NOW,
+};
+const card = (
+  facts: Partial<MatchStateFacts>,
+  display: Partial<Parameters<typeof projectNextMatchCard>[0]> = {}
+) =>
+  projectNextMatchCard({
+    state: projectMatchState({ ...base, ...facts }),
+    viewerSide: 'team1',
+    vetoTurn: 'team1',
+    vetoAction: 'pick',
+    viewerConnected: false,
+    readyPlayers: 1,
+    expectedPlayers: 4,
+    score: [7, 5],
+    seriesScore: [0, 1],
+    map: 'Ancient',
+    round: 13,
+    ...display,
+  });
 
-test('before the match: opponent, start time, break, veto, server', () => {
-  expect(card({ opponent: null }).small.key).toBe('opponent');
-  expect(card({ startsAt: NOW + 3600 }).small.key).toBe('startsAt');
-  const held = card({ heldUntil: NOW + 120 });
-  expect([held.tone, held.countdownTo, held.small.key]).toEqual(['act', NOW + 120, 'untilVeto']);
-  const veto = { status: 'in_progress', pickedMaps: [], actions: [] } as const;
-  expect(card({ veto: { ...veto, currentTurn: 'team1', currentAction: 'pick' } })).toMatchObject({
+test('the server chooses opponent, hold, veto turn and queue prompts', () => {
+  expect(card({ participantsReady: false }).small.key).toBe('opponent');
+  expect(card({ heldUntil: NOW + 120 })).toMatchObject({
     tone: 'act',
-    small: { key: 'pick' },
-    action: 'veto',
+    countdownTo: NOW + 120,
+    small: { key: 'untilVeto' },
   });
-  expect(card({ veto: { ...veto, currentTurn: 'team2', currentAction: 'ban' } }).small.key).toBe(
-    'theirTurn'
-  );
-  const done = { status: 'completed', pickedMaps: [], actions: [] } as const;
-  expect(card({ status: 'ready', veto: done })).toMatchObject({
-    tone: 'wait',
-    small: { key: 'forServer' },
-  });
+  expect(card({ heldUntil: NOW + 120, preMatchCompleted: true }).small.key).toBe('untilMatch');
+  expect(card({})).toMatchObject({ tone: 'act', small: { key: 'pick' }, action: 'veto' });
+  expect(card({}, { vetoTurn: 'team2' }).small.key).toBe('theirTurn');
+  expect(card({ status: 'ready', preMatchCompleted: true }).small.key).toBe('forServer');
 });
 
-test('waiting on another match shows the estimate when there is one', () => {
-  const m = { ...base, opponent: null } as TeamMatchInfo;
-  expect(nextMatchCard(m, NOW, 12).big).toEqual({ key: 'about', values: { minutes: 12 } });
-  expect(nextMatchCard(m, NOW, null).big).toEqual({ text: 'TBD' });
-});
-
-test('on the server: join, warmup, live from our side, between maps', () => {
-  expect(card({ status: 'loaded' })).toMatchObject({ tone: 'act', action: 'join' });
-  const players = [
-    { steamId: '1', name: 'a', team: 'team1', connectedAt: 0, isReady: true },
-    { steamId: '2', name: 'b', team: 'team2', connectedAt: 0, isReady: false },
-  ] as const;
-  const warm = card({
-    status: 'loaded',
-    config: { expected_players_total: 4 },
-    connectionStatus: {
-      matchSlug: 'm',
-      connectedPlayers: [...players],
-      team1Connected: 1,
-      team2Connected: 1,
-      totalConnected: 2,
-      lastUpdated: 0,
-    },
-  });
-  expect(warm.big).toEqual({ text: '1/4' });
-  const stats = {
-    matchSlug: 'm',
-    team1Score: 5,
-    team2Score: 7,
-    roundNumber: 13,
-    mapNumber: 0,
-    status: 'live',
-    lastEventAt: 0,
-    team1SeriesScore: 0,
-    team2SeriesScore: 1,
-    mapName: 'Ancient',
-    totalMaps: 3,
-  } as const;
-  // We are team2 here: our score first.
-  expect(card({ status: 'live', isTeam1: false, liveStats: { ...stats } }).big).toEqual({
-    text: '7 – 5',
-  });
+test('an unknown or offline server is never presented as ready to join', () => {
+  expect(card({ status: 'loaded', assigned: true }).action).toBe('open');
   expect(
     card({
-      status: 'live',
-      liveStats: { ...stats },
-      server: { id: 's', name: 's', host: 'h', port: 1, status: 'paused' },
-    })
-  ).toMatchObject({ tone: 'wait', small: { key: 'paused' }, big: { text: '5 – 7' } });
-  expect(card({ status: 'live', liveStats: { ...stats, status: 'postgame' } })).toMatchObject({
+      status: 'loaded',
+      assigned: true,
+      observation: { activity: 'warmup', online: false, observedAt: NOW },
+    }).action
+  ).toBe('open');
+});
+
+test('observed play selects join, warmup, pause and between-map prompts', () => {
+  const active = { status: 'live', assigned: true } as const;
+  const phase = (activity: 'warmup' | 'live' | 'paused' | 'between_maps') => ({
+    ...active,
+    observation: { activity, online: true, observedAt: NOW },
+  });
+  expect(card(phase('warmup'))).toMatchObject({ action: 'join' });
+  expect(card(phase('warmup'), { viewerConnected: true }).big).toEqual({ text: '1/4' });
+  expect(card(phase('live')).big).toEqual({ text: '7 – 5' });
+  expect(card(phase('paused'))).toMatchObject({ tone: 'wait', small: { key: 'paused' } });
+  expect(card(phase('between_maps'))).toMatchObject({
     big: { text: '0 – 1' },
     small: { key: 'nextMap' },
   });
+});
+
+test('the UI uses the server prompt even when legacy fields contradict it', () => {
+  const prompt = card({ heldUntil: NOW + 120 });
+  const match = { status: 'live', heldUntil: null, nextCard: prompt } as TeamMatchInfo;
+  expect(nextMatchCard(match, NOW)).toBe(prompt);
+  const waiting = { ...match, nextCard: card({ participantsReady: false }) };
+  expect(nextMatchCard(waiting, NOW, 12).big).toEqual({ key: 'about', values: { minutes: 12 } });
 });
