@@ -52,7 +52,11 @@ export interface UsePublicBracketResult {
 export function usePublicBracket(
   tournamentId: number | string | undefined
 ): UsePublicBracketResult {
-  const [data, setData] = useState<PublicBracketResponse | null>(null);
+  const [snapshot, setSnapshot] = useState<{ scope: string; data: PublicBracketResponse } | null>(
+    null
+  );
+  const data = snapshot?.scope === String(tournamentId) ? snapshot.data : null;
+  const request = useRef({ id: 0 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const socket = useSocket();
@@ -60,28 +64,35 @@ export function usePublicBracket(
 
   const load = useCallback(async () => {
     if (tournamentId === undefined) return;
+    const id = ++request.current.id;
     try {
       const response = await api.get<PublicBracketResponse>(
         `/api/tournament/${tournamentId}/bracket`
       );
-      setData(response);
+      if (id !== request.current.id) return;
+      setSnapshot({ scope: String(tournamentId), data: response });
       setError('');
     } catch (err: unknown) {
+      if (id !== request.current.id) return;
       const message = err instanceof Error ? err.message : String(err);
       // No bracket yet (nothing generated) is an empty state, not an error.
       if (message.includes('404') || message.toLowerCase().includes('not found')) {
-        setData(null);
+        setSnapshot(null);
         setError('');
       } else {
         setError(message);
       }
     } finally {
-      setLoading(false);
+      if (id === request.current.id) setLoading(false);
     }
   }, [tournamentId]);
 
   useEffect(() => {
+    const pending = request.current;
     void load();
+    return () => {
+      pending.id++;
+    };
   }, [load]);
 
   useEffect(() => {
