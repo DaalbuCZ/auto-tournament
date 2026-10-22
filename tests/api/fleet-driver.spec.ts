@@ -289,6 +289,50 @@ test.describe.serial('Fleet driver: Ready Up servers play matches (M1)', () => {
     while (cleanup.length) await cleanup.pop()?.();
   });
 
+  test('play before the assignment acknowledgement keeps its phase and live stats', async ({
+    request,
+  }) => {
+    const fake = await FakeReadyUp.enroll(request);
+    cleanup.push(() => fake.close());
+    await fake.hello();
+    await link(request, fake.serverId);
+    cleanup.push(() => unlink(request, fake.serverId));
+    const slug = `fleet-early-play-${Date.now()}`;
+    cleanup.push(async () => {
+      await request.delete(`/api/matches/${slug}`, { headers: getAuthHeader() });
+    });
+    await createMatch(request, slug);
+    const assign = await fake.client.next(assignFor(slug));
+    const epoch = Number(assign.epoch);
+    fake.snapshot(slug, epoch);
+    fake.event('live.event.phase.json', {
+      slug,
+      epoch,
+      rev: 1,
+      data: { from: 'warmup', to: 'live', reason: 'flow' },
+    });
+    await expect.poll(async () => (await matchRow(request, slug))?.status).toBe('live');
+    const answer = fake.answer(assign);
+    await fake.client.next(
+      (message) => typeof message.ack === 'number' && message.ack >= Number(answer.seq)
+    );
+    const response = await request.get(`/api/matches/${slug}`, { headers: getAuthHeader() });
+    const detail = await response.json();
+    expect(detail.match.status).toBe('live');
+    expect(detail.match.loadedAt).toBeGreaterThan(0);
+    const stats = await (
+      await request.get(`/api/events/live/${slug}`, { headers: getAuthHeader() })
+    ).json();
+    expect(stats.status).toBe('live');
+    expect(
+      fake.client.received.filter(
+        (message) =>
+          message.type === 'match.unassign' &&
+          (message.payload as { match_id?: string }).match_id === slug
+      )
+    ).toEqual([]);
+  });
+
   test('allocation → assign → live → admin cmds → end → unassign → turnover', async ({
     request,
   }) => {
