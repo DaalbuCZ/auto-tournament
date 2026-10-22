@@ -1,3 +1,4 @@
+import { createMatchStateReader } from '../core/matchState';
 import { withoutConfigSecrets } from '../utils/matchConfigSecrets';
 import { discardTournamentRatings } from './ratingService';
 import { db } from '../config/database';
@@ -889,6 +890,7 @@ class TournamentService {
     );
 
     const matches: BracketMatch[] = [];
+    const readState = createMatchStateReader();
 
     for (const row of rows) {
       const match: BracketMatch = {
@@ -898,6 +900,7 @@ class TournamentService {
         matchNumber: row.match_number,
         serverId: row.server_id,
         status: row.status,
+        state: await readState(row),
         nextMatchId: row.next_match_id,
         createdAt: row.created_at,
         loadedAt: row.loaded_at,
@@ -906,11 +909,9 @@ class TournamentService {
         currentMap: row.current_map ?? null,
         mapNumber: row.map_number ?? null,
         ownStartsAt: (row as { starts_at?: number | null }).starts_at ?? null,
-        vetoing:
-          row.status === 'pending' &&
-          Boolean(row.team1_id && row.team2_id) &&
-          !String(row.veto_state ?? '').includes('"status":"completed"'),
+        vetoing: false,
       };
+      match.vetoing = match.state?.activity === 'veto';
 
       // Integration-owned config, forwarded as-is (client slots: PR 12).
       if (row.config) {

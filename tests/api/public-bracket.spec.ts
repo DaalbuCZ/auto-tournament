@@ -26,6 +26,7 @@ const PUBLIC_MATCH_KEYS = new Set([
   'round',
   'matchNumber',
   'status',
+  'state',
   'nextMatchId',
   'createdAt',
   'loadedAt',
@@ -88,6 +89,8 @@ test.describe('Public bracket API', () => {
           expect(match).not.toHaveProperty('serverId');
           expect(match).not.toHaveProperty('config');
           expect(match).not.toHaveProperty('team1Players');
+          expect(match.state.actions).toEqual([]);
+          for (const blocker of match.state.blockers) expect(blocker.reason).toBeNull();
         }
 
         const first = data.matches.find((m: { round: number }) => m.round === 1);

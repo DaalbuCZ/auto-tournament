@@ -1,3 +1,5 @@
+import { transitionMatch } from './matchTransitions';
+import { matchStateFor } from './matchState';
 /**
  * Core scheduler: which matches are ready, the allocation queue, batch waves,
  * and starting or restarting a tournament.
@@ -523,16 +525,7 @@ export class Scheduler {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      // If anything goes wrong after a server_id was assigned, clear it so
-      // polling/allocation can safely retry on another server.
-      try {
-        await db.updateAsync('matches', { server_id: null }, 'slug = ?', [matchSlug]);
-      } catch (rollbackError) {
-        log.error(
-          `Failed to roll back server_id for match ${matchSlug} after allocation error`,
-          rollbackError
-        );
-      }
+      // The integration owns its assignment attempt and conditional cleanup.
       log.error(`Failed to allocate match ${matchSlug}`, error);
       return {
         success: false,
@@ -1010,25 +1003,23 @@ export class Scheduler {
   async cancelTournament(tournamentId: number): Promise<{ ended: number; cancelled: number }> {
     const tournament = await tournamentService.getTournament(tournamentId);
     if (!tournament) throw new Error('No tournament exists');
-    const loaded = await db.queryAsync<DbMatchRow>(
-      `SELECT * FROM matches WHERE tournament_id = ? AND status IN ('loaded', 'live')
-         AND server_id IS NOT NULL AND server_id != ''`,
+    const open = await db.queryAsync<DbMatchRow>(
+      "SELECT * FROM matches WHERE tournament_id = ? AND status NOT IN ('completed', 'cancelled')",
       [tournamentId]
     );
-    const { ended } = await this.endMatchesOnResources(loaded, {
-      reason: 'tournament-cancel',
-      logPrefix: '[CANCEL]',
-    });
-    const open = await db.queryAsync<{ slug: string }>(
-      "SELECT slug FROM matches WHERE tournament_id = ? AND status NOT IN ('completed', 'cancelled')",
-      [tournamentId]
+    const cancelled: DbMatchRow[] = [];
+    for (const match of open) {
+      this.stopPollingForServer(match.slug);
+      if (await transitionMatch(match, 'cancel')) cancelled.push(match);
+    }
+    const { ended } = await this.endMatchesOnResources(
+      cancelled.filter((match) => Boolean(match.server_id)),
+      {
+        reason: 'tournament-cancel',
+        logPrefix: '[CANCEL]',
+      }
     );
-    for (const { slug } of open) this.stopPollingForServer(slug);
     const now = Math.floor(Date.now() / 1000);
-    await db.runAsync(
-      "UPDATE matches SET status = 'cancelled', server_id = NULL WHERE tournament_id = ? AND status NOT IN ('completed', 'cancelled')",
-      [tournamentId]
-    );
     await db.updateAsync('tournament', { status: 'cancelled', updated_at: now }, 'id = ?', [
       tournamentId,
     ]);
@@ -1037,7 +1028,7 @@ export class Scheduler {
     );
     emitTournamentUpdate({ id: tournamentId, status: 'cancelled' });
     emitBracketUpdate({ action: 'tournament_cancelled' });
-    return { ended, cancelled: open.length };
+    return { ended, cancelled: cancelled.length };
   }
 
   async restartTournament(
@@ -1108,15 +1099,9 @@ export class Scheduler {
 
     // Reset all loaded/live matches back to 'ready' status
     if (loadedMatches.length > 0) {
-      await db.runAsync(
-        `UPDATE matches 
-         SET status = 'ready', 
-             loaded_at = NULL,
-             server_id = NULL
-         WHERE tournament_id = ? 
-         AND status IN ('loaded', 'live')`,
-        [tournamentId]
-      );
+      for (const match of loadedMatches) {
+        await transitionMatch(match, 'retry_assignment', { loaded_at: null, server_id: null });
+      }
       log.info(`[RESTART] Reset ${loadedMatches.length} match(es) to 'ready' status`);
     }
 
@@ -1437,6 +1422,7 @@ export class Scheduler {
       matchNumber: row.match_number,
       serverId: row.server_id,
       status: row.status,
+      state: await matchStateFor(row),
       nextMatchId: row.next_match_id,
       createdAt: row.created_at,
       loadedAt: row.loaded_at,
