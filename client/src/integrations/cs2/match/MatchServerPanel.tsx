@@ -15,7 +15,7 @@ import {
   radii,
 } from '../../../module-sdk';
 import type { MatchConnectPanelProps } from '../../types';
-import type { CS2MapData, MatchConnectResponse, MatchServer } from '../cs2.types';
+import type { CS2MapData, MatchConnectResponse } from '../cs2.types';
 import { getMapData, getMapDisplayName } from '../maps/mapData';
 import { copyTextToClipboard } from './clipboard';
 
@@ -36,48 +36,6 @@ function mapDataFor(slug: string | null): CS2MapData | null {
 }
 
 /**
- * The match is over. Its `server_id` stays set, but the server runs another match by now: a
- * Connect there lands on that match's server, which kicks the player (NTLAN, 2026-10-16).
- */
-const isFinished = (status: string | null | undefined): boolean =>
-  status === 'completed' || status === 'cancelled';
-
-/**
- * The server to show, or null for "waiting for a server".
- *
- * `server.status` is the plugin's own status (idle |
- * loading | warmup | knife | live | paused | halftime | postgame | queued |
- * error), filled in only when the server answered, so any value but `error`
- * means it is reachable. Live stats count on their own: they only arrive from
- * a server that is talking to us. (This once compared against 'online' and
- * 'checking', which the route never produces, and a server in `idle` read as
- * unassigned.)
- *
- * The plugin says `idle` for a server with a match loaded that has not been
- * asked again since, so a live match could read "Status: Available": what the
- * match itself is doing is the better answer when there is one.
- */
-function effectiveServer(connect: MatchConnectResponse): MatchServer | null {
-  const { server, liveStatus, matchStatus } = connect;
-  if (!server) return null;
-  const serverStatus = server.status ?? null;
-  const online = (!!serverStatus && serverStatus !== 'error') || !!liveStatus;
-  if (!online) return null;
-  const liveDerived: string | null = liveStatus
-    ? liveStatus
-    : matchStatus === 'live'
-      ? 'live'
-      : matchStatus === 'loaded'
-        ? 'warmup'
-        : null;
-  const status =
-    liveDerived && (!serverStatus || serverStatus === 'idle' || serverStatus === 'queued')
-      ? liveDerived
-      : serverStatus;
-  return { ...server, status: status ?? server.status };
-}
-
-/**
  * How the viewer joins this match, read by slug and read again whenever the
  * match, the bracket or the connection moves: a server gets assigned, the map
  * changes, the server's status changes. Null until the first answer.
@@ -87,16 +45,21 @@ function useMatchConnect(
   enabled: boolean,
   matchStatus: string | undefined
 ): { connect: MatchConnectResponse | null; reload: () => Promise<void> } {
-  const [connect, setConnect] = useState<MatchConnectResponse | null>(null);
+  const [snapshot, setSnapshot] = useState<{ slug: string; view: MatchConnectResponse } | null>(
+    null
+  );
+  const connect = snapshot?.slug === matchSlug ? snapshot.view : null;
+  const request = useRef({ id: 0 });
   const socket = useSocket();
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(async () => {
+    const id = ++request.current.id;
     try {
       const res = await api.get<MatchConnectResponse>(
         `/api/game/cs2/matches/${encodeURIComponent(matchSlug)}/connect`
       );
-      if (res.success) setConnect(res);
+      if (res.success && id === request.current.id) setSnapshot({ slug: matchSlug, view: res });
     } catch (err) {
       console.error('Failed to read how to join the match:', err);
     }
@@ -111,7 +74,7 @@ function useMatchConnect(
 
   // Until there is a server to join, ask again every 5 s as well: a missed socket event left
   // a matchmaking room without its Join until the page was reloaded (2026-10-15).
-  const waitingForServer = enabled && !connect?.server?.host && !isFinished(connect?.matchStatus);
+  const waitingForServer = enabled && connect?.state.activity === 'queued';
   useEffect(() => {
     if (!waitingForServer) return;
     const id = window.setInterval(() => void load(), 5000);
@@ -120,6 +83,7 @@ function useMatchConnect(
 
   useEffect(() => {
     if (!enabled) return;
+    const pending = request.current;
     const reload = () => {
       if (timer.current) clearTimeout(timer.current);
       timer.current = setTimeout(() => void load(), 300);
@@ -143,6 +107,7 @@ function useMatchConnect(
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
+      pending.id++;
       if (timer.current) clearTimeout(timer.current);
       socket.off('fleet:failover', onFailover);
       document.removeEventListener('visibilitychange', onVisible);
@@ -182,9 +147,9 @@ export function MatchServerPanel({
   const [copyFallbackCommand, setCopyFallbackCommand] = useState<string | null>(null);
   const reduceMotion = useReducedMotion();
 
-  // Over, by the route's answer or the page's (whichever heard first): nothing to join.
-  const finished = isFinished(connect?.matchStatus) || isFinished(matchStatus);
-  const server = connect && !finished ? effectiveServer(connect) : null;
+  const finished =
+    connect?.state.lifecycle === 'completed' || connect?.state.lifecycle === 'cancelled';
+  const server = connect?.server ?? null;
   // LAN or internet: the platform picks for where the viewer is; they can switch.
   const [via, setViaState] = useState<'lan' | 'public' | null>(null);
   const addresses = server?.addresses ?? null;

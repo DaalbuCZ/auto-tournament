@@ -2,13 +2,13 @@
  * The top of the live overview: the viewer's next match (useTeamNextMatch)
  * and the hero. Moved out of OverviewLive.tsx as is.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { Link as RouterLink } from 'react-router-dom';
 import { Button } from '@mui/material';
 import { useTranslation } from 'react-i18next';
 import type { Match, TeamMatchInfo, Tournament } from '../../../types';
 import { matchPagePath } from '../../../paths';
-import { matchPhaseOf, type MatchPhase } from '../../../utils/matchPhase';
+import type { MatchRoomPhase as MatchPhase } from '../../../types/matchState.types';
 import { useSocket } from '../../../hooks/useSocket';
 import { onSocketReconnect } from '../../../utils/socketResync';
 import { placementFor } from '../../../hooks/usePlacement';
@@ -26,21 +26,22 @@ interface TeamMatchResponse {
   hasMatch?: boolean;
   match?: TeamMatchInfo | null;
   tournamentStatus?: string;
-  team?: { name?: string } | null;
+  team?: { id?: string; name?: string } | null;
 }
 
 /** The viewer's team's next match, kept fresh as matches and the bracket move. */
 export function useTeamNextMatch(teamId: string | null | undefined) {
   const [data, setData] = useState<TeamMatchResponse | null>(null);
+  const request = useRef({ id: 0 });
   const load = useCallback(() => {
     if (!teamId) return undefined;
-    let live = true;
+    const id = ++request.current.id;
     fetch(`/api/team/${encodeURIComponent(teamId)}/match`, { credentials: 'same-origin' })
       .then((res) => (res.ok ? (res.json() as Promise<TeamMatchResponse>) : null))
-      .then((body) => live && setData(body))
-      .catch(() => live && setData(null));
+      .then((body) => id === request.current.id && setData(body))
+      .catch(() => id === request.current.id && setData(null));
     return () => {
-      live = false;
+      request.current.id++;
     };
   }, [teamId]);
   useEffect(() => load(), [load]);
@@ -57,8 +58,8 @@ export function useTeamNextMatch(teamId: string | null | undefined) {
       for (const event of events) socket.off(event, changed);
     };
   }, [socket, slug, load, teamId]);
-  const match = data?.hasMatch ? (data.match ?? null) : null;
-  const phase: MatchPhase | null = match ? matchPhaseOf(match, data?.tournamentStatus ?? '') : null;
+  const match = data && data.team?.id === teamId && data.hasMatch ? (data.match ?? null) : null;
+  const phase: MatchPhase | null = match ? (match.state?.roomPhase ?? 'unknown') : null;
   return { match, phase, teamName: data?.team?.name ?? null };
 }
 
