@@ -1,4 +1,5 @@
 import type { BracketMatch, BracketResponse } from '../types/tournament.types';
+import { visibleMatchState } from '../core/projectMatchState';
 
 /**
  * One bracket match as anyone may see it: who plays whom, where it stands and
@@ -21,6 +22,7 @@ export type PublicBracketMatch = Pick<
   | 'startsAt'
   | 'vetoOpensAt'
   | 'status'
+  | 'state'
   | 'nextMatchId'
   | 'createdAt'
   | 'loadedAt'
@@ -58,6 +60,7 @@ export function toPublicBracketMatch(match: BracketMatch): PublicBracketMatch {
     round: match.round,
     matchNumber: match.matchNumber,
     status: match.status,
+    state: match.state ? visibleMatchState(match.state, 'public') : undefined,
     nextMatchId: match.nextMatchId ?? null,
     createdAt: match.createdAt,
     loadedAt: match.loadedAt,

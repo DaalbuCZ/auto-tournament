@@ -1,10 +1,12 @@
+import { visibleMatchState } from '../core/projectMatchState';
+import { createMatchStateReader, matchStateFor } from '../core/matchState';
 import { logoUrl } from '../services/teamSelfService';
 import { viewerTeamIdOfMatch } from '../services/matchViewer';
 import { applyMatchTimes, matchTimeFields } from '../services/matchTimes';
 import type { Request, Response } from 'express';
 import { Router } from 'express';
 import { getGameRatings } from '../services/gameRatings';
-import { matchService } from '../services/matchService';
+import { MatchTransitionConflict, matchService } from '../services/matchService';
 import { isQueuedAllocationResult, scheduler } from '../core/scheduler';
 import type { CreateMatchInput, MatchConfig, MatchListItem } from '../types/match.types';
 import type { TournamentResponse } from '../types/tournament.types';
@@ -244,6 +246,7 @@ async function getMatchDetailsBySlug(slug: string): Promise<MatchListItem | null
           }
         : undefined,
     status: row.status,
+    state: await matchStateFor(row),
     serverId: row.server_id,
     serverName: row.server_name || undefined,
     config: transformedConfig,
@@ -670,6 +673,7 @@ router.get('/', async (req: Request, res: Response) => {
     const isShuffleTournament = tournamentType?.type === 'shuffle';
 
     // Transform players from dictionary to array for frontend
+    const readState = createMatchStateReader();
     const matches: MatchListItem[] = await Promise.all(
       rows.map(async (row) => {
         // For bracket-managed matches (round >= 1) rebuild config on demand so
@@ -783,6 +787,7 @@ router.get('/', async (req: Request, res: Response) => {
                 }
               : undefined,
           status: row.status,
+          state: await readState(row),
           serverId: row.server_id,
           serverName: row.server_name || undefined,
           config: transformedConfig,
@@ -924,7 +929,10 @@ router.get('/', async (req: Request, res: Response) => {
 
     // No GOTV password for non-admins when the match broadcasts with no delay.
     if (!(await checkAdminAccess(req)).ok) {
-      for (const match of matches) match.config = withoutConfigSecrets(match.config);
+      for (const match of matches) {
+        match.config = withoutConfigSecrets(match.config);
+        if (match.state) match.state = visibleMatchState(match.state, 'public');
+      }
     }
 
     return res.json({
@@ -1148,6 +1156,7 @@ router.get('/:slug', async (req: Request, res: Response) => {
       success: true,
       match: {
         ...match,
+        state: match.state ? visibleMatchState(match.state, admin ? 'admin' : 'public') : undefined,
         // No GOTV password for non-admins when the match broadcasts with no delay.
         config: admin ? match.config : withoutConfigSecrets(match.config),
         // Kept as they are where the match already has them (tournament matches).
@@ -1729,7 +1738,9 @@ router.patch('/:slug/status', requireAuth, async (req: Request, res: Response) =
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to update status';
-    const statusCode = message.includes('not found') ? 404 : 500;
+    let statusCode = 500;
+    if (error instanceof MatchTransitionConflict) statusCode = 409;
+    else if (message.includes('not found')) statusCode = 404;
 
     console.error('Error updating match status:', error);
     return res.status(statusCode).json({

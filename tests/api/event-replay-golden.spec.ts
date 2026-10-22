@@ -261,6 +261,7 @@ test.describe.serial('Golden Ready Up BO3 event replay', () => {
         players[steamId] = { summary, ratingHistory: ratingHistory.history };
       }
 
+      expect(matchAfter.match).toHaveProperty('state.version', expect.any(Number));
       const matchForGolden = {
         ...matchAfter.match,
         id: '<matchid>',
@@ -269,9 +270,13 @@ test.describe.serial('Golden Ready Up BO3 event replay', () => {
           : {}),
       };
 
+      // Command counts vary across valid assignment/event interleavings.
       expectGolden(
         'event-replay-result',
-        normalizeForGolden({ match: matchForGolden, players }, { replace: COMMON_REPLACE })
+        normalizeForGolden(
+          { match: matchForGolden, players },
+          { replace: COMMON_REPLACE, volatileKeys: ['version'] }
+        )
       );
     }
   );

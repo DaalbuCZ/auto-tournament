@@ -1,3 +1,4 @@
+import { matchStateFor } from '../core/matchState';
 import { db } from '../config/database';
 import type { Match, CreateMatchInput, MatchResponse } from '../types/match.types';
 import { log } from '../utils/logger';
@@ -12,7 +13,9 @@ import {
 } from '../utils/matchIntegration';
 import { tournamentRowToResponse } from '../utils/tournamentRow';
 import type { DbMatchRow, DbTournamentRow } from '../types/database.types';
-import type { SqlValue } from '../config/database';
+import { transitionMatch, type MatchCommand } from '../core/matchTransitions';
+
+export class MatchTransitionConflict extends Error {}
 
 class MatchService {
   /**
@@ -29,7 +32,7 @@ class MatchService {
     defaultsTournamentId: number | null
   ): Promise<MatchResponse> {
     // Check if slug already exists
-    const existing = await db.getOneAsync<Match>('matches', 'slug = ?', [input.slug]);
+    const existing = await db.getOneAsync<Match & DbMatchRow>('matches', 'slug = ?', [input.slug]);
     if (existing) {
       throw new Error(`Match with slug '${input.slug}' already exists`);
     }
@@ -106,12 +109,12 @@ class MatchService {
       status: initialStatus,
     });
 
-    const match = await db.getOneAsync<Match>('matches', 'slug = ?', [input.slug]);
+    const match = await db.getOneAsync<Match & DbMatchRow>('matches', 'slug = ?', [input.slug]);
     if (!match) {
       throw new Error('Failed to create match');
     }
 
-    const response = this.toResponse(match, baseUrl);
+    const response = await this.toResponse(match, baseUrl);
 
     // Emit a websocket update so UIs (Matches page, player views, etc.) can
     // immediately reflect newly created manual matches without requiring a
@@ -136,7 +139,7 @@ class MatchService {
    * Get match by slug
    */
   async getMatchBySlug(slug: string, baseUrl: string): Promise<MatchResponse | null> {
-    const match = await db.getOneAsync<Match>('matches', 'slug = ?', [slug]);
+    const match = await db.getOneAsync<Match & DbMatchRow>('matches', 'slug = ?', [slug]);
     return match ? this.toResponse(match, baseUrl) : null;
   }
 
@@ -144,7 +147,7 @@ class MatchService {
    * Get match by ID
    */
   async getMatchById(id: number, baseUrl: string): Promise<MatchResponse | null> {
-    const match = await db.getOneAsync<Match>('matches', 'id = ?', [id]);
+    const match = await db.getOneAsync<Match & DbMatchRow>('matches', 'id = ?', [id]);
     return match ? this.toResponse(match, baseUrl) : null;
   }
 
@@ -152,13 +155,13 @@ class MatchService {
    * Get all matches
    */
   async getAllMatches(baseUrl: string, serverId?: string): Promise<MatchResponse[]> {
-    let matches: Match[];
+    let matches: Array<Match & DbMatchRow>;
     if (serverId) {
-      matches = await db.getAllAsync<Match>('matches', 'server_id = ?', [serverId]);
+      matches = await db.getAllAsync<Match & DbMatchRow>('matches', 'server_id = ?', [serverId]);
     } else {
-      matches = await db.getAllAsync<Match>('matches');
+      matches = await db.getAllAsync<Match & DbMatchRow>('matches');
     }
-    return matches.map((m) => this.toResponse(m, baseUrl));
+    return Promise.all(matches.map((m) => this.toResponse(m, baseUrl)));
   }
 
   /**
@@ -168,23 +171,33 @@ class MatchService {
     slug: string,
     status: 'pending' | 'loaded' | 'live' | 'completed'
   ): Promise<void> {
-    const match = await db.getOneAsync<Match>('matches', 'slug = ?', [slug]);
+    const match = await db.getOneAsync<Match & DbMatchRow>('matches', 'slug = ?', [slug]);
     if (!match) {
       throw new Error(`Match '${slug}' not found`);
     }
 
-    const updateData: Record<string, SqlValue> = { status };
-    if (status === 'loaded') {
-      updateData.loaded_at = Math.floor(Date.now() / 1000);
+    const commands: Record<typeof status, MatchCommand | null> = {
+      pending: 'reset_prematch',
+      loaded: 'accept_assignment',
+      live: 'start_play',
+      completed: null,
+    };
+    const command = commands[status];
+    if (!command)
+      throw new MatchTransitionConflict(
+        'Complete the match with a result or report, so progression and ratings are applied'
+      );
+    if (
+      (status === 'loaded' || status === 'live') &&
+      integrationForMatch(match).capabilities.servers &&
+      !match.server_id
+    ) {
+      throw new MatchTransitionConflict('Assign a server before starting play');
     }
-    if (status === 'completed' && match.status !== 'completed') {
-      // An admin completing a match is a deliberate finish. Stamping
-      // completed_at is what marks it finalized (isMatchFinalized), so late
-      // plugin events don't re-open it.
-      updateData.completed_at = Math.floor(Date.now() / 1000);
-    }
-
-    await db.updateAsync('matches', updateData, 'slug = ?', [slug]);
+    if (!(await transitionMatch(match, command)))
+      throw new MatchTransitionConflict(
+        'The match does not allow that transition; reload its current state'
+      );
     log.matchStatusUpdate(slug, status);
   }
 
@@ -212,7 +225,7 @@ class MatchService {
   /**
    * Convert database match to response format
    */
-  private toResponse(match: Match, baseUrl: string): MatchResponse {
+  private async toResponse(match: Match & DbMatchRow, baseUrl: string): Promise<MatchResponse> {
     // Integration-owned blob, forwarded as stored (client slots: PR 12).
     const config = parseStoredMatchConfig(match.config);
     return {
@@ -223,6 +236,7 @@ class MatchService {
       createdAt: match.created_at,
       loadedAt: match.loaded_at,
       status: match.status,
+      state: await matchStateFor(match),
       configUrl: `${baseUrl}/api/matches/${match.slug}.json`,
     };
   }

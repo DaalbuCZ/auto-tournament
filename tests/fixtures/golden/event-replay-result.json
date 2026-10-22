@@ -167,6 +167,21 @@
     "serverId": null,
     "slug": "r1m1",
     "startsAt": null,
+    "state": {
+      "actions": ["correct_result"],
+      "activity": "completed",
+      "blockers": [],
+      "lifecycle": "completed",
+      "observation": null,
+      "opensAt": null,
+      "participantsReady": true,
+      "preMatchCompleted": true,
+      "requiresPreMatch": true,
+      "requiresResource": true,
+      "roomPhase": "done",
+      "version": "<version>",
+      "winner": "team1"
+    },
     "status": "completed",
     "team1": {
       "id": "golden-replay-a",

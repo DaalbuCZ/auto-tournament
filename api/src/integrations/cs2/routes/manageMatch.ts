@@ -1,3 +1,5 @@
+import type { DbMatchRow } from '../../../types/database.types';
+import { matchStateFor } from '../../../core/matchState';
 /**
  * The admin match page (/manage/tournaments/:id/matches/:slug): everything it
  * shows in one read, and the Ready Up commands it sends.
@@ -145,6 +147,11 @@ router.get('/matches/:slug/manage', requireAuth, async (req: Request, res: Respo
     );
     if (!match) return res.status(404).json({ success: false, error: 'Match not found' });
 
+    const matchRow = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
+      slug,
+    ]);
+    if (!matchRow) return res.status(404).json({ success: false, error: 'Match not found' });
+    const matchState = await matchStateFor(matchRow);
     const live = await getLiveState(slug);
     let server: {
       id: string;
@@ -235,6 +242,7 @@ router.get('/matches/:slug/manage', requireAuth, async (req: Request, res: Respo
       match: {
         slug: match.slug,
         status: match.status,
+        state: matchState,
         tournamentId: match.tournament_id,
         round: match.round,
         matchNumber: match.match_number,
