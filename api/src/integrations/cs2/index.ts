@@ -1,3 +1,4 @@
+import type { DbMatchRow } from '../../types/database.types';
 /**
  * CS2 game integration, on Ready Up (the native CS2 plugin).
  *
@@ -250,6 +251,11 @@ export const cs2Integration: GameIntegration<Cs2Data> = {
     return vetoCompleted(row?.veto_state);
   },
 
+  async matchObservation(match) {
+    const { cs2MatchObservation } = await import('./matchObservation');
+    return cs2MatchObservation(match);
+  },
+
   /** The map veto runs unless the tournament turned it off (`settings.cs2.veto: false`). */
   fillsShortTeams(tournament) {
     return storedCs2Settings(tournament.settings)?.fillTeamsWithBots === true;
@@ -270,10 +276,11 @@ export const cs2Integration: GameIntegration<Cs2Data> = {
       import('../../services/settingsService'),
       import('../../services/socketService'),
     ]);
-    await db.runAsync(
-      "UPDATE matches SET status = 'pending' WHERE slug = ? AND (server_id IS NULL OR server_id = '') AND status IN ('pending', 'ready')",
-      [ctx.slug]
-    );
+    const { transitionMatch } = await import('../../core/matchTransitions');
+    const match = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
+      ctx.slug,
+    ]);
+    if (!match || match.server_id || !(await transitionMatch(match, 'reset_prematch'))) return;
     emitBracketUpdate({ action: 'match_ready', matchSlug: ctx.slug });
     if (await settingsService.isSimulationModeEnabled()) {
       const { autoCompleteVetoForMatch } = await import('./veto/simulation');
