@@ -2,21 +2,9 @@ import React from 'react';
 import { Box, Typography, Chip, Tooltip } from '@mui/material';
 import { Row } from '../common/ui';
 import { tokens } from '../../theme/tokens';
-import {
-  getBracketMatchLabel,
-  getStatusColor,
-  getStatusLabel,
-  isUnpairedSwissMatch,
-  waitingForPairingLabel,
-} from '../../utils/matchUtils';
-import {
-  isManualMatch,
-  isShuffleMatch,
-  isVetoDisabledForMatch,
-  type MatchLike,
-} from '../../utils/matchFlags';
-import type { Match, MatchLiveStats } from '../../types';
-import { deriveCurrentMapScore, deriveSeriesScore } from '../../utils/matchScoreDisplay';
+import { getBracketMatchLabel, getStatusColor } from '../../utils/matchUtils';
+import { isManualMatch, isShuffleMatch, type MatchLike } from '../../utils/matchFlags';
+import type { Match } from '../../types';
 import { TeamNameLink } from '../team/TeamNameLink';
 import { useTranslation } from 'react-i18next';
 
@@ -36,57 +24,11 @@ export const MatchListCard: React.FC<MatchListCardProps> = ({
   scoreDisplayMode = 'auto',
 }) => {
   const { t } = useTranslation();
-  const bracketMatch = match as Match & { liveStats?: MatchLiveStats | null };
   // eslint-disable-next-line no-restricted-syntax -- Match is an interface without MatchLike's index signature; same fields
   const matchLike = match as unknown as MatchLike;
   const shuffle = isShuffleMatch(matchLike);
   const manual = isManualMatch(matchLike);
-  const vetoDisabled = isVetoDisabledForMatch(matchLike);
-
-  const deriveSeriesMaps = () => {
-    let seriesMapsTeam1: number | undefined =
-      typeof match.team1Score === 'number' ? match.team1Score : undefined;
-    let seriesMapsTeam2: number | undefined =
-      typeof match.team2Score === 'number' ? match.team2Score : undefined;
-
-    if (
-      (seriesMapsTeam1 === undefined || seriesMapsTeam2 === undefined) &&
-      match.mapResults &&
-      match.mapResults.length > 0
-    ) {
-      const derived = match.mapResults.reduce(
-        (acc, result) => {
-          if (result.team1Score > result.team2Score) acc.team1 += 1;
-          else if (result.team2Score > result.team1Score) acc.team2 += 1;
-          return acc;
-        },
-        { team1: 0, team2: 0 }
-      );
-      seriesMapsTeam1 = derived.team1;
-      seriesMapsTeam2 = derived.team2;
-    }
-
-    return { seriesMapsTeam1, seriesMapsTeam2 };
-  };
-
-  const { seriesMapsTeam1, seriesMapsTeam2 } = deriveSeriesMaps();
-
-  // Winner side: prefer explicit winner.id where possible, fall back to series score.
-  let winnerSide: 'team1' | 'team2' | null = null;
-  if (match.status === 'completed') {
-    if (match.winner?.id && match.team1?.id && match.winner.id === match.team1.id) {
-      winnerSide = 'team1';
-    } else if (match.winner?.id && match.team2?.id && match.winner.id === match.team2.id) {
-      winnerSide = 'team2';
-    } else if (
-      typeof seriesMapsTeam1 === 'number' &&
-      typeof seriesMapsTeam2 === 'number' &&
-      seriesMapsTeam1 !== seriesMapsTeam2
-    ) {
-      winnerSide = seriesMapsTeam1 > seriesMapsTeam2 ? 'team1' : 'team2';
-    }
-  }
-
+  const winnerSide = match.state?.winner ?? null;
   const getTeamName = (teamId: string | undefined, which: 'team1' | 'team2') => {
     const team = teamId === match.team1?.id ? match.team1 : match.team2;
     if (team) {
@@ -97,53 +39,14 @@ export const MatchListCard: React.FC<MatchListCardProps> = ({
         ? (match.config?.team1 as { name?: string } | undefined)
         : (match.config?.team2 as { name?: string } | undefined);
     if (configTeam?.name) return configTeam.name;
-    if (match.status === 'completed') return '—';
+    if (match.state?.lifecycle === 'completed') return '—';
     return 'TBD';
   };
 
   const getTeamScoreDisplay = (team: 'team1' | 'team2'): number | undefined => {
-    if (scoreDisplayMode === 'series') {
-      const series = deriveSeriesScore(bracketMatch, bracketMatch.liveStats ?? null);
-      const isInProgress = match.status === 'loaded' || match.status === 'live';
-      const isNotStarted = match.status === 'pending' || match.status === 'ready';
-      const isUnknownZero = series.source === 'default' && series.team1 === 0 && series.team2 === 0;
-
-      // Keep dashes for not-started matches with no known series score yet.
-      if (isNotStarted && isUnknownZero) {
-        return undefined;
-      }
-
-      // For loaded/live matches, show at least 0-0 immediately.
-      if (isInProgress) {
-        return team === 'team1' ? series.team1 : series.team2;
-      }
-
-      return team === 'team1' ? series.team1 : series.team2;
-    }
-
-    if (match.status === 'completed') {
-      // Normal path: use derived series maps (best-of-N).
-      let seriesScore = team === 'team1' ? seriesMapsTeam1 : seriesMapsTeam2;
-
-      // If we have a declared winner but the series scores are tied (e.g. 1-1),
-      // this is typically a single-map series where the map ended tied on
-      // rounds but the plugin broke the tie by performance (damage).
-      // In that case, force a clear 1–0 / 0–1 display instead of 1–1.
-      if (
-        match.status === 'completed' &&
-        winnerSide &&
-        typeof seriesMapsTeam1 === 'number' &&
-        typeof seriesMapsTeam2 === 'number' &&
-        seriesMapsTeam1 === seriesMapsTeam2 &&
-        (!match.mapResults || match.mapResults.length === 0)
-      ) {
-        seriesScore = team === winnerSide ? 1 : 0;
-      }
-
-      return typeof seriesScore === 'number' ? seriesScore : undefined;
-    }
-    const roundsScore = team === 'team1' ? match.team1Score : match.team2Score;
-    return typeof roundsScore === 'number' ? roundsScore : undefined;
+    if (scoreDisplayMode === 'series')
+      return team === 'team1' ? match.team1SeriesScore : match.team2SeriesScore;
+    return team === 'team1' ? match.team1Score : match.team2Score;
   };
 
   // In the bracket list view we want to emphasise the map number rather than
@@ -152,34 +55,11 @@ export const MatchListCard: React.FC<MatchListCardProps> = ({
     n: typeof match.mapNumber === 'number' ? match.mapNumber + 1 : 1,
   });
 
-  const tooltipTitle = (() => {
-    if (scoreDisplayMode === 'series') {
-      const series = deriveSeriesScore(bracketMatch, bracketMatch.liveStats ?? null);
-      const current = deriveCurrentMapScore(bracketMatch, bracketMatch.liveStats ?? null, {
-        mapNumber: match.mapNumber ?? null,
-      });
-      const hasLiveRounds =
-        !!bracketMatch.liveStats &&
-        (match.status === 'live' || match.status === 'loaded') &&
-        (current.source === 'liveStats' || current.team1 !== 0 || current.team2 !== 0);
-      return hasLiveRounds
-        ? `${t('matchInfo.scoreboard.currentMapScore')}: ${current.team1} - ${current.team2}`
-        : `${t('matchInfo.scoreboard.mapsWon')}: ${series.team1} - ${series.team2}`;
-    }
-    return match.status === 'completed'
+  const tooltipTitle =
+    scoreDisplayMode === 'series' || match.state?.lifecycle === 'completed'
       ? t('matchInfo.scoreboard.mapsWon')
       : t('matchInfo.scoreboard.currentMapScore');
-  })();
-
-  // A thin bar on the row's left edge for a match that is on a server:
-  // allocated (serverId set, not yet loaded/live/completed) amber, loaded
-  // (warmup) blue, live green; nothing for finished or upcoming ones.
-  const getEdgeColor = () => {
-    if (match.status === 'live') return tokens.color.live;
-    if (match.status === 'loaded') return tokens.color.info;
-    if (match.serverId && match.status !== 'completed') return tokens.color.warning;
-    return 'transparent';
-  };
+  const edgeColor = match.state?.roomPhase === 'live' ? tokens.color.live : 'transparent';
 
   return (
     // One row of a `RowList` (the drafts' `.row-list`), not a card of its own.
@@ -188,7 +68,7 @@ export const MatchListCard: React.FC<MatchListCardProps> = ({
       onClick={onClick}
       sx={{
         cursor: onClick ? 'pointer' : 'default',
-        boxShadow: `inset 3px 0 0 ${getEdgeColor()}`,
+        boxShadow: `inset 3px 0 0 ${edgeColor}`,
         '&:hover': onClick ? { bgcolor: tokens.color.paper3 } : {},
         '&:first-of-type': { borderTopLeftRadius: 'inherit', borderTopRightRadius: 'inherit' },
         '&:last-of-type': { borderBottomLeftRadius: 'inherit', borderBottomRightRadius: 'inherit' },
@@ -315,21 +195,11 @@ export const MatchListCard: React.FC<MatchListCardProps> = ({
             />
           )}
           <Chip
-            label={
-              isUnpairedSwissMatch(match)
-                ? waitingForPairingLabel()
-                : getStatusLabel(
-                    match.status,
-                    false,
-                    vetoDisabled ? true : match.vetoCompleted,
-                    undefined,
-                    Boolean(match.serverId)
-                  )
-            }
+            label={t(`matchState.${match.state?.activity ?? 'unknown'}`)}
             size="small"
-            {...(getStatusColor(match.status) === 'primary'
+            {...(getStatusColor(match.state?.activity ?? 'unknown') === 'primary'
               ? { sx: { color: tokens.color.accent } }
-              : { color: getStatusColor(match.status) })}
+              : { color: getStatusColor(match.state?.activity ?? 'unknown') })}
           />
         </Box>
       </Box>
