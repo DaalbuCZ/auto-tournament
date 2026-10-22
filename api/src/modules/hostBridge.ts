@@ -17,6 +17,8 @@ import * as configPublicPaths from '../config/publicPaths';
 import * as configTrustProxy from '../config/trustProxy';
 import * as coreAllocationQueue from '../core/allocationQueue';
 import * as coreMatchLifecycle from '../core/matchLifecycle';
+import * as coreMatchTransitions from '../core/matchTransitions';
+import * as coreMatchCommandLock from '../core/matchCommandLock';
 import * as coreProjectMatchState from '../core/projectMatchState';
 import * as coreScheduler from '../core/scheduler';
 import * as middlewareAuth from '../middleware/auth';
@@ -68,6 +70,8 @@ const MODULES: Record<string, object> = {
   'config/trustProxy': configTrustProxy,
   'core/allocationQueue': coreAllocationQueue,
   'core/matchLifecycle': coreMatchLifecycle,
+  'core/matchTransitions': coreMatchTransitions,
+  'core/matchCommandLock': coreMatchCommandLock,
   'core/projectMatchState': coreProjectMatchState,
   'core/scheduler': coreScheduler,
   'middleware/auth': middlewareAuth,

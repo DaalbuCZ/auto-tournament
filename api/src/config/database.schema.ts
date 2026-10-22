@@ -182,6 +182,8 @@ export function getSchemaSQL(): string {
       team1_id TEXT,
       team2_id TEXT,
       winner_id TEXT,
+      winner_side TEXT, -- team1, team2, none (draw); NULL for old results without a known side
+      state_version INTEGER NOT NULL DEFAULT 0, -- compare-and-set guard for match commands
       server_id TEXT,
       config TEXT NOT NULL,
       game TEXT NOT NULL DEFAULT 'cs2', -- Game integration that owns this row (integrations/registry)

@@ -417,6 +417,17 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       await client.query('DROP INDEX IF EXISTS idx_teams_owner_uid');
     },
   },
+  {
+    id: '2026-10-22-match-result-side',
+    description: 'Preserve a known winner side independently of persistent team ids',
+    async up(client) {
+      await client.query(`UPDATE matches SET winner_side = CASE
+        WHEN winner_id = team1_id THEN 'team1'
+        WHEN winner_id = team2_id THEN 'team2'
+        ELSE NULL END
+        WHERE status = 'completed' AND winner_side IS NULL AND winner_id IS NOT NULL`);
+    },
+  },
 ];
 
 /** A fixed key for the advisory lock, so two API processes never run one migration twice. */

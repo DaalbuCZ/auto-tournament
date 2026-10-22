@@ -9,6 +9,7 @@
  * which keeps dev/prod log files focused on actions instead of every SQL call.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Untrusted } from '../utils/untrusted';
 import { Pool, type PoolClient } from 'pg';
 import { log, LOG_DB_VERBOSE, LOG_DB_VALUES } from '../utils/logger';
@@ -57,6 +58,16 @@ class DatabaseManager {
   private pool?: Pool;
   private connectionString: string;
   private initialized = false;
+  private transactionClient = new AsyncLocalStorage<{
+    client: PoolClient;
+    active: boolean;
+    transaction: boolean;
+  }>();
+
+  private get queryConnection(): Pool | PoolClient {
+    const transaction = this.transactionClient.getStore();
+    return transaction?.active ? transaction.client : this.postgresPool;
+  }
 
   constructor() {
     // PostgreSQL - will be initialized asynchronously
@@ -471,6 +482,8 @@ class DatabaseManager {
 
   /** Run `fn` with one pooled connection (for work that needs a transaction), then release it. */
   async withClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    const current = this.transactionClient.getStore();
+    if (current?.active) return fn(current.client);
     if (!this.postgresPool) throw new Error('Database not initialized');
     const client = await this.postgresPool.connect();
     try {
@@ -478,6 +491,36 @@ class DatabaseManager {
     } finally {
       client.release();
     }
+  }
+
+  /** Keep called db helpers on a connection holding a session advisory lock. */
+  async withConnection<T>(client: PoolClient, fn: () => Promise<T>): Promise<T> {
+    const scope = { client, active: true, transaction: false };
+    try {
+      return await this.transactionClient.run(scope, fn);
+    } finally {
+      scope.active = false;
+    }
+  }
+
+  /** All db helpers in the callback share one transaction, including called services. */
+  async transaction<T>(fn: () => Promise<T>): Promise<T> {
+    const current = this.transactionClient.getStore();
+    if (current?.active && current.transaction) return fn();
+    return this.withClient(async (client) => {
+      await client.query('BEGIN');
+      const transaction = { client, active: true, transaction: true };
+      try {
+        const result = await this.transactionClient.run(transaction, fn);
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        transaction.active = false;
+      }
+    });
   }
 
   /**
@@ -589,7 +632,7 @@ class DatabaseManager {
         `[DB] GETALL ${table} where=${where ?? 'none'} params=${this.safeJson(loggedParams)}`
       );
     }
-    const result = await this.postgresPool.query(query, params);
+    const result = await this.queryConnection.query(query, params);
     const rows = result.rows as T[];
     if (LOG_DB_VERBOSE) {
       log.database(`[DB] GETALL ${table} OK rows=${rows.length}`);
@@ -610,7 +653,7 @@ class DatabaseManager {
         `[DB] GETONE ${table} where=${where} params=${this.safeJson(redactParamsForLog(where, params))}`
       );
     }
-    const result = await this.postgresPool.query(query, converted.params);
+    const result = await this.queryConnection.query(query, converted.params);
     const row = (result.rows[0] as T) || undefined;
     if (LOG_DB_VERBOSE) {
       log.database(`[DB] GETONE ${table} OK ${row ? 'found' : 'not found'}`);
@@ -649,7 +692,7 @@ class DatabaseManager {
           )}`
         );
       }
-      const result = await this.postgresPool.query(query, values);
+      const result = await this.queryConnection.query(query, values);
       if (result.rows.length > 0 && result.rows[0]?.id !== undefined) {
         lastInsertRowid = result.rows[0].id;
       }
@@ -683,7 +726,7 @@ class DatabaseManager {
       if (LOG_DB_VERBOSE) {
         log.database(`[DB] UPDATE ${table} set=${this.safeJson(data)} where="${where}"`);
       }
-      const result = await this.postgresPool.query(query, values);
+      const result = await this.queryConnection.query(query, values);
       this.logRunResult('UPDATE', table, result.rowCount || 0);
       return { changes: result.rowCount || 0 };
     } catch (err) {
@@ -704,7 +747,7 @@ class DatabaseManager {
       if (LOG_DB_VERBOSE) {
         log.database(`[DB] DELETE ${table} where="${where}"`);
       }
-      const result = await this.postgresPool.query(query, converted.params);
+      const result = await this.queryConnection.query(query, converted.params);
       this.logRunResult('DELETE', table, result.rowCount || 0);
       return { changes: result.rowCount || 0 };
     } catch (err) {
@@ -725,7 +768,7 @@ class DatabaseManager {
         );
       }
       const converted = convertPlaceholders(sql, params);
-      const result = await this.postgresPool.query(converted.sql, converted.params);
+      const result = await this.queryConnection.query(converted.sql, converted.params);
       const lastInsertRowid = result.rows[0]?.id;
       this.logRunResult('RUN', 'custom', result.rowCount || 0, lastInsertRowid);
       return { changes: result.rowCount || 0, lastInsertRowid };
@@ -741,7 +784,7 @@ class DatabaseManager {
       if (LOG_DB_VERBOSE) {
         log.database(`[DB] EXEC sql=${JSON.stringify(sql)}`);
       }
-      await this.postgresPool.query(sql);
+      await this.queryConnection.query(sql);
       this.logRunResult('EXEC', 'custom', 0);
     } catch (err) {
       log.error(`[DB] EXEC failed: ${(err as Error).message}`);
@@ -758,7 +801,7 @@ class DatabaseManager {
         );
       }
       const converted = params ? convertPlaceholders(sql, params) : { sql, params: [] };
-      const result = await this.postgresPool.query(converted.sql, converted.params);
+      const result = await this.queryConnection.query(converted.sql, converted.params);
       const rows = result.rows as T[];
       if (LOG_DB_VERBOSE) {
         log.database(`[DB] QUERY OK rows=${rows.length}`);
@@ -785,7 +828,7 @@ class DatabaseManager {
         );
       }
       const converted = params ? convertPlaceholders(sql, params) : { sql, params: [] };
-      const result = await this.postgresPool.query(converted.sql, converted.params);
+      const result = await this.queryConnection.query(converted.sql, converted.params);
       const row = result.rows[0] as T | undefined;
       if (LOG_DB_VERBOSE) {
         log.database(`[DB] QUERY ONE OK ${row ? 'found' : 'not found'}`);
@@ -803,7 +846,7 @@ class DatabaseManager {
   async getAppSettingAsync(key: string): Promise<string | null> {
     if (!this.postgresPool) throw new Error('Database not initialized');
     try {
-      const result = await this.postgresPool.query(
+      const result = await this.queryConnection.query(
         'SELECT value FROM app_settings WHERE key = $1',
         [key]
       );
@@ -827,14 +870,14 @@ class DatabaseManager {
 
     try {
       if (value === null) {
-        const result = await this.postgresPool.query('DELETE FROM app_settings WHERE key = $1', [
+        const result = await this.queryConnection.query('DELETE FROM app_settings WHERE key = $1', [
           trimmedKey,
         ]);
         this.logRunResult('DELETE', `app_settings(${trimmedKey})`, result.rowCount || 0);
         return;
       }
 
-      const result = await this.postgresPool.query(
+      const result = await this.queryConnection.query(
         `
           INSERT INTO app_settings (key, value, updated_at)
           VALUES ($1, $2, EXTRACT(EPOCH FROM NOW())::INTEGER)
@@ -855,7 +898,7 @@ class DatabaseManager {
   > {
     if (!this.postgresPool) throw new Error('Database not initialized');
     try {
-      const result = await this.postgresPool.query(
+      const result = await this.queryConnection.query(
         'SELECT key, value, updated_at FROM app_settings'
       );
       if (LOG_DB_VERBOSE) {
