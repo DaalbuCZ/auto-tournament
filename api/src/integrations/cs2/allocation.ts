@@ -1,3 +1,5 @@
+import { transitionMatch } from '../../core/matchTransitions';
+import { claimMatchResource, releaseResourceClaim } from '../../core/matchResourceClaims';
 /**
  * CS2 server pool: which servers can take a match, and getting a match onto
  * one.
@@ -465,6 +467,7 @@ export class Cs2ServerPool {
     matchSlug: string,
     server: ServerResponse
   ): Promise<ServerAllocationResult> {
+    let claim: DbMatchRow | null = null;
     try {
       // Final live status check right before allocation so we don't rely on
       // the older snapshot returned from getAvailableServers.
@@ -518,7 +521,9 @@ export class Cs2ServerPool {
       serverAllocationTracker.markAllocated(server.id, matchSlug);
 
       // Persist server_id on the match so UIs and webhooks see the assignment
-      await db.updateAsync('matches', { server_id: server.id }, 'slug = ?', [matchSlug]);
+      claim = await claimMatchResource(matchSlug, server.id);
+      if (!claim)
+        return { matchSlug, success: false, error: 'The match or resource is no longer available' };
 
       // Emit websocket event for server assignment
       await this.emitServerAssigned(matchSlug, server.id);
@@ -537,7 +542,7 @@ export class Cs2ServerPool {
 
       // Roll back server_id if loading failed so this match can be retried later.
       try {
-        await db.updateAsync('matches', { server_id: null }, 'slug = ?', [matchSlug]);
+        if (claim) await releaseResourceClaim(claim);
       } catch (rollbackError) {
         log.error(
           `[ALLOCATION] Failed to roll back server_id for match ${matchSlug} after load failure`,
@@ -567,7 +572,7 @@ export class Cs2ServerPool {
       // by future allocation passes instead of getting stuck with a server
       // but no loadedAt.
       try {
-        await db.updateAsync('matches', { server_id: null }, 'slug = ?', [matchSlug]);
+        if (claim) await releaseResourceClaim(claim);
       } catch (rollbackError) {
         log.error(
           `[ALLOCATION] Failed to roll back server_id for match ${matchSlug} after allocation error`,
@@ -683,6 +688,7 @@ export class Cs2ServerPool {
     only?: string
   ): Promise<ServerAllocationResult & { retryElsewhere?: boolean }> {
     let allocatedServerId: string | null = null;
+    let claim: DbMatchRow | null = null;
     try {
       // Get first available server, respecting the in‑memory "allocating" guard
       // so concurrent allocations never pick the same server. An admin's pick
@@ -749,7 +755,9 @@ export class Cs2ServerPool {
       serverAllocationTracker.markAllocated(server.id, matchSlug);
 
       // Update match with server_id
-      await db.updateAsync('matches', { server_id: server.id }, 'slug = ?', [matchSlug]);
+      claim = await claimMatchResource(matchSlug, server.id);
+      if (!claim)
+        return { matchSlug, success: false, error: 'The match or resource is no longer available' };
 
       // Emit websocket event for server assignment
       await this.emitServerAssigned(matchSlug, server.id);
@@ -764,7 +772,7 @@ export class Cs2ServerPool {
       }
 
       // Rollback server_id if loading failed
-      await db.updateAsync('matches', { server_id: null }, 'slug = ?', [matchSlug]);
+      if (claim) await releaseResourceClaim(claim);
       if (loadResult.retryElsewhere) serverAllocationTracker.markIdle(server.id);
       return {
         matchSlug,
@@ -778,7 +786,7 @@ export class Cs2ServerPool {
       // If anything goes wrong after we've assigned a server_id, clear it so
       // polling/allocation can safely retry on another server.
       try {
-        await db.updateAsync('matches', { server_id: null }, 'slug = ?', [matchSlug]);
+        if (claim) await releaseResourceClaim(claim);
       } catch (rollbackError) {
         log.error(
           `Failed to roll back server_id for match ${matchSlug} after allocation error`,
@@ -861,9 +869,13 @@ export class Cs2ServerPool {
       }
 
       // Step 3: Reset match status to 'ready'
-      await db.updateAsync('matches', { status: 'ready', loaded_at: null }, 'slug = ?', [
-        matchSlug,
-      ]);
+      if (!(await transitionMatch(match, 'retry_assignment', { loaded_at: null }))) {
+        return {
+          success: false,
+          message: 'The match changed during restart',
+          error: 'State conflict',
+        };
+      }
 
       // Step 4: Reload the match on the same server
       log.info(`Reloading match ${matchSlug} on server ${serverId}`);
@@ -989,6 +1001,11 @@ export class Cs2ServerPool {
    * the match is 'ready' or 'loaded' and has a server.
    */
   async moveToOtherServer(matchSlug: string, oldServerId: string): Promise<ServerActionResult> {
+    const match = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
+      matchSlug,
+    ]);
+    if (match?.server_id !== oldServerId)
+      return { ok: false, conflict: true, error: 'The assignment changed' };
     const availableServers = await this.getAvailableServers();
     const fallback = availableServers.find((s) => s.id !== oldServerId);
 
@@ -1008,16 +1025,15 @@ export class Cs2ServerPool {
     serverAllocationTracker.markAllocated(fallback.id, matchSlug);
 
     // Update match to point to the new server and reset it to a clean pre-load state.
-    await db.updateAsync(
-      'matches',
-      {
+    if (
+      !(await transitionMatch(match, 'retry_assignment', {
         server_id: fallback.id,
-        status: 'ready',
         loaded_at: null,
-      },
-      'slug = ?',
-      [matchSlug]
-    );
+      }))
+    ) {
+      serverAllocationTracker.markIdle(fallback.id);
+      return { ok: false, conflict: true, error: 'The match changed during reallocation' };
+    }
 
     // Only now that server_id points at the new server: the old one gets
     // match.unassign {moved}.

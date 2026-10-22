@@ -17,6 +17,7 @@ import * as configPublicPaths from '../config/publicPaths';
 import * as configTrustProxy from '../config/trustProxy';
 import * as coreAllocationQueue from '../core/allocationQueue';
 import * as coreMatchLifecycle from '../core/matchLifecycle';
+import * as coreMatchResourceClaims from '../core/matchResourceClaims';
 import * as coreMatchState from '../core/matchState';
 import * as coreMatchTransitions from '../core/matchTransitions';
 import * as coreMatchCommandLock from '../core/matchCommandLock';
@@ -71,6 +72,7 @@ const MODULES: Record<string, object> = {
   'config/trustProxy': configTrustProxy,
   'core/allocationQueue': coreAllocationQueue,
   'core/matchLifecycle': coreMatchLifecycle,
+  'core/matchResourceClaims': coreMatchResourceClaims,
   'core/matchState': coreMatchState,
   'core/matchTransitions': coreMatchTransitions,
   'core/matchCommandLock': coreMatchCommandLock,

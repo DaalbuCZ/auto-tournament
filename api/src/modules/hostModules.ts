@@ -21,6 +21,7 @@ export const HOST_MODULES: readonly string[] = [
   'config/trustProxy',
   'core/allocationQueue',
   'core/matchLifecycle',
+  'core/matchResourceClaims',
   'core/matchState',
   'core/matchTransitions',
   'core/matchCommandLock',
