@@ -1,3 +1,5 @@
+import { transitionMatch } from '../../core/matchTransitions';
+import type { DbMatchRow } from '../../types/database.types';
 /**
  * Fake game integration: test-only.
  *
@@ -116,10 +118,12 @@ const done = (message: string): ResourceActionResult => ({ ok: true, message });
 /** Put a ready match straight into `loaded`: there is no server to load it on. */
 async function markLoaded(ctx: MatchContext): Promise<AllocateResult> {
   const { db } = await import('../../config/database');
-  await db.runAsync(
-    "UPDATE matches SET status = 'loaded', loaded_at = ? WHERE slug = ? AND status = 'ready'",
-    [Math.floor(Date.now() / 1000), ctx.slug]
-  );
+  const match = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
+    ctx.slug,
+  ]);
+  if (!match || !(await transitionMatch(match, 'accept_assignment'))) {
+    return { status: 'failed', error: 'The match is no longer ready', retryable: false };
+  }
   return { status: 'assigned' };
 }
 

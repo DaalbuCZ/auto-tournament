@@ -17,7 +17,7 @@ import {
   type PlayerStatLine,
 } from '../../../services/matchLiveStatsService';
 import { matchLifecycle } from '../../../core/matchLifecycle';
-import { isMatchFinalized } from '../../../utils/matchStatusHelpers';
+import { canTransitionMatch, transitionMatch } from '../../../core/matchTransitions';
 import type { DbMatchRow } from '../../../types/database.types';
 import type { NormalizedEvent } from '../../types';
 import type { Untrusted } from '../../../utils/untrusted';
@@ -71,27 +71,14 @@ function shouldAcceptPlayEvent(
   eventName: string,
   matchId: string | number
 ): boolean {
-  if (match.status !== 'completed') return true;
-  if (isMatchFinalized(match)) {
-    log.warn(`Ignoring ${eventName} for already completed match`, {
-      matchId,
-      slug: match.slug,
-    });
-    return false;
-  }
-  log.warn(`Re-opening match marked completed without a series result (${eventName})`, {
-    matchId,
-    slug: match.slug,
-  });
-  return true;
+  const accepted = canTransitionMatch(match, 'start_play');
+  if (!accepted)
+    log.warn(`Ignoring ${eventName} for ${match.status} match`, { matchId, slug: match.slug });
+  return accepted;
 }
 
-async function updateMatchStatus(match: DbMatchRow, status: DbMatchRow['status']): Promise<void> {
-  if (match.status === status) {
-    return;
-  }
-
-  await db.updateAsync('matches', { status }, 'id = ?', [match.id]);
+async function updateMatchStatus(match: DbMatchRow): Promise<boolean> {
+  if (!(await transitionMatch(match, 'start_play'))) return false;
   const updatedMatch = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE id = ?', [
     match.id,
   ]);
@@ -103,6 +90,7 @@ async function updateMatchStatus(match: DbMatchRow, status: DbMatchRow['status']
       status: updatedMatch.status,
     });
   }
+  return true;
 }
 
 function determinePlayerTeam(
@@ -361,6 +349,8 @@ export async function applyNormalizedEvents(
       continue;
     }
 
+    if (!canTransitionMatch(match, 'start_play')) continue;
+
     switch (event.type) {
       case 'series.started':
         log.success(`Series started (fleet): ${match.slug}`, { format: `BO${event.seriesLength}` });
@@ -373,7 +363,7 @@ export async function applyNormalizedEvents(
         log.success(`Going live (fleet): map ${event.mapNumber} ${event.mapName ?? ''}`.trim(), {
           matchSlug: match.slug,
         });
-        await updateMatchStatus(match, 'live');
+        if (!(await updateMatchStatus(match))) break;
         // A shuffle: players who never joined the server drop out of the rounds after.
         if (event.mapNumber === 0) {
           const live = match;
@@ -408,6 +398,7 @@ export async function applyNormalizedEvents(
         match = {
           ...match,
           status: 'live',
+          state_version: (match.state_version ?? 0) + 1,
           map_number: event.mapNumber,
           current_map: event.mapName ?? match.current_map,
         };

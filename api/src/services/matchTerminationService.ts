@@ -1,3 +1,4 @@
+import { transitionMatch } from '../core/matchTransitions';
 import { db } from '../config/database';
 import { log } from '../utils/logger';
 import { emitMatchUpdate } from './socketService';
@@ -17,16 +18,8 @@ import type { DbMatchRow } from '../types/database.types';
  * Shared by the admin End Match control and by force-cancel so the two cannot
  * drift apart.
  */
-export async function settleEndedMatch(
-  match: DbMatchRow,
-  reason: string
-): Promise<void> {
-  await db.updateAsync(
-    'matches',
-    { status: 'cancelled', completed_at: Math.floor(Date.now() / 1000) },
-    'slug = ?',
-    [match.slug]
-  );
+export async function settleEndedMatch(match: DbMatchRow, reason: string): Promise<void> {
+  if (!(await transitionMatch(match, 'cancel'))) return;
 
   log.info(`Match ${match.slug} marked cancelled (${reason})`);
 
