@@ -1,3 +1,5 @@
+import { visibleMatchState } from '../../../core/projectMatchState';
+import { matchStateFor } from '../../../core/matchState';
 /**
  * GET /api/game/cs2/matches/:slug/connect
  *
@@ -47,9 +49,6 @@ import { QUEUE_ORDER_SQL } from '../../../core/allocationQueue';
 import type { MatchState } from '../fleet/protocol/v1';
 
 /** The match is over: its server, if it still names one, belongs to another match now. */
-function isFinishedMatchStatus(status: string | null | undefined): boolean {
-  return status === 'completed' || status === 'cancelled';
-}
 
 /**
  * The viewer's match that is loaded or live in the same tournament, other than this one; null
@@ -212,7 +211,8 @@ router.get('/matches/:slug/connect', async (req: Request, res: Response) => {
     const onFleet = match.server_transport === 'fleet';
     // Fleet matches: admins see how to join too (they are not asked otherwise).
     const viewerIsAdmin = onFleet && !viewerIsTeamMember ? (await checkAdminAccess(req)).ok : false;
-    const finished = isFinishedMatchStatus(match.status);
+    const state = await matchStateFor(match);
+    const finished = state.lifecycle === 'completed' || state.lifecycle === 'cancelled';
     const canSeeServer = (viewerIsTeamMember || viewerIsAdmin) && !finished;
     const currentMatchSlug =
       finished && viewerIsTeamMember ? await viewerCurrentMatchSlug(match, effectiveSteamId) : null;
@@ -297,10 +297,14 @@ router.get('/matches/:slug/connect', async (req: Request, res: Response) => {
     const host = chosen?.host ?? match.server_host;
     const port = chosen?.port ?? match.server_port;
 
+    let audience: 'public' | 'participant' | 'admin' = 'public';
+    if (viewerIsAdmin) audience = 'admin';
+    else if (viewerIsTeamMember) audience = 'participant';
     return res.json({
       success: true,
       viewerIsTeamMember,
       matchStatus: match.status,
+      state: visibleMatchState(state, audience),
       liveStatus: liveStats?.status ?? null,
       roundNumber: liveStats?.roundNumber ?? null,
       queuePosition,
@@ -308,7 +312,7 @@ router.get('/matches/:slug/connect', async (req: Request, res: Response) => {
       currentMap,
       mapNumber,
       server:
-        canSeeServer && match.server_id
+        canSeeServer && match.server_id && state.actions.includes('connect')
           ? {
               id: match.server_id,
               name: match.server_name,

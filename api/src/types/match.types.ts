@@ -1,3 +1,4 @@
+import type { MatchStateView, MatchStatus } from './matchState.types';
 export interface MatchPlayer {
   [steamId: string]: string; // steamId -> player name
 }
@@ -127,10 +128,11 @@ export interface Match {
   config: string; // JSON string of MatchConfig
   created_at: number;
   loaded_at?: number; // When the match was loaded on the server
-  status: 'pending' | 'loaded' | 'live' | 'completed';
+  status: MatchStatus;
 }
 
 export interface MatchResponse {
+  state: MatchStateView;
   id: number;
   slug: string;
   serverId: string;
@@ -173,6 +175,7 @@ export interface MatchMapResult {
  * Match list item response - used for GET /api/matches
  */
 export interface MatchListItem {
+  state?: MatchStateView;
   id: number;
   slug: string;
   /** `matches.tournament_id`; null outside a tournament. */
