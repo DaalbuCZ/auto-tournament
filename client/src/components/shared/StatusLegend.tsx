@@ -19,7 +19,7 @@ import {
   InfoIcon,
   UsersThreeIcon,
 } from '@phosphor-icons/react';
-import { getStatusColor, getStatusLabel } from '../../utils/matchUtils';
+import { getStatusColor } from '../../utils/matchUtils';
 import { useTranslation } from 'react-i18next';
 
 interface StatusInfo {
@@ -36,25 +36,25 @@ export const StatusLegend: React.FC = () => {
   const statusInfo: StatusInfo[] = [
     {
       status: 'pending',
-      label: getStatusLabel('pending'),
+      label: t('matchState.queued'),
       explanation: t('matchesPage.statusGuide.pending'),
       icon: <ClockIcon />,
     },
     {
       status: 'loaded',
-      label: getStatusLabel('loaded'),
+      label: t('matchState.warmup'),
       explanation: t('matchesPage.statusGuide.loaded'),
       icon: <UsersThreeIcon />,
     },
     {
       status: 'live',
-      label: getStatusLabel('live'),
+      label: t('matchState.live'),
       explanation: t('matchesPage.statusGuide.live'),
       icon: <GameControllerIcon />,
     },
     {
       status: 'completed',
-      label: getStatusLabel('completed'),
+      label: t('matchState.completed'),
       explanation: t('matchesPage.statusGuide.completed'),
       icon: <CheckCircleIcon />,
     },
@@ -111,4 +111,3 @@ export const StatusLegend: React.FC = () => {
     </Card>
   );
 };
-

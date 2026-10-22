@@ -12,14 +12,8 @@ import {
   TableHead,
   TableRow,
 } from '@mui/material';
-import {
-  getStatusColor,
-  getStatusLabel,
-  isUnpairedSwissMatch,
-  waitingForPairingLabel,
-} from '../../utils/matchUtils';
+import { getStatusColor } from '../../utils/matchUtils';
 import type { Match, MatchLiveStats, SwissStanding, Team } from '../../types';
-import { deriveSeriesScore } from '../../utils/matchScoreDisplay';
 import { TeamNameLink } from '../team/TeamNameLink';
 import { useTranslation } from 'react-i18next';
 import { tokens, mono, withAlpha } from '../../theme/tokens';
@@ -104,8 +98,8 @@ export default function SwissView({
                             index < 2
                               ? withAlpha(tokens.color.live, 0.12)
                               : index < 4
-                              ? tokens.color.paper3
-                              : 'transparent',
+                                ? tokens.color.paper3
+                                : 'transparent',
                           boxShadow: index < 2 ? `inset 3px 0 0 ${tokens.color.live}` : 'none',
                           opacity: index < 4 ? 1 : 0.7,
                         }}
@@ -139,8 +133,8 @@ export default function SwissView({
                               record.roundDiff > 0
                                 ? 'success.main'
                                 : record.roundDiff < 0
-                                ? 'error.main'
-                                : 'text.secondary'
+                                  ? 'error.main'
+                                  : 'text.secondary'
                             }
                           >
                             {record.roundDiff > 0 ? '+' : ''}
@@ -170,115 +164,117 @@ export default function SwissView({
                       <Typography variant="h6" fontWeight={600}>
                         {t('rounds.roundN', { n: round })}
                       </Typography>
-                      {!hasMatches && <Chip label={t('bracket.swiss.notGenerated')} size="small" color="default" />}
+                      {!hasMatches && (
+                        <Chip
+                          label={t('bracket.swiss.notGenerated')}
+                          size="small"
+                          color="default"
+                        />
+                      )}
                     </Box>
 
                     {hasMatches ? (
                       <Box display="flex" flexDirection="column" gap={1}>
-                        {roundMatches.map((match) => (
-                          // Note: `useBracket` can attach `liveStats` onto matches.
-                          // SwissView treats them as optional to show last-known series score.
+                        {roundMatches.map((match) =>
                           (() => {
                             const m = match as SwissMatch;
-                            const series = deriveSeriesScore(m, m.liveStats ?? null);
-                            const isInProgress = m.status === 'loaded' || m.status === 'live';
-                            const isNotStarted = m.status === 'pending' || m.status === 'ready';
-                            const isUnknownZero =
-                              series.source === 'default' &&
-                              series.team1 === 0 &&
-                              series.team2 === 0;
-                            const showScore = m.status === 'completed' || isInProgress;
-                            const left =
-                              showScore && !(isNotStarted && isUnknownZero) ? series.team1 : null;
-                            const right =
-                              showScore && !(isNotStarted && isUnknownZero) ? series.team2 : null;
+                            const showScore =
+                              m.state?.lifecycle === 'active' ||
+                              m.state?.lifecycle === 'completed' ||
+                              m.state?.lifecycle === 'awaiting_decision';
+                            const left = showScore ? (m.team1SeriesScore ?? null) : null;
+                            const right = showScore ? (m.team2SeriesScore ?? null) : null;
 
                             return (
-                          <Card
-                            key={match.id}
-                            variant="outlined"
-                            sx={{
-                              cursor: onMatchClick ? 'pointer' : 'default',
-                              bgcolor: tokens.color.paper3,
-                              borderColor: 'transparent',
-                              borderRadius: `${tokens.radius.sm}px`,
-                              '&:hover': onMatchClick
-                                ? {
-                                    borderColor: tokens.color.rule,
-                                  }
-                                : {},
-                            }}
-                            onClick={() => onMatchClick?.(match)}
-                          >
-                            <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
-                              <Box
-                                display="flex"
-                                justifyContent="space-between"
-                                alignItems="center"
+                              <Card
+                                key={match.id}
+                                variant="outlined"
+                                sx={{
+                                  cursor: onMatchClick ? 'pointer' : 'default',
+                                  bgcolor: tokens.color.paper3,
+                                  borderColor: 'transparent',
+                                  borderRadius: `${tokens.radius.sm}px`,
+                                  '&:hover': onMatchClick
+                                    ? {
+                                        borderColor: tokens.color.rule,
+                                      }
+                                    : {},
+                                }}
+                                onClick={() => onMatchClick?.(match)}
                               >
-                                <Box display="flex" alignItems="center" gap={1} flex={1}>
-                                  <Typography variant="body2" sx={{ minWidth: 120 }}>
-                                    {match.team1?.name || 'TBD'}
-                                  </Typography>
-                                  {left !== null ? (
-                                    <Typography variant="body2" fontWeight={600} sx={mono}>
-                                      {left}
-                                    </Typography>
-                                  ) : (
-                                    <Typography variant="body2" fontWeight={600} color="text.secondary">
-                                      —
-                                    </Typography>
-                                  )}
-                                </Box>
-                                <Typography
-                                  variant="body2"
-                                  color="text.secondary"
-                                  sx={{ mx: 2, fontWeight: 600 }}
-                                >
-                                  vs
-                                </Typography>
-                                <Box
-                                  display="flex"
-                                  alignItems="center"
-                                  justifyContent="flex-end"
-                                  gap={1}
-                                  flex={1}
-                                >
-                                  {right !== null ? (
-                                    <Typography variant="body2" fontWeight={600} sx={mono}>
-                                      {right}
-                                    </Typography>
-                                  ) : (
-                                    <Typography variant="body2" fontWeight={600} color="text.secondary">
-                                      —
-                                    </Typography>
-                                  )}
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ minWidth: 120, textAlign: 'right' }}
+                                <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
+                                  <Box
+                                    display="flex"
+                                    justifyContent="space-between"
+                                    alignItems="center"
                                   >
-                                    {match.team2?.name ||
-                                      (match.team1 && match.status === 'completed'
-                                        ? t('bracket.swiss.bye')
-                                        : 'TBD')}
-                                  </Typography>
-                                </Box>
-                                <Chip
-                                  label={
-                                    isUnpairedSwissMatch(match)
-                                      ? waitingForPairingLabel()
-                                      : getStatusLabel(match.status)
-                                  }
-                                  size="small"
-                                  color={getStatusColor(match.status)}
-                                  sx={{ ml: 2, minWidth: 90 }}
-                                />
-                              </Box>
-                            </CardContent>
-                          </Card>
+                                    <Box display="flex" alignItems="center" gap={1} flex={1}>
+                                      <Typography variant="body2" sx={{ minWidth: 120 }}>
+                                        {match.team1?.name || 'TBD'}
+                                      </Typography>
+                                      {left !== null ? (
+                                        <Typography variant="body2" fontWeight={600} sx={mono}>
+                                          {left}
+                                        </Typography>
+                                      ) : (
+                                        <Typography
+                                          variant="body2"
+                                          fontWeight={600}
+                                          color="text.secondary"
+                                        >
+                                          —
+                                        </Typography>
+                                      )}
+                                    </Box>
+                                    <Typography
+                                      variant="body2"
+                                      color="text.secondary"
+                                      sx={{ mx: 2, fontWeight: 600 }}
+                                    >
+                                      vs
+                                    </Typography>
+                                    <Box
+                                      display="flex"
+                                      alignItems="center"
+                                      justifyContent="flex-end"
+                                      gap={1}
+                                      flex={1}
+                                    >
+                                      {right !== null ? (
+                                        <Typography variant="body2" fontWeight={600} sx={mono}>
+                                          {right}
+                                        </Typography>
+                                      ) : (
+                                        <Typography
+                                          variant="body2"
+                                          fontWeight={600}
+                                          color="text.secondary"
+                                        >
+                                          —
+                                        </Typography>
+                                      )}
+                                      <Typography
+                                        variant="body2"
+                                        sx={{ minWidth: 120, textAlign: 'right' }}
+                                      >
+                                        {match.team2?.name ||
+                                          (match.team1 && match.state?.lifecycle === 'completed'
+                                            ? t('bracket.swiss.bye')
+                                            : 'TBD')}
+                                      </Typography>
+                                    </Box>
+                                    <Chip
+                                      label={t(`matchState.${match.state?.activity ?? 'unknown'}`)}
+                                      size="small"
+                                      color={getStatusColor(match.state?.activity ?? 'unknown')}
+                                      sx={{ ml: 2, minWidth: 90 }}
+                                    />
+                                  </Box>
+                                </CardContent>
+                              </Card>
                             );
                           })()
-                        ))}
+                        )}
                       </Box>
                     ) : (
                       <Typography

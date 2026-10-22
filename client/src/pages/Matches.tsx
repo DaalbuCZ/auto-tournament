@@ -1,6 +1,6 @@
 import { pageTitle } from '../utils/pageTitle';
 import { manageMatchPath } from '../paths';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Box, Typography, LinearProgress, Snackbar, Alert, Button } from '@mui/material';
 import { GameControllerIcon, PlusIcon } from '@phosphor-icons/react';
 import { scopedSocket } from '../utils/sharedSocket';
@@ -57,7 +57,6 @@ export default function Matches() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [liveEvents, setLiveEvents] = useState<Map<string, MatchEvent['event']>>(new Map());
-  const [tournamentStatus, setTournamentStatus] = useState<string>('setup');
   const [createMatchOpen, setCreateMatchOpen] = useState(false);
   const { showSuccess, showError } = useSnackbar();
   // What the queued matches are waiting for, asked of the game's own module
@@ -75,58 +74,33 @@ export default function Matches() {
   // them and the list simply shows the matches.
   const QueueBanner = matchIntegration?.matchListQueue?.banner;
   const QueueCountdown = matchIntegration?.matchListQueue?.countdown;
-  const MatchQueueStatus = matchIntegration?.matchListQueue?.cardStatus;
-  // How many wait, as the module reads its own answer (0 without one).
-  const summarizeAvailability = matchIntegration?.summarizeAvailability;
-  const waitingMatches =
-    serverAllocationStatus && summarizeAvailability
-      ? summarizeAvailability(serverAllocationStatus).waitingMatches
-      : 0;
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedMatchSlugs, setSelectedMatchSlugs] = useState<Set<string>>(() => new Set());
   const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false);
   const { t } = useTranslation();
 
+  const request = useRef({ id: 0 });
+
   // Fetch matches
   const fetchMatches = useCallback(async () => {
+    const id = ++request.current.id;
     try {
       const data = await api.get<MatchesResponse & { tournamentStatus?: string }>('/api/matches');
+      if (id !== request.current.id) return;
 
       if (data.success) {
         const matches = data.matches || [];
-        setTournamentStatus(data.tournamentStatus || 'setup');
 
-        const hasTeams = (m: Match) => {
-          // Manual matches (round = 0) don't have bracket-seeded teams; rely on
-          // config team names, but skip pure "TBD" placeholders.
-          if (m.round === 0) {
-            const cfgTeam1Name = (m.config?.team1 as { name?: string } | undefined)?.name;
-            const cfgTeam2Name = (m.config?.team2 as { name?: string } | undefined)?.name;
-            return Boolean(
-              cfgTeam1Name && cfgTeam1Name !== 'TBD' && cfgTeam2Name && cfgTeam2Name !== 'TBD'
-            );
-          }
-
-          // Bracket / tournament matches: only consider teams truly assigned in
-          // the bracket (DB-backed team rows). This prevents future-round
-          // matches with "TBD" placeholders in config from appearing in
-          // Upcoming/Live sections.
-          return Boolean(m.team1 && m.team2);
-        };
-
-        // Upcoming matches: pending and ready (including veto phase)
         const upcoming = matches.filter(
-          (m) => (m.status === 'pending' || m.status === 'ready') && hasTeams(m)
+          (m) =>
+            (m.state?.lifecycle === 'planned' || m.state?.lifecycle === 'awaiting_decision') &&
+            m.state.participantsReady
         );
-
-        // Live matches: only show matches with both teams effectively assigned
         const live = matches.filter(
-          (m) => (m.status === 'live' || m.status === 'loaded') && hasTeams(m)
+          (m) => m.state?.lifecycle === 'active' && m.state.participantsReady
         );
-
-        // History: show all completed and cancelled matches including walkovers
         const history = matches
-          .filter((m) => m.status === 'completed' || m.status === 'cancelled')
+          .filter((m) => m.state?.lifecycle === 'completed' || m.state?.lifecycle === 'cancelled')
           .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
 
         setUpcomingMatches(upcoming);
@@ -146,10 +120,11 @@ export default function Matches() {
         });
       }
     } catch (err) {
+      if (id !== request.current.id) return;
       setError(t('matchesPage.errors.loadMatches'));
       console.error(err);
     } finally {
-      setLoading(false);
+      if (id === request.current.id) setLoading(false);
     }
   }, [t]);
 
@@ -161,122 +136,20 @@ export default function Matches() {
   // Initialize Socket.io connection (mount-only)
   useEffect(() => {
     // Connect to same origin - works in both dev (proxied) and production (Caddy)
+    const pending = request.current;
     const newSocket = scopedSocket();
 
-    newSocket.on('connect', () => {
-      console.log('Socket.io connected');
-    });
-
-    newSocket.on(
-      'match:update',
-      (data: Match | { slug?: string; connectionStatus?: { totalConnected: number } }) => {
-        // Handle connection status updates
-        if ('slug' in data && data.slug && 'connectionStatus' in data && data.connectionStatus) {
-          // We still accept connection status payloads here for backward
-          // compatibility, but the Matches list no longer uses the aggregate
-          // counts directly. The detailed Team view pulls live connection
-          // status from its own hook.
-          return;
-        }
-
-        const match = data as Match & {
-          liveStats?: {
-            team1Score?: number;
-            team2Score?: number;
-            team1SeriesScore?: number;
-            team2SeriesScore?: number;
-            status?: string;
-          };
-        };
-
-        const matchIdOrSlugEquals = (m: Match) =>
-          (match.id !== undefined && m.id === match.id) ||
-          (!!match.slug && !!m.slug && m.slug === match.slug);
-
-        const applyLiveScoreOverlay = (base: Match, updates: typeof match): Match => {
-          const statusFromUpdate = updates.status as Match['status'] | undefined;
-          const isCompletedUpdate = statusFromUpdate === 'completed';
-
-          // Start from the existing match state
-          const next: Match = { ...base };
-
-          // When a match transitions into the completed state via websocket,
-          // explicitly reset both scores back to 0-0 before applying the
-          // final series result from the payload. This avoids transient
-          // hybrids like "9-1" where only the winner's side was updated.
-          if (isCompletedUpdate) {
-            next.team1Score = 0;
-            next.team2Score = 0;
-          }
-
-          Object.assign(next, updates);
-
-          const liveStats = updates.liveStats;
-          if (liveStats && next.status !== 'completed') {
-            // For in-progress matches the headline score is the current map's
-            // rounds, and the map score field follows it. Between maps the live
-            // stats still hold the finished map's rounds, so warmup counts as
-            // no score on the new map. Completed matches keep their persisted
-            // series score.
-            const inWarmup = liveStats.status === 'warmup';
-            if (typeof liveStats.team1Score === 'number') {
-              next.team1MapScore = inWarmup ? 0 : liveStats.team1Score;
-              next.team1Score = next.team1MapScore;
-            }
-            if (typeof liveStats.team2Score === 'number') {
-              next.team2MapScore = inWarmup ? 0 : liveStats.team2Score;
-              next.team2Score = next.team2MapScore;
-            }
-          }
-          return next;
-        };
-
-        const hasTeams = (m: Match | typeof match) =>
-          Boolean(
-            // Bracket / enriched matches with DB-backed team rows
-            ((m as Match).team1 || (m as Match).config?.team1) &&
-            ((m as Match).team2 || (m as Match).config?.team2)
-          );
-
-        const upsertMatch = (list: Match[], updatedMatch: typeof match) => {
-          const index = list.findIndex(matchIdOrSlugEquals);
-          if (index !== -1) {
-            const updated = [...list];
-            updated[index] = applyLiveScoreOverlay(updated[index], updatedMatch);
-            return updated;
-          }
-          // If this is a brand new match and we don't yet have both teams
-          // attached, skip inserting a "ghost" placeholder. The next GET
-          // /api/matches poll or a richer websocket payload will hydrate it.
-          if (!hasTeams(updatedMatch)) {
-            return list;
-          }
-          return [...list, applyLiveScoreOverlay(updatedMatch as Match, updatedMatch)];
-        };
-
-        const removeMatch = (list: Match[]) => list.filter((m) => !matchIdOrSlugEquals(m));
-
-        if (match.status === 'pending' || match.status === 'ready') {
-          setUpcomingMatches((prev) => upsertMatch(prev, match));
-          setLiveMatches((prev) => removeMatch(prev));
-        } else if (match.status === 'live' || match.status === 'loaded') {
-          setUpcomingMatches((prev) => removeMatch(prev));
-          setLiveMatches((prev) => upsertMatch(prev, match));
-        } else if (match.status === 'completed') {
-          setUpcomingMatches((prev) => removeMatch(prev));
-          setLiveMatches((prev) => removeMatch(prev));
-          setMatchHistory((prev) => {
-            const exists = prev.some(matchIdOrSlugEquals);
-            if (exists) {
-              return prev.map((m) =>
-                matchIdOrSlugEquals(m) ? applyLiveScoreOverlay(m, match) : m
-              );
-            }
-            return [applyLiveScoreOverlay(match as Match, match), ...prev];
-          });
-        }
-      }
-    );
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const reload = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        void fetchMatches();
+      }, 200);
+    };
+    newSocket.on('match:update', reload);
+    newSocket.on('veto:update', reload);
+    newSocket.on('tournament:update', reload);
 
     newSocket.on('match:event', (data: MatchEvent) => {
       setLiveEvents((prev) => {
@@ -286,15 +159,14 @@ export default function Matches() {
       });
     });
 
-    newSocket.on('bracket:update', () => {
-      // Refresh matches when bracket updates
-      fetchMatches();
-    });
+    newSocket.on('bracket:update', reload);
 
     // Events sent while the socket was down are gone; refetch on reconnect.
     const offReconnect = onSocketReconnect(newSocket, () => void fetchMatches());
 
     return () => {
+      pending.id++;
+      if (timer) clearTimeout(timer);
       offReconnect();
       newSocket.disconnect();
     };
