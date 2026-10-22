@@ -109,6 +109,8 @@ export interface TeamMember {
 
 /** Everything `GET /api/game/manual/matches/:slug` answers with. */
 export interface MatchReportView {
+  panelState:
+    'nothing' | 'waitingOpponent' | 'needsAnswer' | 'disputed' | 'awaitingAdmin' | 'confirmed';
   match: {
     slug: string;
     status: string;
