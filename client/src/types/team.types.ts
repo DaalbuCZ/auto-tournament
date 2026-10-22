@@ -1,3 +1,4 @@
+import type { MatchStateView, MatchStatus, NextMatchCardView } from './matchState.types';
 /**
  * Team-related types
  */
@@ -58,12 +59,14 @@ export interface TeamMatchVetoSummary {
 }
 
 export interface TeamMatchInfo {
+  state: MatchStateView;
+  nextCard: NextMatchCardView;
   slug: string;
   /** Game integration that owns it (API `game`, 'cs2' today). */
   game?: string;
   round: number;
   matchNumber: number;
-  status: 'pending' | 'ready' | 'loaded' | 'live' | 'completed';
+  status: MatchStatus;
   isTeam1: boolean;
   /**
    * Indicates whether the current viewer is a member of the team whose page

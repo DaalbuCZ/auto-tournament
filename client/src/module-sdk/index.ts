@@ -221,3 +221,5 @@ function moduleNamespaces(moduleId: string): readonly [string, string] {
 // Labels
 export { getRoundLabel, getBracketMatchLabel } from '../utils/matchUtils';
 export { CLIENT_API_VERSION } from './version';
+
+export type { MatchStateView } from '../types/matchState.types';

@@ -1,3 +1,4 @@
+import type { MatchStateView, MatchStatus } from './matchState.types';
 /**
  * Match-related types
  */
@@ -7,6 +8,7 @@ import type { MatchPhase } from './matchPhase.types';
 import type { Untrusted } from '../utils/untrusted';
 
 export interface Match {
+  state?: MatchStateView;
   id: number;
   slug: string;
   /** Game integration that owns it (API `game`, 'cs2' today). */
@@ -16,7 +18,7 @@ export interface Match {
   /** 'WB' | 'LB' | 'GF' | 'GF_RESET' | 'SE' | null (bracket matches only). */
   bracket?: string | null;
   nextMatchId?: number | null;
-  status: 'pending' | 'ready' | 'loaded' | 'live' | 'completed' | 'cancelled';
+  status: MatchStatus;
   team1?: Team;
   team2?: Team;
   winner?: Team;
