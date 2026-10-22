@@ -1,3 +1,4 @@
+import { withMatchCommandLock } from './matchCommandLock';
 /**
  * Match lifecycle: map results and series results, for every game.
  *
@@ -24,6 +25,8 @@
  */
 
 import { db } from '../config/database';
+import { canTransitionMatch, transitionMatch } from './matchTransitions';
+import { isMatchFinalized } from '../utils/matchStatusHelpers';
 import { log } from '../utils/logger';
 import { emitMatchUpdate, emitBracketUpdate } from '../services/socketService';
 import {
@@ -81,38 +84,39 @@ const INTEGRATION_RESULT: ResultMeta = { source: 'integration', actorId: null };
 async function ingest(events: NormalizedEvent[]): Promise<void> {
   for (const event of events) {
     switch (event.type) {
-      case 'map.started':
+      case 'map.started': {
+        const match = await matchBySlug(event.slug);
+        if (!match || !canTransitionMatch(match, 'start_play')) break;
         void postMatchChatLine(event.slug, 'mapLive', {
           n: event.mapNumber + 1,
           map: event.mapName ?? '',
         });
         break;
+      }
       case 'map.result': {
-        const match = await matchBySlug(event.slug);
-        if (match) {
-          await handleMapCompletion(match, event);
-          const names = await matchTeamNames(event.slug);
-          void postMatchChatLine(event.slug, 'mapResult', {
-            n: event.mapNumber + 1,
-            map: event.mapName ?? '',
-            team1: names.team1,
-            team2: names.team2,
-            s1: event.team1Score,
-            s2: event.team2Score,
-          });
-        }
+        await withMatchCommandLock(event.slug, async () => {
+          const match = await matchBySlug(event.slug);
+          if (
+            match &&
+            canTransitionMatch(match, 'complete') &&
+            match.status !== NEEDS_DECISION_STATUS
+          ) {
+            await handleMapCompletion(match, event);
+            const names = await matchTeamNames(event.slug);
+            void postMatchChatLine(event.slug, 'mapResult', {
+              n: event.mapNumber + 1,
+              map: event.mapName ?? '',
+              team1: names.team1,
+              team2: names.team2,
+              s1: event.team1Score,
+              s2: event.team2Score,
+            });
+          }
+        });
         break;
       }
-      case 'series.ended':
-        if (event.winner === 'team1' || event.winner === 'team2') {
-          const names = await matchTeamNames(event.slug);
-          void postMatchChatLine(event.slug, 'seriesWon', {
-            team: event.winner === 'team1' ? names.team1 : names.team2,
-            a: Math.max(event.team1SeriesScore, event.team2SeriesScore),
-            b: Math.min(event.team1SeriesScore, event.team2SeriesScore),
-          });
-        }
-        await applySeriesResult(
+      case 'series.ended': {
+        const outcome = await applySeriesResult(
           event.slug,
           {
             games: [],
@@ -122,7 +126,16 @@ async function ingest(events: NormalizedEvent[]): Promise<void> {
           },
           INTEGRATION_RESULT
         );
+        if (outcome.applied && (event.winner === 'team1' || event.winner === 'team2')) {
+          const names = await matchTeamNames(event.slug);
+          void postMatchChatLine(event.slug, 'seriesWon', {
+            team: event.winner === 'team1' ? names.team1 : names.team2,
+            a: Math.max(event.team1SeriesScore, event.team2SeriesScore),
+            b: Math.min(event.team1SeriesScore, event.team2SeriesScore),
+          });
+        }
         break;
+      }
       case 'presence.changed': {
         // No core state for presence yet (the integration's adapter shows it);
         // resolving the account here is the seam the identity step builds on.
@@ -347,12 +360,13 @@ async function awaitAdminDecision(
     totalMaps - 1,
     inSeries.reduce((max, r) => Math.max(max, r.mapNumber), 0)
   );
-  await db.updateAsync(
-    'matches',
-    { status: NEEDS_DECISION_STATUS, current_map: null, map_number: lastMapIndex },
-    'id = ?',
-    [match.id]
-  );
+  if (
+    !(await transitionMatch(match, 'require_decision', {
+      current_map: null,
+      map_number: lastMapIndex,
+    }))
+  )
+    return;
   await releaseMatch(match);
   emitMatchUpdate({
     id: match.id,
@@ -424,7 +438,7 @@ export async function setSeriesWinnerByAdmin(
   const match = await matchByIdOrSlug(slug);
   if (!match) return { ok: false, status: 404, error: 'Match not found' };
   const status = match.status as string;
-  if (status === 'completed' && match.winner_id) {
+  if (isMatchFinalized(match)) {
     return { ok: false, status: 409, error: 'Match already has a winner' };
   }
   if (!['live', 'loaded', NEEDS_DECISION_STATUS, 'completed'].includes(status)) {
@@ -448,11 +462,17 @@ export async function setSeriesWinnerByAdmin(
     actorId,
   });
   // The maps played are already recorded; the admin only decides the series.
-  await applySeriesResult(
+  const outcome = await applySeriesResult(
     match.slug,
     { games: [], team1Score: decision.team1Maps, team2Score: decision.team2Maps, winner },
     { source: 'admin', actorId }
   );
+  if (!outcome.applied)
+    return {
+      ok: false,
+      status: 409,
+      error: 'The match changed before the result could be applied',
+    };
   return { ok: true };
 }
 
@@ -469,6 +489,14 @@ async function applySeriesResult(
   result: SeriesResult,
   meta: ResultMeta
 ): Promise<ApplySeriesResultOutcome> {
+  return withMatchCommandLock(slug, () => applyLockedSeriesResult(slug, result, meta));
+}
+
+async function applyLockedSeriesResult(
+  slug: string,
+  result: SeriesResult,
+  meta: ResultMeta
+): Promise<ApplySeriesResultOutcome> {
   const match = await matchBySlug(slug);
   if (!match) {
     log.error(`Match not found for series_end event: ${slug}`);
@@ -477,12 +505,18 @@ async function applySeriesResult(
 
   // Idempotency guard: if this match has already been finalized with a winner
   // and marked as completed, skip re-processing duplicate results.
-  if (match.status === 'completed' && match.winner_id) {
+  if (isMatchFinalized(match)) {
     log.warn('Ignoring duplicate series_end for already completed match', {
       slug: match.slug,
       source: meta.source,
     });
     return { applied: false, reason: 'already_completed' };
+  }
+  if (
+    !canTransitionMatch(match, 'complete') ||
+    (meta.source === 'integration' && match.status === NEEDS_DECISION_STATUS)
+  ) {
+    return { applied: false, reason: 'invalid_state' };
   }
   // A result the core synthesises (see finishExhaustedSeries) can race the
   // game's own; only one may run the progression.
@@ -640,7 +674,9 @@ async function processSeriesEnd(
   // Prefer the explicit winner, even when scores are tied (e.g.
   // performance-based tiebreaks). Fall back to score comparison only if the
   // winner is "none".
-  const winnerSide = result.winner;
+  let winnerSide = result.winner;
+  if (winnerSide === 'none' && team1Score !== team2Score)
+    winnerSide = team1Score > team2Score ? 'team1' : 'team2';
   const isDrawFromScores = winnerSide === 'none' && team1Score === team2Score;
 
   let winnerId: string | null = null;
@@ -655,7 +691,6 @@ async function processSeriesEnd(
   } else {
     winnerId = null;
   }
-  const completedAt = Math.floor(Date.now() / 1000);
   // Finished matches point at the last map played, whatever the game reported since.
   const lastMap = await lastPlayedMapIndex(match, description);
   const finalMapNumber = lastMap === null ? {} : { map_number: lastMap };
@@ -670,16 +705,10 @@ async function processSeriesEnd(
         `Could not determine winner team_id for manual match ${matchSlug}; marking completed without winner_id`
       );
 
-      await db.updateAsync(
-        'matches',
-        {
-          status: 'completed',
-          completed_at: completedAt,
-          ...finalMapNumber,
-        },
-        'id = ?',
-        [match.id]
-      );
+      if (
+        !(await transitionMatch(match, 'complete', { winner_side: winnerSide, ...finalMapNumber }))
+      )
+        return false;
 
       // Even though manual matches don't have bracket progression or a
       // persistent tournament association, we still want them to appear in
@@ -764,17 +793,14 @@ async function processSeriesEnd(
     // tie games no longer appear as "live" forever and that player stats are
     // still recorded for history, while ratings remain unchanged.
     if (isDrawFromScores) {
-      await db.updateAsync(
-        'matches',
-        {
-          status: 'completed',
+      if (
+        !(await transitionMatch(match, 'complete', {
           winner_id: null,
-          completed_at: completedAt,
+          winner_side: 'none',
           ...finalMapNumber,
-        },
-        'id = ?',
-        [match.id]
-      );
+        }))
+      )
+        return false;
 
       log.warn(`Match ${matchSlug} ended in a draw; marking completed without winner_id`);
 
@@ -823,17 +849,14 @@ async function processSeriesEnd(
   }
 
   // Update match status to completed
-  await db.updateAsync(
-    'matches',
-    {
-      status: 'completed',
+  if (
+    !(await transitionMatch(match, 'complete', {
       winner_id: winnerId,
-      completed_at: completedAt,
+      winner_side: winnerId === match.team1_id ? 'team1' : 'team2',
       ...finalMapNumber,
-    },
-    'id = ?',
-    [match.id]
-  );
+    }))
+  )
+    return false;
 
   log.success(`Match ${matchSlug} marked as completed with winner ${winnerId}`);
 

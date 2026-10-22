@@ -1,3 +1,4 @@
+import { transitionMatch } from '../core/matchTransitions';
 /**
  * Match Progression Utilities
  * Handles tournament bracket progression logic
@@ -694,12 +695,8 @@ export async function makeMatchReady(match: DbMatchRow): Promise<void> {
     );
 
     // Update match with config and ready status
-    await db.updateAsync(
-      'matches',
-      { config: serializeMatchConfig(config), status: 'ready' },
-      'id = ?',
-      [match.id]
-    );
+    if (!(await transitionMatch(match, 'prepare', { config: serializeMatchConfig(config) })))
+      return;
 
     // Get team names for logging
     const team1 = await db.queryOneAsync<DbTeamRow>('SELECT name FROM teams WHERE id = ?', [
