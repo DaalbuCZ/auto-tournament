@@ -1,3 +1,4 @@
+import type { MatchStateView } from '../types/matchState.types';
 /**
  * Client side of the game-integration contract (3.0 phase C, PR 12).
  *
@@ -118,6 +119,7 @@ export interface MatchAllocationPanelProps {
  */
 /** A finished match as its public page has it (core's GET /api/matches/:slug). */
 export interface PublicMatch {
+  state?: MatchStateView;
   slug: string;
   status: string;
   team1: { id: string | null; name: string | null; tag: string | null } | null;

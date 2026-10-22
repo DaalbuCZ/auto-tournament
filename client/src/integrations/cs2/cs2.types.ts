@@ -1,3 +1,4 @@
+import type { MatchStateView } from '../../module-sdk';
 /**
  * Counter-Strike 2's own data shapes: servers, the fleet's availability and
  * the map veto.
@@ -210,6 +211,7 @@ export interface MatchServer {
 
 /** `GET /api/game/cs2/matches/:slug/connect`: how the viewer joins one match. */
 export interface MatchConnectResponse extends Cs2ApiResponse {
+  state: MatchStateView;
   viewerIsTeamMember: boolean;
   matchStatus: string;
   /** The live-stats phase (warmup, knife, live, halftime, postgame), once there are live stats. */
