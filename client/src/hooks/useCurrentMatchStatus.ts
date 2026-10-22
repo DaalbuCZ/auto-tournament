@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../utils/api';
-import type { Socket } from 'socket.io-client';
 import { scopedSocket } from '../utils/sharedSocket';
 import { onSocketReconnect } from '../utils/socketResync';
 
@@ -12,7 +11,16 @@ export interface MatchupSide {
 }
 
 export type MatchStatusValue =
-  'none' | 'your_turn_veto' | 'waiting_veto' | 'veto_soon' | 'waiting_server' | 'match_ready';
+  | 'none'
+  | 'your_turn_veto'
+  | 'waiting_veto'
+  | 'veto_soon'
+  | 'waiting_server'
+  | 'match_ready'
+  | 'on_hold'
+  | 'report_result'
+  | 'needs_decision'
+  | 'state_unknown';
 
 interface MatchStatusResult {
   status: MatchStatusValue;
@@ -33,152 +41,98 @@ interface MatchStatusResult {
   /** The viewer's team and the opponent, for the next-match dialog. */
   matchup: { you: MatchupSide; opponent: MatchupSide } | null;
   loading: boolean;
+  error: string | null;
   refetch: () => void;
 }
 
+type MatchStatusSnapshot = Omit<MatchStatusResult, 'loading' | 'error' | 'refetch'>;
+const EMPTY: MatchStatusSnapshot = {
+  status: 'none',
+  matchSlug: null,
+  matchName: null,
+  label: null,
+  viewerTeam: null,
+  vetoActionCount: null,
+  lastVetoActionTeam: null,
+  opensAt: null,
+  vetoOff: false,
+  matchup: null,
+};
+
 export function useCurrentMatchStatus(playerSteamId: string | null): MatchStatusResult {
-  const [status, setStatus] = useState<MatchStatusValue>('none');
-  const [matchSlug, setMatchSlug] = useState<string | null>(null);
-  const [matchName, setMatchName] = useState<string | null>(null);
-  const [label, setLabel] = useState<string | null>(null);
-  const [viewerTeam, setViewerTeam] = useState<'team1' | 'team2' | null>(null);
-  const [vetoActionCount, setVetoActionCount] = useState<number | null>(null);
-  const [lastVetoActionTeam, setLastVetoActionTeam] = useState<'team1' | 'team2' | null>(null);
-  const [opensAt, setOpensAt] = useState<string | null>(null);
-  const [vetoOff, setVetoOff] = useState(false);
-  const [matchup, setMatchup] = useState<MatchStatusResult['matchup']>(null);
-  // Loading until the first fetch: a navbar mounted by a page change must not
-  // take the initial 'none' as the previous status and toast the fetched one.
-  const [loading, setLoading] = useState(Boolean(playerSteamId));
-  const socketRef = useRef<Socket | null>(null);
-  const refreshTimerRef = useRef<number | null>(null);
-
-  const fetchStatus = useCallback(
-    async (options?: { silent?: boolean }) => {
-      if (!playerSteamId) {
-        setStatus('none');
-        setMatchSlug(null);
-        setMatchName(null);
-        setLabel(null);
-        setViewerTeam(null);
-        setVetoActionCount(null);
-        setLastVetoActionTeam(null);
-        return;
-      }
-
-      if (!options?.silent) {
-        setLoading(true);
-      }
-      try {
-        const res = await api.get<{
-          success: boolean;
-          status?: MatchStatusValue;
-          matchSlug?: string | null;
-          matchName?: string | null;
-          label?: string | null;
-          viewerTeam?: 'team1' | 'team2' | null;
-          vetoActionCount?: number | null;
-          lastVetoActionTeam?: 'team1' | 'team2' | null;
-          opensAt?: string | null;
-          vetoOff?: boolean;
-          matchup?: MatchStatusResult['matchup'];
-        }>('/api/players/me/match-status');
-
-        if (res?.success) {
-          setStatus((res.status as MatchStatusValue) ?? 'none');
-          setMatchSlug(res.matchSlug ?? null);
-          setMatchName(res.matchName ?? null);
-          setLabel(res.label ?? null);
-          setViewerTeam(res.viewerTeam ?? null);
-          setVetoActionCount(typeof res.vetoActionCount === 'number' ? res.vetoActionCount : null);
-          setLastVetoActionTeam(res.lastVetoActionTeam ?? null);
-          setOpensAt(res.opensAt ?? null);
-          setVetoOff(res.vetoOff === true);
-          setMatchup(res.matchup ?? null);
-        }
-      } catch {
-        setStatus('none');
-        setMatchSlug(null);
-        setMatchName(null);
-        setLabel(null);
-        setViewerTeam(null);
-        setVetoActionCount(null);
-        setLastVetoActionTeam(null);
-      } finally {
-        if (!options?.silent) {
-          setLoading(false);
-        }
-      }
-    },
-    [playerSteamId]
-  );
+  const [answer, setAnswer] = useState<{
+    player: string;
+    snapshot: MatchStatusSnapshot;
+    error: string | null;
+  } | null>(null);
+  const request = useRef({ id: 0 });
+  const fetchStatus = useCallback(async () => {
+    if (!playerSteamId) return;
+    const id = ++request.current.id;
+    try {
+      const res = await api.get<Partial<MatchStatusSnapshot> & { success: boolean }>(
+        '/api/players/me/match-status'
+      );
+      if (id !== request.current.id) return;
+      if (!res.success) throw new Error('Failed to read match status');
+      setAnswer({ player: playerSteamId, snapshot: { ...EMPTY, ...res }, error: null });
+    } catch (error) {
+      if (id !== request.current.id) return;
+      setAnswer((previous) => ({
+        player: playerSteamId,
+        snapshot:
+          previous?.player === playerSteamId
+            ? previous.snapshot
+            : {
+                ...EMPTY,
+                status: 'state_unknown',
+                label: 'state_unknown',
+              },
+        error: error instanceof Error ? error.message : 'Failed to read match status',
+      }));
+    }
+  }, [playerSteamId]);
 
   useEffect(() => {
+    if (!playerSteamId) return;
+    const pending = request.current;
     void fetchStatus();
-  }, [playerSteamId, fetchStatus]);
-
-  // Real-time updates: veto actions, match and bracket changes and the
-  // player's matchmaking events refetch match-status at once (no polling).
-  useEffect(() => {
-    if (!playerSteamId) {
-      if (socketRef.current) {
-        socketRef.current.close();
-        socketRef.current = null;
-      }
-      if (refreshTimerRef.current) {
-        window.clearTimeout(refreshTimerRef.current);
-        refreshTimerRef.current = null;
-      }
-      return;
-    }
-
-    if (!socketRef.current) {
-      socketRef.current = scopedSocket();
-    }
-    const socket = socketRef.current;
-
-    const scheduleSilentRefetch = () => {
-      if (refreshTimerRef.current) return;
-      refreshTimerRef.current = window.setTimeout(() => {
-        refreshTimerRef.current = null;
-        void fetchStatus({ silent: true });
+    const socket = scopedSocket();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const refresh = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        void fetchStatus();
       }, 50);
     };
-
-    // Any veto update can affect whose turn it is (and thus match-status labels);
-    // a match loading, going live or ending, a bracket advancing and the
-    // player's own matchmaking change which match is theirs. No timer.
-    const events = ['veto:update', 'match:update', 'bracket:update', 'mm:changed'];
-    for (const event of events) socket.on(event, scheduleSilentRefetch);
-    socket.emit('player:subscribe');
-    const onConnect = () => socket.emit('player:subscribe');
-    socket.on('connect', onConnect);
-    const offReconnect = onSocketReconnect(socket, scheduleSilentRefetch);
-
+    const subscribe = () => socket.emit('player:subscribe');
+    subscribe();
+    socket.on('connect', subscribe);
+    const events = [
+      'veto:update',
+      'match:update',
+      'bracket:update',
+      'tournament:update',
+      'mm:changed',
+    ];
+    for (const event of events) socket.on(event, refresh);
+    const offReconnect = onSocketReconnect(socket, refresh);
     return () => {
+      pending.id++;
+      if (timer) clearTimeout(timer);
       offReconnect();
-      if (refreshTimerRef.current) {
-        window.clearTimeout(refreshTimerRef.current);
-        refreshTimerRef.current = null;
-      }
-      for (const event of events) socket.off(event, scheduleSilentRefetch);
-      socket.off('connect', onConnect);
-      // Keep socket open for reuse; it will be closed when playerSteamId becomes null.
+      for (const event of events) socket.off(event, refresh);
+      socket.off('connect', subscribe);
+      socket.close();
     };
   }, [playerSteamId, fetchStatus]);
 
+  const current = answer?.player === playerSteamId ? answer : null;
   return {
-    status,
-    matchSlug,
-    matchName,
-    label,
-    viewerTeam,
-    vetoActionCount,
-    lastVetoActionTeam,
-    opensAt,
-    vetoOff,
-    matchup,
-    loading,
-    refetch: () => fetchStatus(),
+    ...(current?.snapshot ?? EMPTY),
+    loading: Boolean(playerSteamId && !current),
+    error: current?.error ?? null,
+    refetch: () => void fetchStatus(),
   };
 }
