@@ -1,3 +1,5 @@
+import { visibleMatchState } from '../core/projectMatchState';
+import { matchStateFor } from '../core/matchState';
 import { logoUrl } from '../services/teamSelfService';
 import { randomBytes } from 'crypto';
 import type { SqlValue } from '../config/database';
@@ -599,13 +601,12 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
     let match = await db.queryOneAsync<
       DbMatchRow & { team1_players?: string | null; team2_players?: string | null }
     >(
-      `SELECT m.id, m.slug, m.status, m.config, m.veto_state, m.held_until, m.team1_id, m.team2_id,
-              m.round, m.tournament_id,
+      `SELECT m.*,
               t1.players as team1_players, t2.players as team2_players
        FROM matches m
        LEFT JOIN teams t1 ON m.team1_id = t1.id
        LEFT JOIN teams t2 ON m.team2_id = t2.id
-       WHERE m.status IN ('loaded', 'live')
+       WHERE m.status IN ('loaded', 'live', 'needs_decision')
          AND (
            (t1.players LIKE ? ESCAPE '\\')
            OR (t2.players LIKE ? ESCAPE '\\')
@@ -620,8 +621,7 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       match = await db.queryOneAsync<
         DbMatchRow & { team1_players?: string | null; team2_players?: string | null }
       >(
-        `SELECT m.id, m.slug, m.status, m.config, m.veto_state, m.held_until, m.team1_id, m.team2_id,
-                m.round, m.tournament_id,
+        `SELECT m.*,
                 t1.players as team1_players, t2.players as team2_players
          FROM matches m
          LEFT JOIN teams t1 ON m.team1_id = t1.id
@@ -693,148 +693,62 @@ router.get('/me/match-status', async (req: Request, res: Response) => {
       });
     }
 
-    // A match before its tournament starts, or still waiting for an opponent, has no veto or
-    // server yet: the top bar shows nothing for it (it said "your turn in veto" before start).
-    if (match.status === 'pending' || match.status === 'ready') {
-      const tournament = match.tournament_id
-        ? await db.queryOneAsync<{ status: string }>('SELECT status FROM tournament WHERE id = ?', [
-            match.tournament_id,
-          ])
-        : null;
-      const started = !match.tournament_id || tournament?.status === 'in_progress';
-      if (!started || !match.team1_id || !match.team2_id) {
-        return res.json({ success: true, status: 'none', matchSlug: null, label: null });
-      }
-    }
-
-    const vetoState = match.veto_state
-      ? (JSON.parse(match.veto_state) as {
-          status?: string;
-          currentTurn?: string;
+    const state = visibleMatchState(await matchStateFor(match), 'participant');
+    const viewerTeam = isTeam1 ? 'team1' : 'team2';
+    const vetoState = (() => {
+      try {
+        return JSON.parse(match.veto_state ?? 'null') as {
           actions?: Array<{ team?: string }>;
-        })
-      : null;
-    const vetoCompleted = vetoState?.status === 'completed';
-
-    // Do NOT read currentTurn straight off veto_state: that row is only written
-    // once the first action is submitted, so on step 1 it is NULL and the team
-    // that has to act first would be told "waiting for veto" instead of
-    // "your turn". The integration's preMatchTurn derives the opening step
-    // from the configured veto order in that case.
-    const currentTurn = vetoCompleted
-      ? null
-      : ((await integrationForMatch(match).preMatchTurn?.(match)) ?? null);
-
-    if (['loaded', 'live'].includes(match.status)) {
-      // On the server, or dropped off it (the site offers to reconnect).
-      const connection = playerConnectionService.connectionOf(match.slug, steamId);
-      return res.json({
-        success: true,
-        status: 'match_ready',
-        matchSlug: match.slug,
-        label: 'match_ready',
-        connection: connection.state,
-        droppedAt: connection.droppedAt,
-        matchName,
-        matchup,
-      });
-    }
-
-    // A tournament without a veto (2v2, shuffle): the break and the wait are for the match, never
-    // "waiting for veto" (the navbar said "Veto in 3:12" for a veto-off final, 2026-10-15).
-    const tournamentSettings = match.tournament_id
-      ? await db.queryOneAsync<{ settings: string | null }>(
-          'SELECT settings FROM tournament WHERE id = ?',
-          [match.tournament_id]
-        )
-      : null;
-    let vetoOff = false;
-    try {
-      vetoOff = !(
-        integrationForMatch(match).usesPreMatchPhase?.({
-          settings: tournamentSettings?.settings ? JSON.parse(tournamentSettings.settings) : {},
-        }) ?? true
-      );
-    } catch {
-      vetoOff = false;
-    }
-
-    // Held before its veto started (the break between a team's matches, or an
-    // admin's hold): "the veto opens at …", with the time for a countdown.
-    const heldUntil = Number((match as { held_until?: number | null }).held_until ?? 0);
-    const vetoStarted = Array.isArray(vetoState?.actions) && vetoState.actions.length > 0;
-    if (
-      (match.status === 'pending' || match.status === 'ready') &&
-      !vetoCompleted &&
-      !vetoStarted &&
-      heldUntil > Math.floor(Date.now() / 1000)
-    ) {
-      return res.json({
-        success: true,
-        status: 'veto_soon',
-        matchSlug: match.slug,
-        label: 'veto_soon',
-        // No veto: the countdown is to the match itself.
-        vetoOff,
-        matchName,
-        matchup,
-        viewerTeam: isTeam1 ? 'team1' : 'team2',
-        vetoActionCount: 0,
-        lastVetoActionTeam: null,
-        opensAt: new Date(heldUntil * 1000).toISOString(),
-      });
-    }
-
-    if ((match.status === 'pending' || match.status === 'ready') && vetoOff) {
-      return res.json({
-        success: true,
-        status: 'waiting_server',
-        matchSlug: match.slug,
-        label: 'waiting_server',
-        matchName,
-        matchup,
-      });
-    }
-
-    if ((match.status === 'pending' || match.status === 'ready') && !vetoCompleted) {
-      const myTurn =
-        currentTurn &&
-        ((currentTurn === 'team1' && isTeam1) || (currentTurn === 'team2' && !isTeam1));
-      // Who made the most recent veto move, so the navbar can tell "the
-      // opponent made their choice" apart from the viewer's own action.
-      const vetoActions = Array.isArray(vetoState?.actions) ? vetoState.actions : [];
-      const lastTeam = vetoActions[vetoActions.length - 1]?.team;
-      return res.json({
-        success: true,
-        status: myTurn ? 'your_turn_veto' : 'waiting_veto',
-        matchSlug: match.slug,
-        label: myTurn ? 'your_turn_veto' : 'waiting_veto',
-        matchName,
-        matchup,
-        viewerTeam: isTeam1 ? 'team1' : 'team2',
-        vetoActionCount: vetoActions.length,
-        lastVetoActionTeam: lastTeam === 'team1' || lastTeam === 'team2' ? lastTeam : null,
-      });
-    }
-
-    if ((match.status === 'pending' || match.status === 'ready') && vetoCompleted) {
-      return res.json({
-        success: true,
-        status: 'waiting_server',
-        matchSlug: match.slug,
-        label: 'waiting_server',
-        matchName,
-        matchup,
-      });
-    }
-
+        } | null;
+      } catch {
+        return null;
+      }
+    })();
+    const vetoActions = Array.isArray(vetoState?.actions) ? vetoState.actions : [];
+    const lastTeam = vetoActions[vetoActions.length - 1]?.team;
+    const currentTurn =
+      state.activity === 'veto' ? await integrationForMatch(match).preMatchTurn?.(match) : null;
+    const status =
+      state.activity === 'not_started' || state.activity === 'waiting_opponent'
+        ? 'none'
+        : state.activity === 'needs_decision'
+          ? 'needs_decision'
+          : state.activity === 'reporting'
+            ? 'report_result'
+            : state.activity === 'held' || state.activity === 'scheduled'
+              ? state.opensAt
+                ? 'veto_soon'
+                : 'on_hold'
+              : state.activity === 'veto'
+                ? currentTurn === viewerTeam
+                  ? 'your_turn_veto'
+                  : 'waiting_veto'
+                : state.activity === 'queued'
+                  ? 'waiting_server'
+                  : state.activity === 'waiting_team'
+                    ? 'on_hold'
+                    : state.activity === 'offline' ||
+                        state.activity === 'unknown' ||
+                        state.activity === 'inconsistent'
+                      ? 'state_unknown'
+                      : 'match_ready';
+    const connection = playerConnectionService.connectionOf(match.slug, steamId);
     return res.json({
       success: true,
-      status: 'match_ready',
-      matchSlug: match.slug,
-      label: 'match_ready',
+      status,
+      label: status === 'none' ? null : status,
+      matchSlug: status === 'none' ? null : match.slug,
+      state,
       matchName,
       matchup,
+      viewerTeam,
+      vetoOff: !state.requiresPreMatch,
+      vetoActionCount: vetoActions.length,
+      lastVetoActionTeam: lastTeam === 'team1' || lastTeam === 'team2' ? lastTeam : null,
+      opensAt: state.opensAt ? new Date(state.opensAt * 1000).toISOString() : null,
+      ...(state.actions.includes('connect')
+        ? { connection: connection.state, droppedAt: connection.droppedAt }
+        : {}),
     });
   } catch (e) {
     log.error('Failed to compute match status for /me/match-status', e as Error);
