@@ -1,3 +1,4 @@
+import { transitionMatch } from '../../../core/matchTransitions';
 import { db } from '../../../config/database';
 import { withVetoLock } from './lock';
 import { log } from '../../../utils/logger';
@@ -472,12 +473,8 @@ async function runAutoVeto(matchSlug: string, options?: AutoVetoOptions): Promis
         vetoState.availableMaps = [];
       }
 
-      await db.updateAsync(
-        'matches',
-        { veto_state: JSON.stringify(vetoState), status: 'ready' },
-        'slug = ?',
-        [matchSlug]
-      );
+      if (!(await transitionMatch(match, 'prepare', { veto_state: JSON.stringify(vetoState) })))
+        return;
       emitVetoUpdate(matchSlug, vetoState);
 
       void postVetoProgress(matchSlug, vetoState);

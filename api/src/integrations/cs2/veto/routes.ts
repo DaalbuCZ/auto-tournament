@@ -1,3 +1,4 @@
+import { transitionMatch } from '../../../core/matchTransitions';
 import { announceVetoTurn } from '../../../services/matchNotices';
 import { withVetoLock } from './lock';
 import type { Request, Response } from 'express';
@@ -733,7 +734,10 @@ async function vetoAction(req: Request, res: Response) {
 
       afterCompletion = async () => {
         // Update match status to 'ready' now that veto is completed
-        await db.updateAsync('matches', { status: 'ready' }, 'slug = ?', [matchSlug]);
+        const current = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
+          matchSlug,
+        ]);
+        if (!current || !(await transitionMatch(current, 'prepare'))) return;
         log.info(`Match ${matchSlug} status updated to 'ready' after veto completion`);
 
         // NEW: Recompute and persist the fresh config snapshot so /api/matches and any readers of matches.config are in sync
@@ -865,10 +869,9 @@ async function vetoAction(req: Request, res: Response) {
 router.post('/:matchSlug/reset', requireAuth, async (req: Request, res: Response) => {
   try {
     const { matchSlug } = req.params;
-    const match = await db.queryOneAsync<{ status: string; server_id: string | null }>(
-      'SELECT status, server_id FROM matches WHERE slug = ?',
-      [matchSlug]
-    );
+    const match = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [
+      matchSlug,
+    ]);
     if (!match) return res.status(404).json({ success: false, error: 'Match not found' });
     if ((match.status !== 'pending' && match.status !== 'ready') || match.server_id) {
       return res.status(409).json({
@@ -880,9 +883,11 @@ router.post('/:matchSlug/reset', requireAuth, async (req: Request, res: Response
 
     // A finished veto made the match `ready` (waiting for a server); back to waiting for the veto.
     scheduler.stopPollingForServer(matchSlug);
-    await db.updateAsync('matches', { veto_state: null, status: 'pending' }, 'slug = ?', [
-      matchSlug,
-    ]);
+    if (!(await transitionMatch(match, 'reset_prematch', { veto_state: null }))) {
+      return res
+        .status(409)
+        .json({ success: false, error: 'The match changed; reload and try again' });
+    }
 
     log.info(`Veto reset for match ${matchSlug}`);
 

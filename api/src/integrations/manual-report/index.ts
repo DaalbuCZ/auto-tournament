@@ -1,3 +1,5 @@
+import type { DbMatchRow } from '../../types/database.types';
+import { transitionMatch } from '../../core/matchTransitions';
 /**
  * Manual reporting: the game module for games MAT cannot watch (3.0 phase D).
  *
@@ -149,12 +151,11 @@ function describeTeam(team: Partial<ManualReportTeam> | undefined): MatchDescrip
  */
 async function setLive(slug: string): Promise<void> {
   const { db } = await import('../../config/database');
-  const now = Math.floor(Date.now() / 1000);
-  const result = await db.runAsync(
-    "UPDATE matches SET status = 'live', loaded_at = ? WHERE slug = ? AND status = 'ready'",
-    [now, slug]
-  );
-  if (result.changes > 0) {
+  const match = await db.queryOneAsync<DbMatchRow>('SELECT * FROM matches WHERE slug = ?', [slug]);
+  if (
+    match?.status === 'ready' &&
+    (await transitionMatch(match, 'start_play', { loaded_at: Math.floor(Date.now() / 1000) }))
+  ) {
     const { emitMatchUpdate, emitBracketUpdate } = await import('../../services/socketService');
     emitMatchUpdate({ slug, status: 'live' });
     emitBracketUpdate({ action: 'match_status', matchSlug: slug, status: 'live' });
