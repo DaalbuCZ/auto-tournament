@@ -71,34 +71,9 @@ import { StatFieldsForm } from './StatFieldsForm';
 import { draftFromRecorded, validateDraft, type DraftCheck, type StatDraft } from './statFields';
 import { useStatDraftLabels } from './statFieldMessages';
 
-/** Which of the five sentences the panel is showing. */
-type PanelState =
-  'nothing' | 'waitingOpponent' | 'needsAnswer' | 'disputed' | 'awaitingAdmin' | 'confirmed';
-
-/**
- * Match statuses a result may still be reported for, the same set
- * `submitReport` enforces. `viewer.canReport` only says whether an open report
- * is in the way, so a settled match would otherwise keep offering a button
- * whose only possible answer is "reopen it first".
- */
-const REPORTABLE_MATCH_STATUSES = new Set(['ready', 'loaded', 'live', 'needs_decision']);
-
 /** An empty score row per game of the series. */
 const emptyRows = (seriesLength: number) =>
   Array.from({ length: Math.max(1, seriesLength) }, () => ({ team1: '', team2: '' }));
-
-function stateOf(view: MatchReportView): PanelState {
-  const open = view.open;
-  if (open?.status === 'disputed') return 'disputed';
-  if (view.match.status === 'needs_decision') return 'awaitingAdmin';
-  if (open?.status === 'submitted') {
-    // "Mine, waiting on them" vs "theirs, waiting on me". An admin who captains
-    // neither team may answer, so they get the answerable wording too.
-    return view.viewer.canConfirm ? 'needsAnswer' : 'waitingOpponent';
-  }
-  if (view.reports.some((report) => report.status === 'confirmed')) return 'confirmed';
-  return 'nothing';
-}
 
 /** The score to show big: the game's own for a one-game series, else maps won. */
 function headlineScore(report: MatchReport | null): { team1: number; team2: number } {
@@ -201,7 +176,7 @@ export function ManualReportPanel({ matchSlug, matchStatus }: MatchReportPanelPr
     [view, t]
   );
 
-  const state = view ? stateOf(view) : 'nothing';
+  const state = view?.panelState ?? 'nothing';
   const report = view ? shownReport(view) : null;
 
   const deadline = useMemo(() => {
@@ -300,7 +275,7 @@ export function ManualReportPanel({ matchSlug, matchStatus }: MatchReportPanelPr
     team: state === 'waitingOpponent' ? teamName(opponent) : reporterName,
   });
 
-  const mayReport = viewer.canReport && REPORTABLE_MATCH_STATUSES.has(view.match.status);
+  const mayReport = viewer.canReport;
   // A one-game series has no maps-won score worth showing: a captain who typed
   // 3-1 should not be told the result is 1-0. Anything longer is scored in
   // games won, with the individual games on the chips below.

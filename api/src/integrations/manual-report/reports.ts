@@ -1,3 +1,5 @@
+import { withMatchCommandLock } from '../../core/matchCommandLock';
+import { transitionMatch } from '../../core/matchTransitions';
 /**
  * The manual-report state machine (3.0 phase D, PR D3).
  *
@@ -544,7 +546,7 @@ async function finalize(match: DbMatchRow, report: MatchReport): Promise<boolean
 
 /** Park the match for an admin: a dispute, or an escalated timeout. */
 async function parkForAdmin(match: DbMatchRow): Promise<void> {
-  await db.updateAsync('matches', { status: NEEDS_DECISION_STATUS }, 'id = ?', [match.id]);
+  if (!(await transitionMatch(match, 'require_decision'))) return;
   emitMatchUpdate({ id: match.id, slug: match.slug, status: NEEDS_DECISION_STATUS });
   emitBracketUpdate({
     action: 'match_status',
@@ -877,7 +879,7 @@ export async function adminOverride(input: {
   if (!isManualReportMatch(match)) {
     return fail(409, `Match '${match.slug}' is not reported manually`);
   }
-  if (match.status === 'completed' && match.winner_id) {
+  if (match.status === 'completed') {
     return fail(409, 'That match already has a winner; reopen it first');
   }
   return writeAdminResult(match, input.actor, input.result, 'override', input.stats);
@@ -978,12 +980,50 @@ async function checkStats(
  * the confirmed one and any open one, because a reopened match with a report
  * still open is a match neither captain can report and neither can answer.
  */
+class ReopenConflict extends Error {
+  constructor(readonly outcome: Extract<ReportOutcome, { ok: false }>) {
+    super(outcome.error);
+  }
+}
+
 export async function reopenMatch(input: {
   matchSlug: string;
   actor: ReportActor;
 }): Promise<ReportOutcome> {
+  try {
+    const outcome = await withMatchCommandLock(input.matchSlug, () =>
+      db.transaction(async () => {
+        const result = await reopenMatchInTransaction(input);
+        if (!result.ok) throw new ReopenConflict(result);
+        return result;
+      })
+    );
+    const match = await matchFor(input.matchSlug);
+    if (match) {
+      emitMatchUpdate({ id: match.id, slug: match.slug, status: match.status, winnerId: null });
+      emitBracketUpdate({ action: 'match_status', matchSlug: match.slug, status: match.status });
+      emitTournament(tournamentIdForMatch(match), 'match:report', {
+        matchSlug: match.slug,
+        action: 'reopen',
+        status: match.status,
+      });
+    }
+    return outcome;
+  } catch (error) {
+    if (error instanceof ReopenConflict) return error.outcome;
+    throw error;
+  }
+}
+
+async function reopenMatchInTransaction(input: {
+  matchSlug: string;
+  actor: ReportActor;
+}): Promise<ReportOutcome> {
   if (input.actor.role !== 'admin') return fail(403, 'Only an admin may reopen a match');
-  const match = await matchFor(input.matchSlug);
+  const match = await db.queryOneAsync<DbMatchRow>(
+    'SELECT * FROM matches WHERE slug = ? FOR UPDATE',
+    [input.matchSlug]
+  );
   if (!match) return fail(404, `Match '${input.matchSlug}' not found`);
   if (!isManualReportMatch(match)) {
     return fail(409, `Match '${match.slug}' is not reported manually`);
@@ -1007,7 +1047,7 @@ export async function reopenMatch(input: {
   // Every match this one feeds, by explicit slot wiring or by next_match_id.
   const downstream = await db.queryAsync<DbMatchRow>(
     `SELECT * FROM matches
-      WHERE team1_from_match_id = ? OR team2_from_match_id = ? OR id = ?`,
+      WHERE team1_from_match_id = ? OR team2_from_match_id = ? OR id = ? ORDER BY id FOR UPDATE`,
     [match.id, match.id, match.next_match_id ?? -1]
   );
   const started = downstream.filter((m) => !['pending', 'ready'].includes(m.status) || m.winner_id);
@@ -1039,20 +1079,17 @@ export async function reopenMatch(input: {
       updates.team2_id = null;
     }
     if (Object.keys(updates).length === 0) continue;
-    updates.status = 'pending';
-    await db.updateAsync('matches', updates, 'id = ?', [later.id]);
+    if (!(await transitionMatch(later, 'reset_prematch', updates)))
+      return fail(409, 'A later match changed; reload and try again');
   }
 
   await db.runAsync('DELETE FROM match_map_results WHERE match_slug = ?', [match.slug]);
   await db.runAsync('DELETE FROM player_match_stats WHERE match_slug = ?', [match.slug]);
   // The custom values belonged to the result that no longer stands (PR D6).
   await clearValues(match.slug);
-  await db.updateAsync(
-    'matches',
-    { status: 'live', winner_id: null, completed_at: null, map_number: 0, current_map: null },
-    'id = ?',
-    [match.id]
-  );
+  if (!(await transitionMatch(match, 'reopen', { map_number: 0, current_map: null }))) {
+    return fail(409, 'The match changed while it was being reopened; reload and try again');
+  }
 
   // An **open** report is about a result that no longer stands either, and
   // leaving one behind strands both captains. This only ever superseded the
@@ -1077,13 +1114,6 @@ export async function reopenMatch(input: {
   await recordAction({ id: previous?.id ?? null, matchSlug: match.slug }, 'reopen', input.actor, {
     previousWinnerId: match.winner_id,
     ratingsReverted: reverted,
-  });
-  emitMatchUpdate({ id: match.id, slug: match.slug, status: 'live', winnerId: null });
-  emitBracketUpdate({ action: 'match_status', matchSlug: match.slug, status: 'live' });
-  emitTournament(tournamentId, 'match:report', {
-    matchSlug: match.slug,
-    action: 'reopen',
-    status: 'live',
   });
 
   const report = previous ? await reportById(previous.id) : null;

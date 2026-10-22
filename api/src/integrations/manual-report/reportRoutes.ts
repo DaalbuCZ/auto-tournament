@@ -109,8 +109,16 @@ manualReportRoutes.get('/matches/:slug', async (req: Request, res: Response) => 
       (actor.role === 'admin' ||
         (isCaptain && open.submittedByTeam !== null && actor.team !== open.submittedByTeam));
 
+    const reportable = ['ready', 'loaded', 'live', 'needs_decision'].includes(match.status);
+    let panelState = 'nothing';
+    if (open?.status === 'disputed') panelState = 'disputed';
+    else if (match.status === 'needs_decision') panelState = 'awaitingAdmin';
+    else if (open?.status === 'submitted')
+      panelState = mayAnswer ? 'needsAnswer' : 'waitingOpponent';
+    else if (reports.some((report) => report.status === 'confirmed')) panelState = 'confirmed';
     res.json({
       success: true,
+      panelState,
       match: {
         slug: match.slug,
         status: match.status,
@@ -127,10 +135,11 @@ manualReportRoutes.get('/matches/:slug', async (req: Request, res: Response) => 
       viewer: {
         team: actor.team,
         role: actor.role,
-        canReport: open === null || open.status === 'submitted',
-        canConfirm: mayAnswer,
-        canDispute: mayAnswer,
+        canReport: reportable && (open === null || open.status === 'submitted'),
+        canConfirm: reportable && mayAnswer,
+        canDispute: reportable && mayAnswer,
         canWithdraw:
+          reportable &&
           open !== null &&
           open.status === 'submitted' &&
           (actor.role === 'admin' || (isCaptain && actor.team === open.submittedByTeam)),
