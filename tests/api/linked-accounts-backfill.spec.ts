@@ -147,6 +147,8 @@ test.describe.serial('linked_accounts and schema_migrations', () => {
     const id = steamId();
     const discord = discordId();
     const github = `gh-${digits(8)}`;
+    // Earlier specs can leave legacy players with no linked account.
+    await backfill(request);
     await createPlayer(request, id, { discordId: discordId() });
     await seedSignIn(request, 'discord', discord, id);
     await seedSignIn(request, 'github', github, id);
