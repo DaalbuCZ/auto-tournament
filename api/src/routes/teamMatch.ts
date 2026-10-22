@@ -1,3 +1,6 @@
+import { visibleMatchState } from '../core/projectMatchState';
+import { projectNextMatchCard } from '../core/projectNextMatchCard';
+import { matchStateFor } from '../core/matchState';
 import { logoUrl } from '../services/teamSelfService';
 import type { Request, Response } from 'express';
 import { Router } from 'express';
@@ -453,6 +456,10 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
       ? logoUrl(opponent.id, isTeam1 ? match.team2_logo : match.team1_logo)
       : null;
 
+    const state = visibleMatchState(
+      await matchStateFor(match),
+      viewerIsTeamMember ? 'participant' : 'public'
+    );
     return res.json({
       success: true,
       team: {
@@ -469,6 +476,29 @@ router.get('/:teamId/match', async (req: Request, res: Response) => {
         round: match.round,
         matchNumber: match.match_number,
         status: match.status,
+        state,
+        nextCard: projectNextMatchCard({
+          state,
+          viewerSide: isTeam1 ? 'team1' : 'team2',
+          vetoTurn:
+            state.activity === 'veto'
+              ? ((await integrationForMatch(match).preMatchTurn?.(match)) ?? null)
+              : null,
+          vetoAction: vetoSummary?.currentAction ?? null,
+          viewerConnected:
+            connectionStatus?.connectedPlayers.some(
+              (p) => p.team === (isTeam1 ? 'team1' : 'team2')
+            ) ?? false,
+          readyPlayers: connectionStatus?.connectedPlayers.filter((p) => p.isReady).length ?? 0,
+          expectedPlayers: perTeam ? perTeam * 2 : 10,
+          score: [normalizedLiveStats?.team1Score ?? 0, normalizedLiveStats?.team2Score ?? 0],
+          seriesScore: [
+            normalizedLiveStats?.team1SeriesScore ?? 0,
+            normalizedLiveStats?.team2SeriesScore ?? 0,
+          ],
+          map: normalizedLiveStats?.mapName ?? null,
+          round: normalizedLiveStats?.roundNumber ?? 0,
+        }),
         isTeam1,
         currentMap: match.current_map ?? null,
         mapNumber: match.map_number ?? null,
