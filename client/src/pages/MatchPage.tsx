@@ -23,7 +23,6 @@ import type { PublicMatch } from '../integrations/types';
 import { fontDisplay, mono, tokens } from '../theme/tokens';
 import { useSocket } from '../hooks/useSocket';
 import { useAuth } from '../contexts/AuthContext';
-import { getStatusLabel } from '../utils/matchUtils';
 import { manageMatchPath, teamProfilePath, tournamentTabPath } from '../paths';
 import { ArrowLeftIcon } from '@phosphor-icons/react';
 import { YourMatchCard } from '../components/tournament/match/YourMatchCard';
@@ -291,17 +290,18 @@ export default function MatchPage() {
 
   // The viewer plays in this match: their part comes first while it is on.
   const viewerTeamId = match.viewerTeamId ?? null;
-  const matchIsOn = match.status !== 'completed' && match.status !== 'cancelled';
+  const matchIsOn =
+    match.state?.lifecycle !== 'completed' && match.state?.lifecycle !== 'cancelled';
   // The steps, veto and server are for a game played on servers through its
   // module; a manually reported game has only the report panel.
   const playsThroughModule = Boolean(integration.preMatchView || integration.matchPanels.teamView);
   // A player's match card carries them itself (in place of its map pills).
   const playerCard = !!viewerTeamId && matchIsOn && playsThroughModule;
 
-  const live = match.status === 'live' || match.status === 'loaded';
+  const live = match.state?.lifecycle === 'active';
   const showChat = !!viewerTeamId || isAdmin;
   // The veto takes the page's width (the drafts' veto board); the chat moves under it.
-  const vetoing = matchIsOn && match.status === 'pending' && match.vetoCompleted === false;
+  const vetoing = match.state?.activity === 'veto';
 
   return (
     <Container
@@ -370,7 +370,7 @@ export default function MatchPage() {
                   sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: tokens.color.live }}
                 />
               )}
-              {getStatusLabel(match.status)}
+              {t(`matchState.${match.state?.activity ?? 'unknown'}`)}
             </Box>
           )}
           {/* Its start time (Manage › Schedule), until it is on a server. */}

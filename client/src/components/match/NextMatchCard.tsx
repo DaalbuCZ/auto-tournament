@@ -6,13 +6,13 @@
  */
 
 import { OpponentName } from '../team/MatchRowLinks';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import { Link as RouterLink } from 'react-router-dom';
 import { Box, Button, Typography } from '@mui/material';
 import { useTranslation } from 'react-i18next';
 import type { TeamMatchInfo } from '../../types';
 import { matchPagePath } from '../../paths';
-import { matchPhaseOf, type MatchPhase } from '../../utils/matchPhase';
+import type { MatchRoomPhase as MatchPhase } from '../../types/matchState.types';
 import { useSocket } from '../../hooks/useSocket';
 import { onSocketReconnect } from '../../utils/socketResync';
 import { tokens, fontDisplay } from '../../theme/tokens';
@@ -26,27 +26,33 @@ const PHASE_KEY: Record<Exclude<MatchPhase, 'done'>, string> = {
   veto: 'yourMatch.vetoTitle',
   joining: 'yourMatch.waitingForPlayers',
   live: 'yourMatch.live',
+  blocked: 'matchState.blocked',
+  reporting: 'matchState.reporting',
+  needsDecision: 'matchState.needs_decision',
+  cancelled: 'matchState.cancelled',
+  unknown: 'matchState.unknown',
 };
 
 interface TeamMatchResponse {
   hasMatch?: boolean;
   match?: TeamMatchInfo | null;
   tournamentStatus?: string;
-  team?: { name?: string } | null;
+  team?: { id?: string; name?: string } | null;
 }
 
 export function NextMatchCard({ teamId }: { teamId: string }) {
   const { t } = useTranslation();
   const [data, setData] = useState<TeamMatchResponse | null>(null);
+  const request = useRef({ id: 0 });
 
   const load = useCallback(() => {
-    let live = true;
+    const id = ++request.current.id;
     fetch(`/api/team/${encodeURIComponent(teamId)}/match`, { credentials: 'same-origin' })
       .then((res) => (res.ok ? (res.json() as Promise<TeamMatchResponse>) : null))
-      .then((body) => live && setData(body))
-      .catch(() => live && setData(null));
+      .then((body) => id === request.current.id && setData(body))
+      .catch(() => id === request.current.id && setData(null));
     return () => {
-      live = false;
+      request.current.id++;
     };
   }, [teamId]);
 
@@ -68,10 +74,10 @@ export function NextMatchCard({ teamId }: { teamId: string }) {
     };
   }, [socket, slug, load]);
 
-  const match = data?.hasMatch ? (data.match ?? null) : null;
+  const match = data && data.team?.id === teamId && data.hasMatch ? (data.match ?? null) : null;
   if (!match?.slug) return null;
-  const phase = matchPhaseOf(match, data?.tournamentStatus ?? '');
-  if (phase === 'done') return null;
+  const phase = match.state?.roomPhase ?? 'unknown';
+  if (phase === 'done' || phase === 'cancelled') return null;
 
   const us = match.isTeam1 ? 'team1' : 'team2';
   const them = match.isTeam1 ? 'team2' : 'team1';
@@ -79,7 +85,7 @@ export function NextMatchCard({ teamId }: { teamId: string }) {
   const theirName = match.opponent?.name ?? match.config?.[them]?.name ?? t('home.tbd');
   const ourId = teamId;
   const theirId = match.opponent?.id ?? null;
-  const yourTurn = phase === 'veto';
+  const yourTurn = match.nextCard?.label === 'vetoTurn';
 
   return (
     <Box

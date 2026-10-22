@@ -10,7 +10,6 @@ import { MatchMapChips } from '../../team/MatchMapChips';
 import { LivePlayersTable } from '../../match/LivePlayersTable';
 import { SectionTitle, StatePill, TeamLogo, panel } from '../ui/draftUi';
 import { getMapDisplayName } from '../../../constants/maps';
-import { matchPhaseOf } from '../../../utils/matchPhase';
 import { tokens, fontDisplay, mono, radii } from '../../../theme/tokens';
 import { panelSx, panelBorderSx } from '../../../components/common/ui';
 import type { Untrusted } from '../../../utils/untrusted';
@@ -208,8 +207,8 @@ export function YourMatchCard({
     );
   }
 
-  const phase = matchPhaseOf(match, tournamentStatus);
-  const viewerIsMember = match.viewerIsTeamMember !== false;
+  const phase = match.state?.roomPhase ?? 'unknown';
+  const viewerIsMember = match.viewerIsTeamMember === true;
   const us = match.isTeam1 ? 'team1' : 'team2';
   const them = match.isTeam1 ? 'team2' : 'team1';
   const ourName = team?.name ?? match[us]?.name ?? match.config?.[us]?.name ?? '';
@@ -275,7 +274,14 @@ export function YourMatchCard({
     typeof mapNumber === 'number' && totalMaps && totalMaps > 1
       ? t('yourMatch.mapOf', { n: mapNumber + 1, total: totalMaps })
       : null;
-  const outcome = ourMaps > theirMaps ? 'won' : ourMaps < theirMaps ? 'lost' : 'draw';
+  const outcome =
+    match.state?.winner === us
+      ? 'won'
+      : match.state?.winner === them
+        ? 'lost'
+        : match.state?.winner === 'none'
+          ? 'draw'
+          : null;
 
   // The card's title, its colour and the pill on its right (the drafts' match room).
   let title: string;
@@ -291,12 +297,7 @@ export function YourMatchCard({
   } else if (phase === 'veto') {
     title = t('yourMatch.vetoTitle');
     ring = color.accent;
-  } else if (
-    phase === 'joining' &&
-    !match.server &&
-    match.status !== 'loaded' &&
-    match.status !== 'live'
-  ) {
+  } else if (match.state?.activity === 'queued') {
     // No server yet (the drafts' "Waiting for a server"): the queue place comes from the join panel.
     title = t('yourMatch.waitingForServer');
     pill = mapLabel ? (
@@ -348,12 +349,21 @@ export function YourMatchCard({
         {t('yourMatch.sideYou', { side: ourSide })}
       </Box>
     ) : null;
+  } else if (phase !== 'done') {
+    title = t(`matchState.${match.state?.activity ?? 'unknown'}`);
+    detail =
+      match.state?.blockers
+        .map((b) => b.reason)
+        .filter(Boolean)
+        .join(' · ') || null;
   } else {
-    title = t(`yourMatch.outcome.${outcome}`, {
-      us: ourMaps,
-      them: theirMaps,
-      opponent: theirName,
-    });
+    title = outcome
+      ? t(`yourMatch.outcome.${outcome}`, {
+          us: ourMaps,
+          them: theirMaps,
+          opponent: theirName,
+        })
+      : t('yourMatch.finished');
     ring = outcome === 'won' ? color.live : color.rule;
     detail = t('yourMatch.finished');
   }
@@ -475,7 +485,7 @@ export function YourMatchCard({
               hideMatchHeader
             />
           ) : null)}
-        {(phase === 'joining' || phase === 'live') && join}
+        {match.state?.actions.includes('connect') && join}
         {phase === 'live' && join && (
           <Typography
             sx={{ fontSize: '0.8125rem', color: color.muted }}

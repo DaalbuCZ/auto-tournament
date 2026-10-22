@@ -1,3 +1,4 @@
+import type { MatchStateView } from '../../types/matchState.types';
 import type { ComponentType } from 'react';
 import { useCallback, useEffect, useState } from 'react';
 import { Box, Typography } from '@mui/material';
@@ -22,6 +23,7 @@ interface RoomPlayer {
 
 /** What the match page knows about a match, for someone who does not play in it. */
 export interface SpectatorRoomMatch {
+  state?: MatchStateView;
   slug?: string;
   status: string;
   vetoCompleted?: boolean;
@@ -79,7 +81,6 @@ function useLiveStats(slug: string | undefined, on: boolean): MatchLiveStats | n
  */
 export function SpectatorRoom({
   match,
-  hasVeto,
   Watch,
 }: {
   match: SpectatorRoomMatch;
@@ -88,30 +89,27 @@ export function SpectatorRoom({
   Watch?: ComponentType<{ matchSlug: string }>;
 }) {
   const { t } = useTranslation();
-  const steps: Step[] = hasVeto
+  const steps: Step[] = match.state?.requiresPreMatch
     ? ['veto', 'server', 'live', 'result']
     : ['server', 'live', 'result'];
-  const now: Step =
-    match.status === 'completed' || match.status === 'cancelled'
-      ? 'result'
-      : match.status === 'live' || match.status === 'loaded'
-        ? 'live'
-        : hasVeto && match.vetoCompleted === false
-          ? 'veto'
-          : 'server';
+  const stepsByPhase: Record<MatchStateView['roomPhase'], Step> = {
+    notStarted: 'server',
+    waitingOpponent: 'server',
+    veto: 'veto',
+    joining: 'server',
+    live: 'live',
+    done: 'result',
+    cancelled: 'result',
+    blocked: 'server',
+    reporting: 'live',
+    needsDecision: 'result',
+    unknown: 'server',
+  };
+  const now = stepsByPhase[match.state?.roomPhase ?? 'unknown'];
   const nowIndex = steps.indexOf(now);
   const live = useLiveStats(match.slug, now === 'live');
 
-  const serverText =
-    now === 'veto'
-      ? t('matchPage.spectator.server.afterVeto')
-      : now === 'server'
-        ? match.serverId
-          ? t('matchPage.spectator.server.loading')
-          : t('matchPage.spectator.server.waiting')
-        : now === 'live'
-          ? t('matchPage.spectator.server.playing')
-          : t('matchPage.spectator.server.freed');
+  const serverText = t(`matchState.${match.state?.activity ?? 'unknown'}`);
 
   const teams = [
     {
