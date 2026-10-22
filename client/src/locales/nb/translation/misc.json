@@ -359,7 +359,34 @@
       "goVeto": "Gå til vetoen",
       "paused": "Pause",
       "about": "~{{minutes}} min",
-      "joinServer": "Bli med på serveren"
+      "joinServer": "Bli med på serveren",
+      "state": {
+        "blocked": "Match is on hold",
+        "not_started": "Waiting for the tournament to start",
+        "waiting_opponent": "Waiting for an opponent",
+        "held": "Match is on hold",
+        "scheduled": "Scheduled",
+        "veto": "Map veto",
+        "queued": "Waiting for a server",
+        "loading": "Loading the match",
+        "warmup": "Warmup",
+        "knife": "Knife round",
+        "side_pick": "Choosing sides",
+        "live": "Live",
+        "halftime": "Halftime",
+        "overtime": "Overtime",
+        "paused": "Paused",
+        "between_maps": "Between maps",
+        "reporting": "Play the match and report the result",
+        "needs_decision": "Waiting for an admin decision",
+        "completed": "Finished",
+        "cancelled": "Cancelled",
+        "offline": "Server offline",
+        "inconsistent": "Game and server state disagree",
+        "unknown": "Waiting for server state",
+        "waiting_team": "Waiting for a team to finish its current match"
+      },
+      "openMatch": "Open the match for details"
     }
   },
   "browsePage": {
